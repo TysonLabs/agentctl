@@ -1,0 +1,232 @@
+# agentctl
+
+A safe, **read-only** CLI for querying `/agent` observability surfaces — built for AI agents
+(Claude Code and friends) that need to ask a running service "what are you doing right now?"
+without SSH, database clients, or the ability to break anything.
+
+## What is a /agent surface?
+
+A convention, not a framework: a service mounts a token-gated, **read-only** observability API
+at `/agent`. `GET /agent` is a self-describing index of the endpoints it offers:
+
+```json
+{
+  "endpoints": [
+    { "path": "/agent/version", "description": "build SHA and start time" },
+    { "path": "/agent/health",  "description": "liveness and dependency checks" },
+    { "path": "/agent/queues",  "description": "in-memory queue depths" }
+  ]
+}
+```
+
+Response shapes are **not stable contracts** — the consumers are your own agents, updated
+alongside the services. agentctl is therefore deliberately dumb transport: fetch, pretty-print
+JSON, exit codes. No per-service schema parsing.
+
+## Why not just curl?
+
+agentctl is what curl looks like after you delete everything an agent could misuse:
+
+- **GET-only by construction.** There is no method flag. The only HTTP verb in the codebase is
+  a single `http.MethodGet` literal (enforced by a test that greps the sources).
+- **Path confinement.** Requests can only go to paths under `/agent/` on base URLs registered
+  in the config file. No `--url` flag exists. Traversal (`..`, encoded variants) is rejected.
+- **Token hygiene.** Tokens live in one config file, never on the command line. Internally they
+  are wrapped in a `Secret` type whose every formatting path (fmt verbs, JSON) yields a
+  fingerprint (`tok:1a2b3c4d`), and all diagnostics are scrubbed before printing.
+- **Redirect pinning.** Max 3 hops, same scheme+host+port as the registered base URL, and the
+  target path must stay under `/agent`. Anything else is a transport error.
+- Sane timeouts (10s default, 8s for `status`), 10 MiB response cap, no prompts, no color.
+
+## Install
+
+```sh
+go install github.com/TysonLabs/agentctl@latest
+```
+
+## Quick start
+
+1. Write `~/.config/agentctl/services.toml` (chmod 600):
+
+```toml
+[payments.dev]
+base_url = "https://dev.example.com"
+token    = "at_xxxxxxxxxxxx"
+
+[payments.prod]
+base_url = "https://pay.example.com"
+token    = "REPLACE_ME"          # placeholder → listed as "not wired", never called
+
+[payments.meta]                  # informational only — shown by ls, never fetched
+repo = "org/payments"
+unit = "payments.service"
+```
+
+2. Explore:
+
+```sh
+agentctl ls                          # what's registered, what's wired
+agentctl endpoints payments.dev      # what the service offers
+agentctl get payments.dev version    # any of: version, /version, /agent/version
+agentctl get payments.dev "logs?limit=20"
+agentctl status                      # /agent/version + /agent/health across all wired services
+```
+
+## In practice
+
+agentctl exists so that coding agents can operate a fleet of services with curl on their deny
+list. The workflows below are the ones it was built around; the service names and endpoints are
+illustrative.
+
+### Symptom triage
+
+An agent is handed "checkouts are slow since noon" and has to come back with evidence, not a
+restart. The loop:
+
+1. `agentctl endpoints shop.prod` to see what the service can answer. Trust the live index over
+   any runbook; surfaces evolve.
+2. Baseline with `version` (did it just restart? does the SHA match the last deploy?) and
+   `health` (pools, scheduler last-runs, per-dependency last success/error).
+3. Sample in-memory state twice, a minute apart, to tell a growing queue from a stable one.
+4. Pull logs filtered server-side: a `since` bounded to the symptom window and `q=` terms taken
+   from the symptom. Start narrow, widen only if empty.
+5. Report a diagnosis and a recommended action for a human to take. Triage never mutates.
+
+If `/agent` itself is unreachable, exit code 3 is the finding: the process is down or the network
+path is broken, and the agent says so instead of guessing.
+
+### Deploy verification
+
+After a push, nothing counts as verified until `agentctl get shop.prod version` reports the
+deployed SHA. Then `health` is checked for anything the deploy degraded, and only then does the
+agent exercise the changed behaviour. A health payload can also carry "restart owed" style
+fields, so a config change the process could not hot-apply shows up here rather than a week later.
+
+### Fleet sweep
+
+`agentctl status` gives one line per wired service and environment, hitting `version` and
+`health` with an 8s timeout. Exit 2 means at least one service answered with an HTTP error, exit
+3 means at least one was unreachable. A 502 from a reverse proxy in front of a dead process
+shows up as `FAIL HTTP 502 on /agent/version` rather than as a hung command.
+
+### Joining across services
+
+Two services that talk to each other in production do not need to talk to each other for
+observability. When one records a problem report, it stores only a masked correlation id and
+prints the follow-up for the triager:
+
+```
+agentctl get upstream.prod "logs?q=<correlation_id>"
+```
+
+The human or agent doing triage performs the join by hand through agentctl. The services stay
+decoupled, sensitive data stays out of the reporting service's database, and the observability
+path never becomes a runtime dependency.
+
+### What a surface tends to grow
+
+Surfaces built for this workflow have converged on roughly the same set, whatever the language:
+
+| Endpoint | Answers |
+|---|---|
+| `/agent/version` | What build is running, since when, on which host? |
+| `/agent/health` | Are dependencies healthy? Pools, schedulers, last success/error per integration. |
+| `/agent/state` | What is in memory right now? Queue depths, connection counts, oldest-entry age. |
+| `/agent/config` | What is the resolved effective configuration, with every secret redacted? |
+| `/agent/logs` | What was logged recently? An in-memory ring, filterable server-side. |
+| `/agent/<thing>/<id>` | Detail on one object, addressable only by an id the caller already holds. |
+
+The last row matters: detail endpoints keyed by an unguessable reference (an incident number a
+user was shown, a capability id a session owner minted) let a surface expose depth without
+letting anyone enumerate users or sessions.
+
+## Configuration
+
+- Location: `--config PATH` > `$AGENTCTL_CONFIG` > `~/.config/agentctl/services.toml`.
+- Each `[service.env]` table needs `base_url` (http/https, no userinfo/query/fragment) and `token`.
+- A `[service.meta]` table is informational (repo, unit, owner, …) — shown by `ls`, never fetched.
+- Placeholder tokens (`REPLACE_ME`, `CHANGEME`, `TODO`, `…`, `<...>`, all-`x`, anything under
+  8 chars) mark a service **not wired**: `ls` shows it with the reason, `get`/`endpoints` refuse
+  it, `status` skips it.
+- Keep the file `chmod 600`; agentctl warns (but proceeds) if group/other bits are set.
+
+## Commands
+
+| Command | Behavior |
+|---|---|
+| `agentctl ls` | list services/envs, wiring status, base URLs (never token material) |
+| `agentctl get <svc.env> <path> [--raw]` | GET under `/agent/`; pretty-print JSON, `--raw` for bytes |
+| `agentctl endpoints <svc.env>` | fetch `GET /agent` and render the descriptor table |
+| `agentctl status [svc.env ...]` | fan out `/agent/version` + `/agent/health`, one line per service |
+| `agentctl version` | print agentctl's own version |
+
+Global flags: `--config PATH`, `--timeout DUR` (default 10s; `status` default 8s), `--help`.
+
+### Exit codes (stable API)
+
+| Code | Meaning |
+|---|---|
+| 0 | success (`status`: all wired queried services 2xx on both endpoints) |
+| 1 | usage error, config error, unknown service.env, not-wired target, rejected path |
+| 2 | HTTP status ≥ 400 (body still printed to stdout) |
+| 3 | transport: DNS/dial/TLS/timeout, refused redirect, body over cap |
+
+Output is designed for LLM agents: stdout is the answer only; stderr carries one-line
+`agentctl:`-prefixed diagnostics. No color, no spinners, no prompts.
+
+## Security model
+
+Capabilities that **do not exist**: non-GET methods, arbitrary URLs, custom headers,
+`--insecure`, request bodies, tokens on the CLI, config-write commands (a `wire`/`add`
+command would put tokens in shell history).
+
+What does exist: bearer auth from a 600-mode file, fingerprint-only token rendering,
+output scrubbing, host+path-pinned redirects, timeouts, and a response size cap.
+
+## For agents (CLAUDE.md snippet)
+
+```markdown
+## Observability via agentctl
+- `agentctl ls` — services you can query; only "wired" ones are callable.
+- `agentctl endpoints <svc.env>` — discover what a service exposes.
+- `agentctl get <svc.env> <path>` — read-only GET under /agent; pretty JSON on stdout.
+- `agentctl status` — quick fleet health; exit 0 = all good, 2 = HTTP errors, 3 = unreachable.
+- It cannot mutate anything: GET-only, /agent-only, registered hosts only.
+```
+
+## Building a /agent surface in your service
+
+Non-normative conventions that make a surface pleasant to consume:
+
+- Bearer-token auth; the surface only registers when a token is configured.
+- Read-only forever; mutations belong elsewhere with their own auth.
+- Cheap by construction: in-memory state, O(1) lookups — nothing a caller could use to load you.
+- No secrets, no customer PII in responses or logs.
+- `GET /agent` returns `{"endpoints":[{"path":...,"description":...}]}` so tools and agents
+  can discover everything else. Write each description as the question it answers
+  ("What build is running?") — that is what an agent reads when deciding where to look.
+- Off by default: an empty token means the route group is never mounted, not "mounted but 401".
+- Make index drift impossible: either drive the router from the same table that renders the
+  index, or add a test that fails when a registered route lacks a descriptor.
+- Sanitize at the point of capture (log ring, event cache) rather than at serve time, so a
+  query parameter can never become a search oracle for the raw value. Let opaque ids survive
+  masking; they are the join keys triage depends on.
+- When a field can legitimately be unknown, return *why* (`"not_configured"`, `"bypassed"`,
+  `{"configured": false}`) instead of `null`. A bare null costs someone an hour later.
+- Bound every response: default and maximum `limit`, per-entry byte caps, and a total that stays
+  well under agentctl's 10 MiB ceiling.
+
+## Non-goals
+
+Color/TTY niceties, retries, response caching, keychain integration, `--json` listing output,
+shell completions, config-write commands, per-service schema rendering. PRs adding request
+capabilities beyond GET-under-/agent will be declined on principle.
+
+## Contributing
+
+`make all` runs vet, race-enabled tests, and the build. The test suite includes a source guard
+that fails if any mutating HTTP verb appears in non-test code — keep it that way.
+
+## License
+
+MIT © Tyson George
