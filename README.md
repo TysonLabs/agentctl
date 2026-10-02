@@ -264,6 +264,44 @@ should start it in the background and read `final` when it exits.
 
 Set `AGENTFLOW_CODEX` to use a codex binary other than the one on `PATH`.
 
+### `agentflow ship verify`: wait until a deploy is really live
+
+```sh
+agentflow ship verify recursivecx.prod --sha "$MERGE_SHA"    # safest: wait for that exact build
+agentflow ship verify recursivecx.prod --sha "$MERGE_SHA" --contains --repo . # accept a later forward deploy
+agentflow ship verify vector-dialer.dev --sha d63a514 --once # one check, no waiting
+```
+
+It reads `/agent/version` **through agentctl** (`$AGENTCTL`, then `PATH`, then `~/bin`), so
+agentflow never holds service tokens and makes no HTTP calls itself. It replaces the
+hand-written `until …; sleep` loops agents write after every merge.
+
+- The commit comes from `git_commit`, `commit`, or `git_sha`, or from a
+  `Git Commit: <sha>` line in the `version` build banner. Generic `sha`, `revision`, and
+  unrelated string fields are not trusted. Conflicting recognized values fail closed.
+- A short SHA matches a full one (prefix either way, at least 7 hex digits), because
+  builds usually stamp short SHAs.
+- `--sha` takes a hex SHA (compared as given, so it works from any directory, even for
+  a commit not fetched yet) or a git rev (`origin/main`, `HEAD`, a tag) resolved in the
+  local `--repo` checkout (default: the current directory). Nothing is fetched, so after
+  a merge prefer the merge's SHA over a remote-tracking ref that may be stale.
+- Exact matching is the default. With an explicit `--repo`, `--contains` also accepts a
+  newer deploy that contains the expected commit (`"match": "contains"`). It is
+  intentionally opt-in because a pre-rollback build also descends from the older commit
+  being restored.
+- Transport failures and rollout-like HTTP errors (404, 408, 425, 429, and 5xx) are
+  retried until `--timeout` (default 40m, checking every `--interval`, default 30s).
+  Other HTTP errors and a version with no recognizable commit fail at once.
+
+| Exit | Status | Meaning |
+|---|---|---|
+| 0 | `deployed` | running the expected commit, or (with `--contains`) a descendant |
+| 1 | `agentctl_error` / — | usage error, or a non-retryable agentctl/HTTP failure |
+| 2 | `not_deployed` | `--once` only: not yet |
+| 3 | `unreadable` | `/agent/version` has no recognizable commit |
+| 124 | `timeout` | never matched before `--timeout`; `running`/`error` show the last state |
+| 130 | `interrupted` | interrupted |
+
 ## Non-goals
 
 Color/TTY niceties, retries, response caching, keychain integration, `--json` listing output,

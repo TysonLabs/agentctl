@@ -1,8 +1,8 @@
 // Package cli implements the agentflow command dispatch. Exit codes are
-// assigned here and nowhere else:
-//
-//	0 ok · 1 usage or precondition error · 3 codex failed · 4 no final answer
-//	5 rate or usage limited · 124 timeout · 125 stalled · 130 interrupted
+// assigned in this package and nowhere else, one table per command
+// (exitCodes for codex, shipExitCodes for ship verify). 0 is success, 1 a
+// usage or precondition error, 124 a timeout and 130 an interruption for
+// every command.
 package cli
 
 import (
@@ -28,8 +28,10 @@ var Version = "dev"
 const usage = `agentflow — small, single-purpose workflow commands for coding agents
 
 Usage:
-  agentflow codex [flags]     run codex exec safely and report a JSON result
-  agentflow version           print agentflow's own version
+  agentflow codex [flags]                      run codex exec safely and report a JSON result
+  agentflow ship verify <svc.env> --sha REV    wait until a deployed service runs REV
+                                               (see: agentflow ship --help)
+  agentflow version                            print agentflow's own version
 
 codex flags:
   --dir DIR               repository to work in (default: current directory)
@@ -79,6 +81,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		return runCodex(ctx, args[1:], stdout, stderr)
+	case "ship":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runShip(ctx, args[1:], stdout, stderr)
 	case "version", "--version":
 		fmt.Fprintln(stdout, "agentflow "+Version)
 		return 0
