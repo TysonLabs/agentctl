@@ -22,14 +22,16 @@ Wait until a deployed service runs REV, read through agentctl's /agent/version.
 
   --sha REV          commit to expect: a hex SHA (7+ chars) or any git rev
                      (origin/main, HEAD, a tag), resolved in --repo
-  --repo DIR         git checkout used to resolve REV and to accept a newer
-                     deploy that already contains REV (default: current dir)
+  --repo DIR         git checkout used to resolve REV (default: current dir);
+                     required explicitly with --contains
   --timeout DUR      give up after DUR (default 40m)
   --interval DUR     delay between checks (default 30s)
   --once             check once and exit (0 deployed, 2 not yet)
+  --contains         also accept a running descendant of REV; use only for
+                     forward deploys, not when verifying a rollback
 
-A short SHA matches a full one. Fetch failures while the service restarts are
-retried; a version with no recognizable commit fails at once.
+A short SHA matches a full one. Transient fetch failures while the service
+restarts are retried; a version with no recognizable commit fails at once.
 
 Output: a JSON result on stdout. Exit codes: 0 deployed · 1 usage/agentctl
 error · 2 not deployed (--once) · 3 version unreadable · 124 timeout
@@ -69,6 +71,7 @@ func runShip(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.DurationVar(&o.Timeout, "timeout", 40*time.Minute, "")
 	fs.DurationVar(&o.Interval, "interval", 30*time.Second, "")
 	fs.BoolVar(&o.Once, "once", false, "")
+	fs.BoolVar(&o.Contains, "contains", false, "")
 	pos, err := parseInterleaved(fs, args[1:])
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -92,24 +95,35 @@ func runShip(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if !repoGiven {
 		o.Repo, _ = os.Getwd()
 	}
-	inRepo := gitWorkTree(o.Repo)
+	inRepo := gitWorkTree(ctx, o.Repo)
 	if repoGiven && !inRepo {
 		return fail("--repo %s is not a git work tree", o.Repo)
 	}
 	if !inRepo {
 		o.Repo = "" // no ancestry check outside a checkout
 	}
+	if o.Contains && (!repoGiven || !inRepo) {
+		return fail("--contains needs an explicit git checkout (use --repo DIR)")
+	}
 	if ship.IsHexSHA(rev) {
+		// A hex SHA is compared as text. It is expanded when this clone knows
+		// it, but a merge not fetched yet, or a SHA from another service's
+		// repo, must not turn into an error or a false timeout.
 		o.Expected = strings.ToLower(rev)
+		if inRepo {
+			if full, err := resolveCommit(ctx, o.Repo, rev); err == nil {
+				o.Expected = full
+			}
+		}
 	} else {
 		if !inRepo {
 			return fail("--sha %q is not a hex SHA and there is no git checkout to resolve it (use --repo)", rev)
 		}
-		out, err := exec.Command("git", "-C", o.Repo, "rev-parse", "--verify", "--quiet", rev+"^{commit}").Output()
+		out, err := resolveCommit(ctx, o.Repo, rev)
 		if err != nil {
 			return fail("cannot resolve --sha %q in %s", rev, o.Repo)
 		}
-		o.Expected = strings.TrimSpace(string(out))
+		o.Expected = out
 	}
 
 	bin, err := agentctlBin()
@@ -135,6 +149,14 @@ func runShip(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 // parseInterleaved parses flags that may come before or after positionals
 // (`ship verify svc.env --sha X` and `ship verify --sha X svc.env`).
 func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
+	var afterDash []string
+	for i, arg := range args {
+		if arg == "--" {
+			afterDash = args[i+1:]
+			args = args[:i]
+			break
+		}
+	}
 	var pos []string
 	for {
 		if err := fs.Parse(args); err != nil {
@@ -142,10 +164,7 @@ func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
 		}
 		args = fs.Args()
 		if len(args) == 0 {
-			return pos, nil
-		}
-		if args[0] == "--" {
-			return append(pos, args[1:]...), nil
+			return append(pos, afterDash...), nil
 		}
 		pos = append(pos, args[0])
 		args = args[1:]
@@ -169,7 +188,12 @@ func agentctlBin() (string, error) {
 	return "", errors.New("agentctl not found: put it on PATH or set AGENTCTL")
 }
 
-func gitWorkTree(dir string) bool {
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "--is-inside-work-tree").Output()
+func gitWorkTree(ctx context.Context, dir string) bool {
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--is-inside-work-tree").Output()
 	return err == nil && strings.TrimSpace(string(out)) == "true"
+}
+
+func resolveCommit(ctx context.Context, repo, rev string) (string, error) {
+	out, err := exec.CommandContext(ctx, "git", "-C", repo, "rev-parse", "--verify", "--quiet", "--end-of-options", rev+"^{commit}").Output()
+	return strings.ToLower(strings.TrimSpace(string(out))), err
 }

@@ -75,8 +75,26 @@ func TestShipVerifyResolvesRefs(t *testing.T) {
 	if code != 2 || res.Status != "not_deployed" || len(res.Expected) != 40 {
 		t.Fatalf("exit %d, %+v", code, res)
 	}
+	headOut, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := strings.TrimSpace(string(headOut))
+	code, out, _ = run(t, "ship", "verify", "rcx.prod", "--sha", head[:8], "--repo", repo, "--once")
+	_ = json.Unmarshal([]byte(out), &res)
+	if code != 2 || res.Expected != head {
+		t.Fatalf("abbreviated SHA: exit %d, %+v", code, res)
+	}
 	if code, _, errOut := run(t, "ship", "verify", "rcx.prod", "--sha", "no-such-ref", "--repo", repo); code != 1 || !strings.Contains(errOut, "cannot resolve") {
 		t.Errorf("bad ref: exit %d stderr %q", code, errOut)
+	}
+	// A hex SHA this clone doesn't have (an unfetched merge, another repo's
+	// commit) is compared as text, not rejected.
+	if code, _, errOut := run(t, "ship", "verify", "rcx.prod", "--sha", "1111111", "--repo", repo, "--once"); code != 2 {
+		t.Errorf("unknown abbreviated SHA: exit %d stderr %q, want 2 (not deployed)", code, errOut)
+	}
+	if code, out, errOut := run(t, "ship", "verify", "rcx.prod", "--sha", "f316cb0f", "--repo", repo, "--once"); code != 0 {
+		t.Errorf("running commit absent from the clone: exit %d stdout %q stderr %q, want 0 (textual match)", code, out, errOut)
 	}
 }
 
@@ -93,6 +111,7 @@ func TestShipVerifyUsageErrors(t *testing.T) {
 		{[]string{"ship", "verify", "rcx.prod"}, "--sha is required"},
 		{[]string{"ship", "verify", "rcx.prod", "--sha", "origin/main"}, "not a hex SHA"},
 		{[]string{"ship", "verify", "rcx.prod", "--sha", "1111111", "--repo", "/no/such/dir"}, "not a git work tree"},
+		{[]string{"ship", "verify", "rcx.prod", "--sha", "1111111", "--contains"}, "--contains needs"},
 		{[]string{"ship", "verify", "rcx.prod", "--sha", "1111111", "--interval", "0s"}, "must be positive"},
 		{[]string{"ship", "verify", "rcx.prod", "--sha", "1111111", "--bogus"}, "flag provided but not defined"},
 	}
@@ -105,5 +124,8 @@ func TestShipVerifyUsageErrors(t *testing.T) {
 	}
 	if code, out, _ := run(t, "ship", "--help"); code != 0 || !strings.Contains(out, "ship verify") {
 		t.Errorf("help: exit %d", code)
+	}
+	if code, _, errOut := run(t, "ship", "verify", "--", "rcx.prod", "--sha", "1111111"); code != 1 || !strings.Contains(errOut, "exactly one service") {
+		t.Errorf("-- terminator: exit %d stderr %q", code, errOut)
 	}
 }

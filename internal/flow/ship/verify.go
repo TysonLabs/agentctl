@@ -23,7 +23,7 @@ import (
 type Status string
 
 const (
-	StatusDeployed    Status = "deployed"       // the running commit is (or contains) the expected one
+	StatusDeployed    Status = "deployed"       // the running commit is (or descends from) the expected one
 	StatusNotDeployed Status = "not_deployed"   // --once: it is not, yet
 	StatusUnreadable  Status = "unreadable"     // /agent/version answered without a recognizable commit
 	StatusAgentctl    Status = "agentctl_error" // agentctl refused (unknown or unwired service, bad config)
@@ -43,6 +43,7 @@ type Options struct {
 	Timeout  time.Duration // overall deadline (ignored with Once)
 	Interval time.Duration // delay between polls
 	Once     bool          // check once instead of waiting
+	Contains bool          // accept a running descendant of Expected
 	Fetch    Fetch
 }
 
@@ -76,36 +77,72 @@ func Verify(ctx context.Context, o Options) Result {
 		}
 		return res
 	}
-	var deadline <-chan time.Time
+	pollCtx := ctx
+	cancel := func() {}
 	if !o.Once {
-		t := time.NewTimer(o.Timeout)
-		defer t.Stop()
-		deadline = t.C
+		pollCtx, cancel = context.WithTimeout(ctx, o.Timeout)
+	}
+	defer cancel()
+	timedOut := func() Result {
+		if res.Error == "" {
+			res.Error = fmt.Sprintf("still running %s after %s", res.Running, o.Timeout)
+		}
+		return finish(StatusTimeout, "")
 	}
 	for {
+		select {
+		case <-ctx.Done():
+			return finish(StatusInterrupted, "interrupted")
+		default:
+		}
+		if !o.Once {
+			select {
+			case <-pollCtx.Done():
+				return timedOut()
+			default:
+			}
+		}
 		res.Attempts++
-		body, code, err := o.Fetch(ctx, o.Service)
+		body, code, err := o.Fetch(pollCtx, o.Service)
 		switch {
 		case ctx.Err() != nil:
 			return finish(StatusInterrupted, "interrupted")
+		case !o.Once && pollCtx.Err() != nil:
+			return timedOut()
 		case err != nil:
 			return finish(StatusAgentctl, err.Error())
 		case code == 1:
 			return finish(StatusAgentctl, strings.TrimSpace(string(body)))
-		case code != 0:
+		case retryableAgentctl(code, body):
 			// The service is restarting or unreachable: expected mid-deploy.
 			res.Error = fmt.Sprintf("agentctl exit %d: %s", code, firstLine(body))
+		case code != 0:
+			return finish(StatusAgentctl, fmt.Sprintf("agentctl exit %d: %s", code, firstLine(body)))
 		default:
 			running, started, perr := ParseVersion(body)
 			if perr != nil {
 				return finish(StatusUnreadable, perr.Error())
 			}
 			res.Running, res.StartedAt, res.Error = running, started, ""
+			// Exact matching stays textual (prefix, 7+ hex): requiring both ids
+			// in a local clone would time out on an unfetched merge commit.
 			if Matches(o.Expected, running) {
+				if ctx.Err() != nil {
+					return finish(StatusInterrupted, "interrupted")
+				}
+				if !o.Once && pollCtx.Err() != nil {
+					return timedOut()
+				}
 				res.Match = "exact"
 				return finish(StatusDeployed, "")
 			}
-			if o.Repo != "" && isAncestor(o.Repo, o.Expected, running) {
+			if o.Contains && o.Repo != "" && isAncestor(pollCtx, o.Repo, o.Expected, running) {
+				if ctx.Err() != nil {
+					return finish(StatusInterrupted, "interrupted")
+				}
+				if !o.Once && pollCtx.Err() != nil {
+					return timedOut()
+				}
 				res.Match = "contains"
 				return finish(StatusDeployed, "")
 			}
@@ -119,14 +156,28 @@ func Verify(ctx context.Context, o Options) Result {
 		select {
 		case <-ctx.Done():
 			return finish(StatusInterrupted, "interrupted")
-		case <-deadline:
-			if res.Error == "" {
-				res.Error = fmt.Sprintf("still running %s after %s", res.Running, o.Timeout)
-			}
-			return finish(StatusTimeout, "")
+		case <-pollCtx.Done():
+			return timedOut()
 		case <-time.After(o.Interval):
 		}
 	}
+}
+
+var httpStatusRe = regexp.MustCompile(`\bHTTP ([0-9]{3})\b`)
+
+func retryableAgentctl(code int, body []byte) bool {
+	if code == 3 {
+		return true
+	}
+	if code != 2 {
+		return false
+	}
+	m := httpStatusRe.FindSubmatch(body)
+	if m == nil {
+		return false
+	}
+	status := int(m[1][0]-'0')*100 + int(m[1][1]-'0')*10 + int(m[1][2]-'0')
+	return status == 404 || status == 408 || status == 425 || status == 429 || (status >= 500 && status <= 599)
 }
 
 // Matches reports whether two commit ids name the same commit: one is a
@@ -143,11 +194,12 @@ func Matches(a, b string) bool {
 	return strings.HasPrefix(b, a)
 }
 
-// Fields that carry a commit id in the /agent/version shapes in use, most
-// specific first. A bare "version" is not one of them: it is often semver.
-var commitFields = []string{"git_commit", "commit", "git_sha", "sha", "revision"}
+// Fields known to carry a source commit in /agent/version. Generic fields such
+// as "sha" and "revision" are deliberately not trusted: they may identify a
+// config, image, or schema rather than the running source.
+var commitFields = []string{"git_commit", "commit", "git_sha"}
 
-var commitLineRe = regexp.MustCompile(`(?i)\bgit[ _-]?commit\s*[:=]\s*([0-9a-f]{7,40})\b`)
+var commitLineRe = regexp.MustCompile(`(?im)^[\t ]*git commit[\t ]*:[\t ]*([0-9a-f]{7,40})[\t ]*$`)
 
 // ParseVersion extracts the running commit (and started_at, if present)
 // from an /agent/version body.
@@ -159,30 +211,49 @@ func ParseVersion(body []byte) (commit, startedAt string, err error) {
 	if s, ok := doc["started_at"].(string); ok {
 		startedAt = s
 	}
+	type candidate struct {
+		source, commit string
+	}
+	var candidates []candidate
 	for _, f := range commitFields {
-		if s, ok := doc[f].(string); ok && IsHexSHA(s) {
-			return strings.ToLower(s), startedAt, nil
+		v, present := doc[f]
+		if !present {
+			continue
 		}
+		s, ok := v.(string)
+		if !ok || !IsHexSHA(s) {
+			return "", startedAt, fmt.Errorf("/agent/version field %q is not a commit", f)
+		}
+		candidates = append(candidates, candidate{f, strings.ToLower(s)})
 	}
 	// Free-text build banners, e.g. "rustpbx 0.4.4\nGit Commit: f316cb0f".
-	for _, v := range doc {
-		if s, ok := v.(string); ok {
-			if m := commitLineRe.FindStringSubmatch(s); m != nil {
-				return strings.ToLower(m[1]), startedAt, nil
-			}
+	if version, ok := doc["version"].(string); ok {
+		for _, m := range commitLineRe.FindAllStringSubmatch(version, -1) {
+			candidates = append(candidates, candidate{"version", strings.ToLower(m[1])})
 		}
 	}
-	return "", startedAt, fmt.Errorf("/agent/version has no commit (looked for %s or a \"Git Commit:\" line)", strings.Join(commitFields, ", "))
+	if len(candidates) == 0 {
+		return "", startedAt, fmt.Errorf("/agent/version has no commit (looked for %s or a \"Git Commit:\" line in version)", strings.Join(commitFields, ", "))
+	}
+	commit = candidates[0].commit
+	for _, c := range candidates[1:] {
+		// Without a repository here, prefix agreement cannot prove that two
+		// separately reported abbreviations identify the same object.
+		if commit != c.commit {
+			return "", startedAt, fmt.Errorf("/agent/version has conflicting commits in %s and %s", candidates[0].source, c.source)
+		}
+	}
+	return commit, startedAt, nil
 }
 
 // isAncestor reports whether expected is an ancestor of running in repo. A
 // newer deploy that already contains the expected commit counts as deployed.
 // Any git failure (e.g. running is not in the local clone) is a plain "no".
-func isAncestor(repo, expected, running string) bool {
+func isAncestor(ctx context.Context, repo, expected, running string) bool {
 	if running == "" {
 		return false
 	}
-	cmd := exec.Command("git", "-C", repo, "merge-base", "--is-ancestor", expected, running)
+	cmd := exec.CommandContext(ctx, "git", "-C", repo, "merge-base", "--is-ancestor", expected, running)
 	return cmd.Run() == nil
 }
 

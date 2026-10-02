@@ -267,7 +267,8 @@ Set `AGENTFLOW_CODEX` to use a codex binary other than the one on `PATH`.
 ### `agentflow ship verify`: wait until a deploy is really live
 
 ```sh
-agentflow ship verify recursivecx.prod --sha origin/main     # after a merge that auto-deploys
+agentflow ship verify recursivecx.prod --sha "$MERGE_SHA"    # safest: wait for that exact build
+agentflow ship verify recursivecx.prod --sha "$MERGE_SHA" --contains --repo . # accept a later forward deploy
 agentflow ship verify vector-dialer.dev --sha d63a514 --once # one check, no waiting
 ```
 
@@ -275,24 +276,27 @@ It reads `/agent/version` **through agentctl** (`$AGENTCTL`, then `PATH`, then `
 agentflow never holds service tokens and makes no HTTP calls itself. It replaces the
 hand-written `until …; sleep` loops agents write after every merge.
 
-- The commit comes from `git_commit`, `commit`, `git_sha`, `sha` or `revision`, or from a
-  `Git Commit: <sha>` line inside any string field (a build banner). A bare `version` is
-  never read as a commit, because it is often semver.
+- The commit comes from `git_commit`, `commit`, or `git_sha`, or from a
+  `Git Commit: <sha>` line in the `version` build banner. Generic `sha`, `revision`, and
+  unrelated string fields are not trusted. Conflicting recognized values fail closed.
 - A short SHA matches a full one (prefix either way, at least 7 hex digits), because
   builds usually stamp short SHAs.
-- `--sha` takes a hex SHA or any git rev (`origin/main`, `HEAD`, a tag), resolved in
-  `--repo` (default: the current directory).
-- With a checkout available, a newer deploy that already contains the expected commit
-  counts as deployed (`"match": "contains"`), so two quick merges don't make the first
-  one wait forever.
-- HTTP errors and transport failures while the service restarts are retried until
-  `--timeout` (default 40m, checking every `--interval`, default 30s). A version that
-  answers but has no recognizable commit fails at once rather than waiting out the clock.
+- `--sha` takes a hex SHA (compared as given, so it works from any directory, even for
+  a commit not fetched yet) or a git rev (`origin/main`, `HEAD`, a tag) resolved in the
+  local `--repo` checkout (default: the current directory). Nothing is fetched, so after
+  a merge prefer the merge's SHA over a remote-tracking ref that may be stale.
+- Exact matching is the default. With an explicit `--repo`, `--contains` also accepts a
+  newer deploy that contains the expected commit (`"match": "contains"`). It is
+  intentionally opt-in because a pre-rollback build also descends from the older commit
+  being restored.
+- Transport failures and rollout-like HTTP errors (404, 408, 425, 429, and 5xx) are
+  retried until `--timeout` (default 40m, checking every `--interval`, default 30s).
+  Other HTTP errors and a version with no recognizable commit fail at once.
 
 | Exit | Status | Meaning |
 |---|---|---|
-| 0 | `deployed` | running the expected commit, or one that contains it |
-| 1 | `agentctl_error` / — | usage error, or agentctl refused (unknown or unwired service) |
+| 0 | `deployed` | running the expected commit, or (with `--contains`) a descendant |
+| 1 | `agentctl_error` / — | usage error, or a non-retryable agentctl/HTTP failure |
 | 2 | `not_deployed` | `--once` only: not yet |
 | 3 | `unreadable` | `/agent/version` has no recognizable commit |
 | 124 | `timeout` | never matched before `--timeout`; `running`/`error` show the last state |

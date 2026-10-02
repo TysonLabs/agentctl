@@ -25,7 +25,8 @@ func TestParseVersionShapes(t *testing.T) {
 		{dialerBody, "d63a514", ""},
 		{ccBody, "9788904", "2026-10-02T17:10:49Z"},
 		{`{"git_commit":"ABCDEF1234"}`, "abcdef1234", ""},
-		{`{"version":"1.2.3","commit":"not-hex","build":"Git Commit: 0123abcd"}`, "0123abcd", ""},
+		{`{"version":"build\nGit Commit: 0123abcd"}`, "0123abcd", ""},
+		{`{"commit":"0123abcd","git_sha":"0123abcd"}`, "0123abcd", ""},
 	}
 	for _, c := range cases {
 		got, started, err := ParseVersion([]byte(c.body))
@@ -37,11 +38,17 @@ func TestParseVersionShapes(t *testing.T) {
 
 func TestParseVersionRejects(t *testing.T) {
 	for _, body := range []string{
-		`{"version":"1.2.3"}`,  // semver is not a commit
-		`{"commit":"abc"}`,     // too short
-		`{"commit":"unknown"}`, // not hex
-		`not json`,             // not a document
-		`["f316cb0f"]`,         // not an object
+		`{"version":"1.2.3"}`,                                   // semver is not a commit
+		`{"commit":"abc"}`,                                      // too short
+		`{"commit":"unknown"}`,                                  // not hex
+		`{"sha":"f316cb0f"}`,                                    // generic hashes are not source commits
+		`{"notes":"Git Commit: f316cb0f"}`,                      // only the version banner is trusted
+		`{"version":"Last Git Commit: f316cb0f"}`,               // the label must start a line
+		`{"commit":"f316cb0f","git_sha":"d63a514"}`,             // recognized fields conflict
+		`{"commit":"f316cb0","git_sha":"f316cb0f"}`,             // prefix agreement is still ambiguous
+		`{"commit":"not-hex","version":"Git Commit: f316cb0f"}`, // malformed authoritative field
+		`not json`,     // not a document
+		`["f316cb0f"]`, // not an object
 	} {
 		if c, _, err := ParseVersion([]byte(body)); err == nil {
 			t.Errorf("ParseVersion(%s) = %q, want an error", body, c)
@@ -120,6 +127,36 @@ func TestTimeoutWhileUnreachableKeepsError(t *testing.T) {
 	}
 }
 
+func TestTimeoutCancelsInflightFetch(t *testing.T) {
+	f := func(ctx context.Context, _ string) ([]byte, int, error) {
+		select {
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+			return []byte(`{"commit":"2222222"}`), 0, nil
+		}
+	}
+	o := opts(f, "2222222")
+	o.Timeout = 50 * time.Millisecond
+	start := time.Now()
+	res := Verify(context.Background(), o)
+	if res.Status != StatusTimeout || time.Since(start) > 250*time.Millisecond {
+		t.Fatalf("got %+v after %s", res, time.Since(start))
+	}
+}
+
+func TestLateMatchDoesNotBeatDeadline(t *testing.T) {
+	f := func(context.Context, string) ([]byte, int, error) {
+		time.Sleep(80 * time.Millisecond) // deliberately ignores cancellation
+		return []byte(`{"commit":"2222222"}`), 0, nil
+	}
+	o := opts(f, "2222222")
+	o.Timeout = 30 * time.Millisecond
+	if res := Verify(context.Background(), o); res.Status != StatusTimeout {
+		t.Fatalf("got %+v", res)
+	}
+}
+
 func TestUnreadableFailsFast(t *testing.T) {
 	f, n := script(body(`{"version":"1.2.3"}`))
 	res := Verify(context.Background(), opts(f, "2222222"))
@@ -133,6 +170,24 @@ func TestAgentctlUsageErrorFailsFast(t *testing.T) {
 	res := Verify(context.Background(), opts(f, "2222222"))
 	if res.Status != StatusAgentctl || n.Load() != 1 || !strings.Contains(res.Error, "unknown service") {
 		t.Fatalf("got %+v", res)
+	}
+}
+
+func TestPermanentHTTPErrorFailsFast(t *testing.T) {
+	for _, status := range []string{"400", "401", "403"} {
+		f, n := script(exit(2, "agentctl: HTTP "+status+" from svc.prod /agent/version"))
+		res := Verify(context.Background(), opts(f, "2222222"))
+		if res.Status != StatusAgentctl || n.Load() != 1 || !strings.Contains(res.Error, "HTTP "+status) {
+			t.Errorf("HTTP %s: got %+v after %d fetches", status, res, n.Load())
+		}
+	}
+}
+
+func TestUnexpectedAgentctlExitFailsFast(t *testing.T) {
+	f, n := script(exit(17, "unexpected wrapper failure"))
+	res := Verify(context.Background(), opts(f, "2222222"))
+	if res.Status != StatusAgentctl || n.Load() != 1 || !strings.Contains(res.Error, "exit 17") {
+		t.Fatalf("got %+v after %d fetches", res, n.Load())
 	}
 }
 
@@ -199,7 +254,7 @@ func TestContainsViaAncestry(t *testing.T) {
 	for _, c := range cases {
 		f, _ := script(body(`{"commit":"` + c.running + `"}`))
 		o := opts(f, expected)
-		o.Once, o.Repo = true, repo
+		o.Once, o.Contains, o.Repo = true, true, repo
 		res := Verify(context.Background(), o)
 		if res.Status != c.want {
 			t.Errorf("running %s: got %+v, want %s", c.running, res, c.want)
@@ -208,10 +263,18 @@ func TestContainsViaAncestry(t *testing.T) {
 			t.Errorf("running %s: match = %q, want contains", c.running, res.Match)
 		}
 	}
-	// Without a repo there is no ancestry check.
+	// Descendant acceptance is opt-in so a rollback to expected does not
+	// succeed while the newer deployment is still running.
 	f, _ := script(body(`{"commit":"` + newer[:8] + `"}`))
 	o := opts(f, expected)
-	o.Once = true
+	o.Once, o.Repo = true, repo
+	if res := Verify(context.Background(), o); res.Status != StatusNotDeployed {
+		t.Errorf("exact default: got %+v", res)
+	}
+	// Without a repo there is no ancestry check even if requested.
+	f, _ = script(body(`{"commit":"` + newer[:8] + `"}`))
+	o = opts(f, expected)
+	o.Once, o.Contains = true, true
 	if res := Verify(context.Background(), o); res.Status != StatusNotDeployed {
 		t.Errorf("no repo: got %+v", res)
 	}
@@ -247,7 +310,7 @@ esac
 	if _, code, err := AgentctlFetch(bin, 300*time.Millisecond)(ctx, "slow.prod"); err != nil || code != 3 {
 		t.Errorf("slow: code %d err %v, want a transport-like 3", code, err)
 	}
-	if d := time.Since(start); d > 3*time.Second {
+	if d := time.Since(start); d > 2*time.Second {
 		t.Errorf("slow: a 300ms call took %s (waited on the orphaned child)", d)
 	}
 	if _, _, err := AgentctlFetch(filepath.Join(dir, "missing"), time.Second)(ctx, "ok.prod"); err == nil {
