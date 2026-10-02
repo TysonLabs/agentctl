@@ -256,14 +256,52 @@ should start it in the background and read `final` when it exits.
 |---|---|---|
 | 0 | `ok` | final answer written |
 | 1 | — | usage or precondition error (bad flags, empty diff, prompt too large, codex missing) |
-| 3 | `codex_failed` | codex exited non-zero or reported a failed turn |
+| 3 | `codex_failed` / `claude_failed` | the agent exited non-zero or reported a failed turn |
 | 4 | `no_answer` | codex exited 0 without a final answer |
 | 5 | `rate_limited` | usage or rate limit: wait, then retry |
 | 124 | `timeout` | killed at `--timeout` |
 | 125 | `stalled` | killed after `--stall` with no activity |
-| 130 | `interrupted` | agentflow was interrupted; codex was killed |
+| 130 | `interrupted` | agentflow was interrupted; the agent was killed |
 
 Set `AGENTFLOW_CODEX` to use a codex binary other than the one on `PATH`.
+
+Every launched agent is told it is a sub-agent: do the one task, report, and stop, and
+don't start other agents or reviews, commit, push or open PRs. Without that, a reviewer
+that reads the repo's `AGENTS.md` may try to start a review of its own fixes.
+
+### `agentflow claude`: the same runner for Claude Code
+
+```sh
+agentflow claude --base main                                 # default review brief, diff inlined
+agentflow claude --base main --prompt-file brief.md --write  # fix mode
+agentflow claude --uncommitted --prompt-file brief.md --max-budget-usd 3
+```
+
+It takes the same flags, guarantees and exit codes as `agentflow codex`, so a change Codex
+wrote can be reviewed by Claude. The differences:
+
+- **Sandbox by tool list.** Claude Code has no flag like codex's `sandbox_mode`, and in
+  headless mode it inherits your settings' permission mode, which can be
+  `bypassPermissions`. agentflow runs it with `--restricted` (no shell or code-running
+  tools; user, project and local settings and hooks ignored; file tools confined to
+  `--dir`) and `--strict-mcp-config` (no MCP servers). Read-only gets exactly `Read`,
+  `Grep` and `Glob`. That's an allowlist, because the default set also has tools that
+  create worktrees, message other sessions or upload content. Fix mode (`--write`) adds
+  `Edit`, `Write` and `Bash`, with Bash in Claude Code's sandbox: writes only under
+  `--dir`, no network, and no unsandboxed escape. (A full `go test` may still fail
+  there, because Go's build cache is outside `--dir`; Codex's workspace-write has the
+  same limit.)
+- **No built-in reviewer.** A scope with no prompt gets a short default review brief,
+  with the diff inlined.
+- **The answer comes from the stream.** `ok` requires exit 0 and a final `result` event
+  with `subtype: "success"` and `is_error: false`; its text becomes `final.md`. An error
+  result (`error_max_turns`, a budget stop, an API error) is `claude_failed` (exit 3), or
+  `rate_limited` (exit 5).
+- **Cost.** The JSON adds `cost_usd`, and `--max-budget-usd` stops a run at that spend.
+  The exit code is reported as `claude_exit`, and `rollout` is the session transcript
+  under `~/.claude/projects/` (or `$CLAUDE_CONFIG_DIR`).
+
+Set `AGENTFLOW_CLAUDE` to use a claude binary other than the one on `PATH`.
 
 ### `agentflow ship verify`: wait until a deploy is really live
 

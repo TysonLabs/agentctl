@@ -14,8 +14,9 @@ background and keep working; your harness tells you when it exits. Never wait in
    checkout. Keep the diff to what was asked.
 3. **Run targeted checks while editing:** the tests and linters for what you touched,
    not the whole suite.
-4. **Review with a different agent from the one that wrote the code.** For Codex:
-   `agentflow codex --base main --prompt-file brief.md --write` (fix mode). The brief says
+4. **Review with a different agent from the one that wrote the code:** if Claude wrote
+   it, `agentflow codex --base main --prompt-file brief.md --write` (fix mode); if Codex
+   or another agent wrote it, `agentflow claude` with the same flags. The brief says
    what changed, the contract it must keep, and where to look hardest. Then audit every
    fix it made: accept it, revert it, or amend it, each one for a stated reason. For a
    read-only review, drop `--write`. For a big diff, run one pass per area with

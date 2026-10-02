@@ -104,3 +104,37 @@ func TestVersion(t *testing.T) {
 		t.Errorf("code=%d out=%q", code, out)
 	}
 }
+
+func TestClaudeScopeOnlyGetsDefaultBrief(t *testing.T) {
+	dir := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x"}} {
+		if out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git: %v %s", err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "new.go"), []byte("package x // FRESH\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdinCopy := filepath.Join(t.TempDir(), "stdin.txt")
+	fake := filepath.Join(t.TempDir(), "claude")
+	script := "#!/bin/sh\ncat > " + stdinCopy + "\n" +
+		`echo '{"type":"system","subtype":"init","session_id":"s1"}'` + "\n" +
+		`echo '{"type":"result","subtype":"success","is_error":false,"result":"No findings.","session_id":"s1","total_cost_usd":0.1}'` + "\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENTFLOW_CLAUDE", fake)
+	code, out, errOut := run(t, "claude", "--dir", dir, "--uncommitted", "--out", t.TempDir())
+	if code != 0 || !strings.Contains(out, `"claude_exit": 0`) || !strings.Contains(out, `"agent": "claude"`) {
+		t.Fatalf("exit %d\nstdout %s\nstderr %s", code, out, errOut)
+	}
+	sent, _ := os.ReadFile(stdinCopy)
+	for _, want := range []string{"Review the diff below", "// FRESH", "```diff"} {
+		if !strings.Contains(string(sent), want) {
+			t.Errorf("prompt missing %q:\n%s", want, sent)
+		}
+	}
+	if code, _, errOut := run(t, "codex", "--prompt", "p", "--max-budget-usd", "1"); code != 1 || !strings.Contains(errOut, "not defined") {
+		t.Errorf("--max-budget-usd must be claude-only: exit %d %q", code, errOut)
+	}
+}
