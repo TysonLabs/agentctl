@@ -172,10 +172,11 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	pw.Close() // the child holds the write end now
 
 	var st streamState
-	st.touch(start)
+	st.touch()
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
+		defer pr.Close()
 		st.consume(pr, events)
 	}()
 
@@ -184,6 +185,11 @@ func Run(ctx context.Context, o Options) (Result, error) {
 
 	killed, waitErr := watch(ctx, o, cmd.Process.Pid, start, &st, waitCh)
 	res.DurationS = time.Since(start).Round(10 * time.Millisecond).Seconds()
+	if killed == "" {
+		// cmd.Wait only reaps the direct child. Do not leave helpers from a
+		// normally exiting codex process running in its process group.
+		cleanupGroup(cmd.Process.Pid, o.Grace)
+	}
 
 	// The pipe closes when every holder of the write end exits. A grandchild
 	// that left the process group could keep it open forever: give the reader
@@ -215,13 +221,18 @@ func Run(ctx context.Context, o Options) (Result, error) {
 			msg = lastLine(res.Stderr)
 		}
 		res.Status = StatusFailed
-		if rateLimitRe.MatchString(msg) {
+		stderrText, _ := os.ReadFile(res.Stderr)
+		if rateLimitRe.MatchString(msg) || rateLimitRe.Match(stderrText) {
 			res.Status = StatusRateLimited
 		}
 		res.Error = msg
-	case !nonEmpty(res.Final):
+	case !st.completed() || !nonEmpty(res.Final):
 		res.Status = StatusNoAnswer
-		res.Error = "codex exited 0 but wrote no final answer"
+		if !st.completed() {
+			res.Error = "codex exited 0 without a completed turn"
+		} else {
+			res.Error = "codex exited 0 but wrote no final answer"
+		}
 	default:
 		res.Status = StatusOK
 	}
@@ -306,6 +317,8 @@ func watch(ctx context.Context, o Options, pid int, start time.Time, st *streamS
 	defer tick.Stop()
 	deadline := time.NewTimer(o.Timeout)
 	defer deadline.Stop()
+	lastActivity := start
+	activity := st.activityCount()
 	for {
 		var reason Status
 		select {
@@ -317,12 +330,23 @@ func watch(ctx context.Context, o Options, pid int, start time.Time, st *streamS
 			reason = StatusTimeout
 		case <-tick.C:
 			st.refreshRollout(o.CodexHome)
-			if o.Stall > 0 && time.Since(st.lastActivity()) > o.Stall {
+			if current := st.activityCount(); current != activity {
+				activity = current
+				lastActivity = time.Now()
+			}
+			if o.Stall > 0 && time.Since(lastActivity) > o.Stall {
 				reason = StatusStalled
 			}
 		}
 		if reason == "" {
 			continue
+		}
+		// Prefer a natural exit that completed before the kill decision. This
+		// avoids reporting a boundary-time success as a timeout or stall.
+		select {
+		case err := <-waitCh:
+			return "", err
+		default:
 		}
 		return reason, killGroup(pid, o.Grace, waitCh)
 	}
@@ -340,6 +364,31 @@ func killGroup(pid int, grace time.Duration, waitCh <-chan error) error {
 	}
 	_ = syscall.Kill(-pid, syscall.SIGKILL)
 	return <-waitCh
+}
+
+// cleanupGroup terminates descendants left in codex's process group after the
+// direct child exits normally. It is bounded even if a descendant ignores
+// SIGTERM.
+func cleanupGroup(pid int, grace time.Duration) {
+	if err := syscall.Kill(-pid, 0); err != nil {
+		return
+	}
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	deadline := time.NewTimer(grace)
+	defer deadline.Stop()
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			if err := syscall.Kill(-pid, 0); err != nil {
+				return
+			}
+		case <-deadline.C:
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			return
+		}
+	}
 }
 
 func killMessage(s Status, o Options) string {
@@ -382,26 +431,20 @@ func lastLine(path string) string {
 
 // streamState is what the stdout reader learns from codex's --json events.
 type streamState struct {
-	last atomic.Int64 // unix nanos of the latest activity
+	activity atomic.Uint64
 
-	mu      sync.Mutex
-	thread  string
-	rollout string
-	rollMod time.Time
-	use     *Usage
-	fail    string
+	mu       sync.Mutex
+	thread   string
+	rollout  string
+	rollSize int64
+	rollMod  time.Time
+	use      *Usage
+	fail     string
+	complete bool
 }
 
-func (s *streamState) touch(t time.Time) {
-	for {
-		cur := s.last.Load()
-		if t.UnixNano() <= cur || s.last.CompareAndSwap(cur, t.UnixNano()) {
-			return
-		}
-	}
-}
-
-func (s *streamState) lastActivity() time.Time { return time.Unix(0, s.last.Load()) }
+func (s *streamState) touch()                { s.activity.Add(1) }
+func (s *streamState) activityCount() uint64 { return s.activity.Load() }
 
 type event struct {
 	Type     string `json:"type"`
@@ -420,8 +463,10 @@ func (s *streamState) consume(r *os.File, sink *os.File) {
 	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	for sc.Scan() {
 		line := sc.Bytes()
-		s.touch(time.Now())
-		_, _ = sink.Write(append(append([]byte{}, line...), '\n'))
+		s.touch()
+		if _, err := sink.Write(append(append([]byte{}, line...), '\n')); err != nil {
+			s.setFailure("writing codex event stream: " + err.Error())
+		}
 		var ev event
 		if json.Unmarshal(line, &ev) != nil {
 			continue
@@ -432,52 +477,68 @@ func (s *streamState) consume(r *os.File, sink *os.File) {
 			s.thread = ev.ThreadID
 		case "turn.completed":
 			s.use = ev.Usage
+			s.complete = true
 		case "turn.failed":
-			if ev.Error != nil {
+			if ev.Error != nil && strings.TrimSpace(ev.Error.Message) != "" {
 				s.fail = ev.Error.Message
 			} else {
 				s.fail = "turn failed"
 			}
 		case "error":
-			s.fail = ev.Message
+			if strings.TrimSpace(ev.Message) != "" {
+				s.fail = ev.Message
+			} else {
+				s.fail = "codex reported an error"
+			}
 		}
 		s.mu.Unlock()
 	}
+	if err := sc.Err(); err != nil {
+		s.setFailure("reading codex event stream: " + err.Error())
+	}
 }
 
-// refreshRollout finds the session log for the thread (once) and treats its
+// refreshRollout finds the session log for this run's thread and treats its
 // growth as activity: codex writes reasoning there while stdout is silent.
 func (s *streamState) refreshRollout(codexHome string) {
 	s.mu.Lock()
-	thread, path := s.thread, s.rollout
+	thread := s.thread
 	s.mu.Unlock()
 	if thread == "" || codexHome == "" {
 		return
 	}
-	if path == "" {
-		matches, _ := filepath.Glob(filepath.Join(codexHome, "sessions", "*", "*", "*", "rollout-*"+thread+".jsonl"))
-		if len(matches) == 0 {
-			return
+	// Names are rollout-<timestamp>-<thread>.jsonl, so the lexically last
+	// match is the newest file for this thread.
+	matches, _ := filepath.Glob(filepath.Join(codexHome, "sessions", "*", "*", "*", "rollout-*-"+thread+".jsonl"))
+	var path string
+	for _, match := range matches {
+		if match > path {
+			path = match
 		}
-		path = matches[0]
-		s.mu.Lock()
-		s.rollout = path
-		s.mu.Unlock()
+	}
+	if path == "" {
+		return
 	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		return
 	}
 	s.mu.Lock()
-	changed := fi.ModTime().After(s.rollMod)
+	changed := path != s.rollout || fi.Size() != s.rollSize || !fi.ModTime().Equal(s.rollMod)
+	s.rollout = path
+	s.rollSize = fi.Size()
 	s.rollMod = fi.ModTime()
 	s.mu.Unlock()
 	if changed {
-		s.touch(fi.ModTime())
+		// Use our monotonic clock for liveness. Filesystem mtimes may be stale
+		// or future-dated and are only change indicators.
+		s.touch()
 	}
 }
 
-func (s *streamState) threadID() string    { s.mu.Lock(); defer s.mu.Unlock(); return s.thread }
-func (s *streamState) rolloutPath() string { s.mu.Lock(); defer s.mu.Unlock(); return s.rollout }
-func (s *streamState) usage() *Usage       { s.mu.Lock(); defer s.mu.Unlock(); return s.use }
-func (s *streamState) failure() string     { s.mu.Lock(); defer s.mu.Unlock(); return s.fail }
+func (s *streamState) setFailure(msg string) { s.mu.Lock(); defer s.mu.Unlock(); s.fail = msg }
+func (s *streamState) threadID() string      { s.mu.Lock(); defer s.mu.Unlock(); return s.thread }
+func (s *streamState) rolloutPath() string   { s.mu.Lock(); defer s.mu.Unlock(); return s.rollout }
+func (s *streamState) usage() *Usage         { s.mu.Lock(); defer s.mu.Unlock(); return s.use }
+func (s *streamState) failure() string       { s.mu.Lock(); defer s.mu.Unlock(); return s.fail }
+func (s *streamState) completed() bool       { s.mu.Lock(); defer s.mu.Unlock(); return s.complete }

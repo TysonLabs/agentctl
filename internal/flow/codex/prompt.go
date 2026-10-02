@@ -53,6 +53,19 @@ func BuildPrompt(dir, userPrompt string, s Scope, maxBytes int) (string, error) 
 	return prompt, nil
 }
 
+// ValidateScope checks that a native review scope is valid and non-empty.
+// BuildPrompt performs the same check while obtaining the diff to inline.
+func ValidateScope(dir string, s Scope) error {
+	diff, _, err := scopedDiff(dir, s)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(diff) == "" {
+		return ErrEmptyDiff
+	}
+	return nil
+}
+
 // scopedDiff renders the diff for a scope, with renames detected (-M) so a
 // moved file is not shown as a delete plus an add.
 func scopedDiff(dir string, s Scope) (diff, label string, err error) {
@@ -63,17 +76,59 @@ func scopedDiff(dir string, s Scope) (diff, label string, err error) {
 		rangeArgs = []string{s.Base + "...HEAD"}
 		label = s.Base + "...HEAD"
 	case s.Commit != "":
-		rangeArgs = []string{s.Commit + "^!"}
 		label = "commit " + s.Commit
+		// `commit^!` has no parent to name for a root commit and produces no
+		// useful patch for a merge. Show root commits against the empty tree
+		// and merge commits against their first parent.
+		args := []string{"-C", dir, "show", "--format=", "-m", "--first-parent", "--no-color", "--no-ext-diff", "-M", s.Commit, "--"}
+		args = append(args, s.Paths...)
+		out, err := git(args...)
+		if err != nil {
+			return "", "", err
+		}
+		if len(s.Paths) > 0 {
+			label += " limited to " + strings.Join(s.Paths, " ")
+		}
+		return out, label, nil
 	case s.Uncommitted:
 		rangeArgs = []string{"HEAD"}
 		label = "uncommitted changes"
 	}
-	args := append(append(base, rangeArgs...), "--")
-	args = append(args, s.Paths...)
-	out, err := git(args...)
-	if err != nil {
-		return "", "", err
+	var out string
+	if s.Uncommitted {
+		if _, headErr := git("-C", dir, "rev-parse", "--verify", "HEAD"); headErr != nil {
+			if !isGitRepo(dir) {
+				return "", "", headErr
+			}
+			// An unborn repository has no HEAD tree. Render staged and unstaged
+			// changes separately, then add untracked files below.
+			for _, extra := range [][]string{{"--cached"}, nil} {
+				args := append(append([]string{}, base...), extra...)
+				args = append(args, "--")
+				args = append(args, s.Paths...)
+				part, err := git(args...)
+				if err != nil {
+					return "", "", err
+				}
+				out += part
+			}
+		} else {
+			args := append(append(base, rangeArgs...), "--")
+			args = append(args, s.Paths...)
+			var err error
+			out, err = git(args...)
+			if err != nil {
+				return "", "", err
+			}
+		}
+	} else {
+		args := append(append(base, rangeArgs...), "--")
+		args = append(args, s.Paths...)
+		var err error
+		out, err = git(args...)
+		if err != nil {
+			return "", "", err
+		}
 	}
 	if len(s.Paths) > 0 {
 		label += " limited to " + strings.Join(s.Paths, " ")

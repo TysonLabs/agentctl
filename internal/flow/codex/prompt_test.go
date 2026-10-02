@@ -79,6 +79,45 @@ func TestCommitScopeAndRenames(t *testing.T) {
 	}
 }
 
+func TestRootCommitScope(t *testing.T) {
+	dir := t.TempDir()
+	gitT(t, dir, "init", "-q", "-b", "main")
+	gitT(t, dir, "config", "user.email", "t@example.com")
+	gitT(t, dir, "config", "user.name", "t")
+	write(t, dir, "root.go", "package root\n")
+	gitT(t, dir, "add", ".")
+	gitT(t, dir, "commit", "-q", "-m", "root")
+	sha := gitT(t, dir, "rev-parse", "HEAD")
+	got, err := BuildPrompt(dir, "p", Scope{Commit: sha}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "new file mode") || !strings.Contains(got, "+package root") {
+		t.Fatalf("root commit diff missing:\n%s", got)
+	}
+}
+
+func TestMergeCommitUsesFirstParentDiff(t *testing.T) {
+	dir := gitRepo(t)
+	gitT(t, dir, "switch", "-q", "-c", "side")
+	write(t, dir, "side.go", "package side\n")
+	gitT(t, dir, "add", ".")
+	gitT(t, dir, "commit", "-q", "-m", "side")
+	gitT(t, dir, "switch", "-q", "main")
+	write(t, dir, "main.go", "package main\n")
+	gitT(t, dir, "add", ".")
+	gitT(t, dir, "commit", "-q", "-m", "main")
+	gitT(t, dir, "merge", "--no-ff", "-q", "-m", "merge", "side")
+	sha := gitT(t, dir, "rev-parse", "HEAD")
+	got, err := BuildPrompt(dir, "p", Scope{Commit: sha}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "side.go") || !strings.Contains(got, "+package side") {
+		t.Fatalf("merge's first-parent diff missing:\n%s", got)
+	}
+}
+
 func TestUncommittedIncludesUntracked(t *testing.T) {
 	dir := gitRepo(t)
 	write(t, dir, "a.go", "package a // edited\n")
@@ -90,6 +129,24 @@ func TestUncommittedIncludesUntracked(t *testing.T) {
 	for _, want := range []string{"package a // edited", "+var Fresh = 1", "new.go"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("prompt missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestUncommittedInUnbornRepository(t *testing.T) {
+	dir := t.TempDir()
+	gitT(t, dir, "init", "-q", "-b", "main")
+	write(t, dir, "staged.go", "package staged\n")
+	gitT(t, dir, "add", "staged.go")
+	write(t, dir, "staged.go", "package staged // modified after staging\n")
+	write(t, dir, "untracked.go", "package untracked\n")
+	got, err := BuildPrompt(dir, "p", Scope{Uncommitted: true}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"+package staged", "+package staged // modified after staging", "+package untracked"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("unborn repository diff missing %q:\n%s", want, got)
 		}
 	}
 }

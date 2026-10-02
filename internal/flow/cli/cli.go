@@ -169,6 +169,9 @@ func runCodex(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	if o.Stall < 0 {
 		return fail("--stall must not be negative")
 	}
+	if maxBytes <= 0 {
+		return fail("--max-prompt-bytes must be positive")
+	}
 	if o.Dir == "" {
 		wd, err := os.Getwd()
 		if err != nil {
@@ -179,13 +182,6 @@ func runCodex(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	if fi, err := os.Stat(o.Dir); err != nil || !fi.IsDir() {
 		return fail("--dir %s is not a directory", o.Dir)
 	}
-	if o.OutDir == "" {
-		d, err := os.MkdirTemp("", "agentflow-codex-")
-		if err != nil {
-			return fail("%v", err)
-		}
-		o.OutDir = d
-	}
 	o.Bin = os.Getenv("AGENTFLOW_CODEX")
 
 	if prompt != "" {
@@ -194,7 +190,21 @@ func runCodex(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			return fail("%v", err)
 		}
 		o.Prompt = built
+	} else if err := codex.ValidateScope(o.Dir, o.Scope); err != nil {
+		return fail("%v", err)
 	}
+	if o.OutDir == "" {
+		d, err := os.MkdirTemp("", "agentflow-codex-")
+		if err != nil {
+			return fail("%v", err)
+		}
+		o.OutDir = d
+	}
+	unlock, err := lockOutDir(o.OutDir)
+	if err != nil {
+		return fail("%v", err)
+	}
+	defer unlock()
 
 	res, err := codex.Run(ctx, o)
 	if err != nil {
@@ -207,5 +217,30 @@ func runCodex(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	if res.Status != codex.StatusOK {
 		fmt.Fprintf(stderr, "agentflow codex: %s: %s (logs: %s)\n", res.Status, res.Error, o.OutDir)
 	}
-	return exitCodes[res.Status]
+	code, ok := exitCodes[res.Status]
+	if !ok {
+		fmt.Fprintf(stderr, "agentflow codex: unknown result status %q\n", res.Status)
+		return exitCodes[codex.StatusFailed]
+	}
+	return code
+}
+
+// lockOutDir prevents concurrent runs from truncating each other's event log
+// or supplying the final.md that another run mistakes for its own answer.
+func lockOutDir(dir string) (func(), error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("--out %s is already in use by another agentflow codex run", dir)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
 }

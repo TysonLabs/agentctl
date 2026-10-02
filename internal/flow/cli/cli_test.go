@@ -31,6 +31,7 @@ func TestUsageErrors(t *testing.T) {
 		{"path without prompt", []string{"codex", "--base", "main", "--path", "x"}, "--path needs"},
 		{"bad flag", []string{"codex", "--sandbox", "danger-full-access"}, "flag provided but not defined"},
 		{"bad timeout", []string{"codex", "--prompt", "p", "--timeout", "0s"}, "--timeout"},
+		{"bad prompt cap", []string{"codex", "--prompt", "p", "--max-prompt-bytes", "0"}, "--max-prompt-bytes"},
 		{"missing dir", []string{"codex", "--prompt", "p", "--dir", "/no/such/dir"}, "not a directory"},
 	}
 	for _, c := range cases {
@@ -65,6 +66,37 @@ func TestEmptyScopeExitsBeforeCodex(t *testing.T) {
 	if code != 1 || !strings.Contains(errOut, "no changes") {
 		t.Errorf("code=%d stderr=%q", code, errOut)
 	}
+}
+
+func TestNativeEmptyScopeExitsBeforeCodex(t *testing.T) {
+	dir := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x"}} {
+		if out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git: %v %s", err, out)
+		}
+	}
+	t.Setenv("AGENTFLOW_CODEX", "/no/such/codex") // must never be reached
+	code, _, errOut := run(t, "codex", "--dir", dir, "--uncommitted")
+	if code != 1 || !strings.Contains(errOut, "no changes") {
+		t.Errorf("code=%d stderr=%q", code, errOut)
+	}
+}
+
+func TestOutDirLockRejectsConcurrentRun(t *testing.T) {
+	dir := t.TempDir()
+	unlock, err := lockOutDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockOutDir(dir); err == nil || !strings.Contains(err.Error(), "already in use") {
+		t.Fatalf("second lock error = %v, want already in use", err)
+	}
+	unlock()
+	unlockAgain, err := lockOutDir(dir)
+	if err != nil {
+		t.Fatalf("lock after release: %v", err)
+	}
+	unlockAgain()
 }
 
 func TestVersion(t *testing.T) {

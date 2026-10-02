@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -68,6 +69,10 @@ func fakeCodex(mode string) int {
 	case "ratelimit":
 		emit(`{"type":"error","message":"You've hit your usage limit. Try again in 2 hours."}`)
 		return 1
+	case "ratelimit-stderr":
+		fmt.Fprintln(os.Stderr, "HTTP 429: retry later")
+		emit(`{"type":"turn.failed","error":{"message":"request failed"}}`)
+		return 1
 	case "stderr-only":
 		fmt.Fprintln(os.Stderr, "Reading additional input from stdin...")
 		fmt.Fprintln(os.Stderr, "Error: Not inside a trusted directory")
@@ -89,6 +94,7 @@ func fakeCodex(mode string) int {
 			emit(`{"type":"item.completed","item":{"type":"agent_message"}}`)
 		}
 		_ = os.WriteFile(final, []byte("done\n"), 0o644)
+		emit(`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`)
 		return 0
 	case "rollout":
 		// No stdout for 3s, but the session log keeps growing.
@@ -98,11 +104,44 @@ func fakeCodex(mode string) int {
 		log := filepath.Join(day, "rollout-2026-10-02T00-00-00-"+thread+".jsonl")
 		for i := range 30 {
 			time.Sleep(100 * time.Millisecond)
-			now := time.Now()
-			_ = os.WriteFile(log, []byte(strconv.Itoa(i)), 0o644)
-			_ = os.Chtimes(log, now, now)
+			f, _ := os.OpenFile(log, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+			_, _ = fmt.Fprintln(f, i)
+			_ = f.Close()
+			// Size growth, rather than a trustworthy filesystem clock, must be
+			// enough to reset the stall timer.
+			past := time.Unix(1, 0)
+			_ = os.Chtimes(log, past, past)
 		}
 		_ = os.WriteFile(final, []byte("done\n"), 0o644)
+		emit(`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`)
+		return 0
+	case "future-rollout":
+		// A future-dated mtime must not suppress stall detection forever.
+		home := os.Getenv("FAKE_CODEX_HOME")
+		day := filepath.Join(home, "sessions", "2026", "10", "02")
+		_ = os.MkdirAll(day, 0o755)
+		log := filepath.Join(day, "rollout-2026-10-02T00-00-00-"+thread+".jsonl")
+		_ = os.WriteFile(log, []byte("one event"), 0o644)
+		future := time.Now().Add(time.Hour)
+		_ = os.Chtimes(log, future, future)
+		time.Sleep(time.Hour)
+	case "leaky-exit":
+		child := exec.Command(os.Args[0])
+		child.Env = append(os.Environ(), "FAKE_CODEX_MODE=sleeper")
+		child.Stdout = os.Stdout // keep the agentflow stdout pipe open
+		if err := child.Start(); err != nil {
+			return 98
+		}
+		_ = os.WriteFile(filepath.Join(rec, "child.pid"), []byte(strconv.Itoa(child.Process.Pid)), 0o644)
+		_ = os.WriteFile(final, []byte("done\n"), 0o644)
+		emit(`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`)
+		return 0
+	case "final-without-completion":
+		_ = os.WriteFile(final, []byte("partial answer\n"), 0o644)
+		return 0
+	case "midline":
+		_ = os.WriteFile(final, []byte("done\n"), 0o644)
+		fmt.Print(`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`)
 		return 0
 	}
 	return 99
@@ -177,6 +216,38 @@ func TestOKExecMode(t *testing.T) {
 	}
 }
 
+func TestBuildArgsForCodex0159(t *testing.T) {
+	tests := []struct {
+		name   string
+		o      Options
+		inRepo bool
+		want   []string
+	}{
+		{
+			name:   "exec",
+			o:      Options{Dir: "/repo", Prompt: "p"},
+			inRepo: true,
+			want:   []string{"exec", "-C", "/repo", "--json", "-c", `sandbox_mode="read-only"`, "-o", "/out/final.md", "-"},
+		},
+		{
+			name: "review",
+			o: Options{
+				Scope: Scope{Base: "main"},
+				Write: true,
+				Model: "gpt-test",
+			},
+			want: []string{"exec", "review", "--base", "main", "--json", "-c", `sandbox_mode="workspace-write"`, "-o", "/out/final.md", "--skip-git-repo-check", "-m", "gpt-test"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := buildArgs(tt.o, "/out/final.md", tt.inRepo); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("argv = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestReviewModeClosesStdinAndPinsSandbox(t *testing.T) {
 	h := newHarness(t, "ok")
 	o := h.opts()
@@ -235,6 +306,21 @@ func TestEmptyAnswerIsNotOK(t *testing.T) {
 	}
 }
 
+func TestFinalWithoutCompletedTurnIsNotOK(t *testing.T) {
+	h := newHarness(t, "final-without-completion")
+	res := run(t, h.opts())
+	if res.Status != StatusNoAnswer || !strings.Contains(res.Error, "completed turn") {
+		t.Fatalf("got %+v, want no_answer for an incomplete turn", res)
+	}
+}
+
+func TestCompletedEventWithoutTrailingNewlineIsRead(t *testing.T) {
+	h := newHarness(t, "midline")
+	if res := run(t, h.opts()); res.Status != StatusOK {
+		t.Fatalf("got %+v, want ok", res)
+	}
+}
+
 func TestStaleFinalFromEarlierRunIsRemoved(t *testing.T) {
 	h := newHarness(t, "empty")
 	if err := os.WriteFile(filepath.Join(h.out, "final.md"), []byte("old answer"), 0o644); err != nil {
@@ -253,6 +339,7 @@ func TestFailures(t *testing.T) {
 		{"fail", "model refused", StatusFailed},
 		{"fail-exit0", "stream disconnected", StatusFailed},
 		{"ratelimit", "usage limit", StatusRateLimited},
+		{"ratelimit-stderr", "request failed", StatusRateLimited},
 		{"stderr-only", "Not inside a trusted directory", StatusFailed},
 	}
 	for _, c := range cases {
@@ -308,6 +395,20 @@ func TestRolloutGrowthCountsAsActivity(t *testing.T) {
 	h := newHarness(t, "rollout")
 	o := h.opts()
 	t.Setenv("FAKE_CODEX_HOME", o.CodexHome)
+	// A stale file with the same suffix must not capture the watcher and hide
+	// the rollout created by this run.
+	staleDir := filepath.Join(o.CodexHome, "sessions", "2020", "01", "01")
+	if err := os.MkdirAll(staleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(staleDir, "rollout-old-thread-rollout.jsonl")
+	if err := os.WriteFile(stale, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
 	o.Stall = 1500 * time.Millisecond
 	res := run(t, o)
 	if res.Status != StatusOK {
@@ -316,6 +417,32 @@ func TestRolloutGrowthCountsAsActivity(t *testing.T) {
 	if !strings.HasSuffix(res.Rollout, "thread-rollout.jsonl") {
 		t.Errorf("rollout = %q", res.Rollout)
 	}
+}
+
+func TestFutureRolloutMtimeDoesNotDisableStall(t *testing.T) {
+	h := newHarness(t, "future-rollout")
+	o := h.opts()
+	t.Setenv("FAKE_CODEX_HOME", o.CodexHome)
+	o.Stall = 500 * time.Millisecond
+	o.Timeout = 3 * time.Second
+	if res := run(t, o); res.Status != StatusStalled {
+		t.Fatalf("got %+v, want stalled", res)
+	}
+}
+
+func TestNormalExitKillsStdoutHoldingDescendant(t *testing.T) {
+	h := newHarness(t, "leaky-exit")
+	o := h.opts()
+	o.Grace = 300 * time.Millisecond
+	res := run(t, o)
+	if res.Status != StatusOK {
+		t.Fatalf("got %+v, want ok", res)
+	}
+	pid, err := strconv.Atoi(h.recorded("child.pid"))
+	if err != nil {
+		t.Fatalf("child pid not recorded: %v", err)
+	}
+	assertDead(t, pid)
 }
 
 func TestCancelInterruptsAndKills(t *testing.T) {
