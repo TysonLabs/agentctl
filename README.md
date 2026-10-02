@@ -216,6 +216,54 @@ Non-normative conventions that make a surface pleasant to consume:
 - Bound every response: default and maximum `limit`, per-entry byte caps, and a total that stays
   well under agentctl's 10 MiB ceiling.
 
+## agentflow (companion binary)
+
+`agentflow` lives in the same repo as a **separate binary** (`cmd/agentflow`), so agentctl
+keeps its read-only guarantee and permission allowlists stay per tool. An import-boundary
+test keeps the two apart. Each agentflow command does one job and reports a JSON result
+and an exit code. It is a set of tools, not a harness: the workflow itself stays in prose.
+
+### `agentflow codex`: run Codex without hangs or false greens
+
+```sh
+agentflow codex --base main                                  # codex's built-in reviewer over main...HEAD
+agentflow codex --base main --prompt-file brief.md           # your brief, with the scoped diff inlined
+agentflow codex --uncommitted --prompt-file brief.md --path internal/flow   # one area at a time
+agentflow codex --prompt-file plan-review.md --dir ~/src/repo                # any read-only task
+agentflow codex --base main --prompt-file fix.md --write     # fix mode (workspace-write)
+```
+
+What it guarantees, each one a way a hand-typed Codex invocation has failed:
+
+| Failure | What agentflow does |
+|---|---|
+| Hangs forever on `Reading additional input from stdin...` | stdin is never inherited: it is `/dev/null`, or the prompt file (read to EOF) |
+| The review subcommand has no `--sandbox` flag and inherits workspace-write | sandbox always pinned via `-c sandbox_mode=...`; read-only unless `--write` |
+| Scope flags can't be combined with a custom prompt (clap error) | a scope plus a prompt inlines the scoped diff (`git diff -M`, untracked files included) |
+| Runs for an hour, or wedges silently | `--timeout` (default 40m) and `--stall` (default 10m with no `--json` events *and* no growth of codex's session log) kill the whole process group |
+| Exit 0 with no answer read as "clean review" | `ok` requires exit 0, no failed turn, and a non-empty final answer |
+| Giant prompts stall in reasoning | prompts over `--max-prompt-bytes` (default 80000) are refused with a hint to split by `--path` |
+| `-C` outside a git repo dies on the trust check | `--skip-git-repo-check` is added only when `--dir` is not a git work tree |
+| An empty scope "passes" | an empty diff is an error, never a review |
+
+Output: JSON on stdout (also `<out>/result.json`), with `status`, `codex_exit`, `duration_s`,
+`thread_id`, `usage`, `error`, and paths to `final.md` (the answer), `prompt.md`,
+`events.jsonl`, `stderr.log` and codex's session rollout. Runs take minutes, so agents
+should start it in the background and read `final` when it exits.
+
+| Exit | Status | Meaning |
+|---|---|---|
+| 0 | `ok` | final answer written |
+| 1 | — | usage or precondition error (bad flags, empty diff, prompt too large, codex missing) |
+| 3 | `codex_failed` | codex exited non-zero or reported a failed turn |
+| 4 | `no_answer` | codex exited 0 without a final answer |
+| 5 | `rate_limited` | usage or rate limit: wait, then retry |
+| 124 | `timeout` | killed at `--timeout` |
+| 125 | `stalled` | killed after `--stall` with no activity |
+| 130 | `interrupted` | agentflow was interrupted; codex was killed |
+
+Set `AGENTFLOW_CODEX` to use a codex binary other than the one on `PATH`.
+
 ## Non-goals
 
 Color/TTY niceties, retries, response caching, keychain integration, `--json` listing output,
