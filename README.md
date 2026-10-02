@@ -221,7 +221,8 @@ Non-normative conventions that make a surface pleasant to consume:
 `agentflow` lives in the same repo as a **separate binary** (`cmd/agentflow`), so agentctl
 keeps its read-only guarantee and permission allowlists stay per tool. An import-boundary
 test keeps the two apart. Each agentflow command does one job and reports a JSON result
-and an exit code. It is a set of tools, not a harness: the workflow itself stays in prose.
+and an exit code. It is a set of tools, not a harness: the workflow itself stays in prose,
+in [AGENTS.md](AGENTS.md).
 
 ### `agentflow codex`: run Codex without hangs or false greens
 
