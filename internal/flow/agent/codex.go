@@ -13,7 +13,7 @@
 // `--json` event stream on stdout is silent while the model reasons, and
 // codex's session rollout file (~/.codex/sessions/.../rollout-*-<thread>.jsonl)
 // only exists once the thread has started.
-package codex
+package agent
 
 import (
 	"bufio"

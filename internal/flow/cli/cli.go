@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/TysonLabs/agentctl/internal/flow/codex"
+	"github.com/TysonLabs/agentctl/internal/flow/agent"
 )
 
 // Version is injected from main via ldflags.
@@ -63,14 +63,14 @@ Exit codes: 0 ok · 1 usage/precondition · 3 codex failed · 4 no final answer
             5 rate/usage limited · 124 timeout · 125 stalled · 130 interrupted
 `
 
-var exitCodes = map[codex.Status]int{
-	codex.StatusOK:          0,
-	codex.StatusFailed:      3,
-	codex.StatusNoAnswer:    4,
-	codex.StatusRateLimited: 5,
-	codex.StatusTimeout:     124,
-	codex.StatusStalled:     125,
-	codex.StatusInterrupted: 130,
+var exitCodes = map[agent.Status]int{
+	agent.StatusOK:          0,
+	agent.StatusFailed:      3,
+	agent.StatusNoAnswer:    4,
+	agent.StatusRateLimited: 5,
+	agent.StatusTimeout:     124,
+	agent.StatusStalled:     125,
+	agent.StatusInterrupted: 130,
 }
 
 // Run executes agentflow with args (without the program name).
@@ -113,7 +113,7 @@ func runCodex(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	fs := flag.NewFlagSet("agentflow codex", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var (
-		o          codex.Options
+		o          agent.Options
 		prompt     string
 		promptFile string
 		maxBytes   int
@@ -198,12 +198,12 @@ func runCodex(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	o.Bin = os.Getenv("AGENTFLOW_CODEX")
 
 	if prompt != "" {
-		built, err := codex.BuildPrompt(o.Dir, prompt, o.Scope, maxBytes)
+		built, err := agent.BuildPrompt(o.Dir, prompt, o.Scope, maxBytes)
 		if err != nil {
 			return fail("%v", err)
 		}
 		o.Prompt = built
-	} else if err := codex.ValidateScope(o.Dir, o.Scope); err != nil {
+	} else if err := agent.ValidateScope(o.Dir, o.Scope); err != nil {
 		return fail("%v", err)
 	}
 	if o.OutDir == "" {
@@ -219,7 +219,7 @@ func runCodex(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 	defer unlock()
 
-	res, err := codex.Run(ctx, o)
+	res, err := agent.Run(ctx, o)
 	if err != nil {
 		return fail("%v", err)
 	}
@@ -227,13 +227,13 @@ func runCodex(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	out = append(out, '\n')
 	_ = os.WriteFile(filepath.Join(o.OutDir, "result.json"), out, 0o644)
 	_, _ = stdout.Write(out)
-	if res.Status != codex.StatusOK {
+	if res.Status != agent.StatusOK {
 		fmt.Fprintf(stderr, "agentflow codex: %s: %s (logs: %s)\n", res.Status, res.Error, o.OutDir)
 	}
 	code, ok := exitCodes[res.Status]
 	if !ok {
 		fmt.Fprintf(stderr, "agentflow codex: unknown result status %q\n", res.Status)
-		return exitCodes[codex.StatusFailed]
+		return exitCodes[agent.StatusFailed]
 	}
 	return code
 }
