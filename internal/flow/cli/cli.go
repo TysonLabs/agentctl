@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -62,8 +63,8 @@ codex and claude flags:
   Sandboxing: codex runs with -c sandbox_mode=read-only (or workspace-write).
   claude runs --restricted with only Read, Grep and Glob; in fix mode it also
   gets Edit, Write and Bash, with Bash in Claude Code's sandbox (writes only
-  under --dir, no network). Both are told they are a sub-agent: do the task,
-  report, stop, and start no other agents.
+  under --dir, no network). Prompt-driven runs are told they are a sub-agent:
+  do the task, report, stop, and start no other agents.
 
 Output: the JSON result on stdout (also saved as <out>/result.json); the
 review itself is in the file named by "final".
@@ -211,8 +212,8 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 	if o.Timeout <= 0 {
 		return fail("--timeout must be positive")
 	}
-	if o.MaxBudgetUSD < 0 {
-		return fail("--max-budget-usd must not be negative")
+	if o.MaxBudgetUSD < 0 || math.IsNaN(o.MaxBudgetUSD) || math.IsInf(o.MaxBudgetUSD, 0) {
+		return fail("--max-budget-usd must be a finite non-negative number")
 	}
 	if o.Stall < 0 {
 		return fail("--stall must not be negative")
@@ -248,7 +249,7 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 		}
 		o.OutDir = d
 	}
-	unlock, err := lockOutDir(o.OutDir)
+	unlock, err := lockOutDir(o.OutDir, name)
 	if err != nil {
 		return fail("%v", err)
 	}
@@ -275,7 +276,7 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 
 // lockOutDir prevents concurrent runs from truncating each other's event log
 // or supplying the final.md that another run mistakes for its own answer.
-func lockOutDir(dir string) (func(), error) {
+func lockOutDir(dir, agentName string) (func(), error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -285,7 +286,7 @@ func lockOutDir(dir string) (func(), error) {
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("--out %s is already in use by another agentflow run", dir)
+		return nil, fmt.Errorf("--out %s is already in use by another agentflow %s run", dir, agentName)
 	}
 	return func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)

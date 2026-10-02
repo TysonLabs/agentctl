@@ -255,9 +255,9 @@ should start it in the background and read `final` when it exits.
 | Exit | Status | Meaning |
 |---|---|---|
 | 0 | `ok` | final answer written |
-| 1 | — | usage or precondition error (bad flags, empty diff, prompt too large, codex missing) |
+| 1 | — | usage or precondition error (bad flags, empty diff, prompt too large, agent missing) |
 | 3 | `codex_failed` / `claude_failed` | the agent exited non-zero or reported a failed turn |
-| 4 | `no_answer` | codex exited 0 without a final answer |
+| 4 | `no_answer` | the agent exited 0 without a final answer |
 | 5 | `rate_limited` | usage or rate limit: wait, then retry |
 | 124 | `timeout` | killed at `--timeout` |
 | 125 | `stalled` | killed after `--stall` with no activity |
@@ -265,9 +265,11 @@ should start it in the background and read `final` when it exits.
 
 Set `AGENTFLOW_CODEX` to use a codex binary other than the one on `PATH`.
 
-Every launched agent is told it is a sub-agent: do the one task, report, and stop, and
-don't start other agents or reviews, commit, push or open PRs. Without that, a reviewer
-that reads the repo's `AGENTS.md` may try to start a review of its own fixes.
+Every prompt-driven agent is told it is a sub-agent: do the one task, report, and stop,
+and don't start other agents or reviews, commit, push or open PRs. Codex's native
+`exec review` mode has no prompt file; it uses its built-in reviewer instructions.
+Without the note, a prompted reviewer that reads the repo's `AGENTS.md` may try to
+start a review of its own fixes.
 
 ### `agentflow claude`: the same runner for Claude Code
 
@@ -277,8 +279,8 @@ agentflow claude --base main --prompt-file brief.md --write  # fix mode
 agentflow claude --uncommitted --prompt-file brief.md --max-budget-usd 3
 ```
 
-It takes the same flags, guarantees and exit codes as `agentflow codex`, so a change Codex
-wrote can be reviewed by Claude. The differences:
+It takes the shared flags, guarantees and exit codes of `agentflow codex`, so a change
+Codex wrote can be reviewed by Claude. The differences:
 
 - **Sandbox by tool list.** Claude Code has no flag like codex's `sandbox_mode`, and in
   headless mode it inherits your settings' permission mode, which can be

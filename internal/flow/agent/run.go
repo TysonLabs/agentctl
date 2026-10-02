@@ -79,9 +79,9 @@ type Options struct {
 	Grace        time.Duration // SIGTERM → SIGKILL delay (default 5s)
 }
 
-// ReviewerNote tells a launched agent that it is the sub-agent, not the
-// author: do the one task and stop. Without it, an agent that reads the
-// repo's AGENTS.md or CLAUDE.md may try to start a review of its own work.
+// ReviewerNote tells a prompt-driven agent that it is the sub-agent, not the
+// author: do the one task and stop. Without it, an agent that reads the repo's
+// AGENTS.md or CLAUDE.md may try to start a review of its own work.
 const ReviewerNote = "You were started by agentflow as a sub-agent for one task: the prompt below. " +
 	"Do that task, report, and stop. Do not start other agents or reviews (agentflow, codex, claude), " +
 	"and do not commit, push, merge or open pull requests."
@@ -467,14 +467,14 @@ func (s *streamState) consume(r *os.File, sink *os.File) {
 		line := sc.Bytes()
 		s.touch()
 		if _, err := sink.Write(append(append([]byte{}, line...), '\n')); err != nil {
-			s.setFailure("writing the event stream: " + err.Error())
+			s.setFailure("writing " + s.backend.name() + " event stream: " + err.Error())
 		}
 		s.mu.Lock()
 		s.backend.handle(line, s)
 		s.mu.Unlock()
 	}
 	if err := sc.Err(); err != nil {
-		s.setFailure("reading the event stream: " + err.Error())
+		s.setFailure("reading " + s.backend.name() + " event stream: " + err.Error())
 	}
 }
 

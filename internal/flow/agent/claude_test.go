@@ -50,6 +50,9 @@ func fakeClaude(mode string) int {
 	case "ratelimit":
 		result("success", true, "API Error: 429 rate limit exceeded, retry later")
 		return 1
+	case "ratelimit-multiline":
+		result("error_during_execution", true, "API Error\nrate limit exceeded, retry later")
+		return 1
 	case "session-log":
 		// Silent on stdout for 3s while the session log grows.
 		day := filepath.Join(os.Getenv("FAKE_CODEX_HOME"), "projects", "-tmp-repo")
@@ -109,7 +112,7 @@ func TestClaudeWriteModeIsSandboxed(t *testing.T) {
 	}
 	args := h.recorded("args.txt")
 	for _, want := range []string{"--restricted", "--tools\nRead,Grep,Glob,Edit,Write,Bash", "--permission-mode\nacceptEdits",
-		`"sandbox":{"enabled":true`, `"allowUnsandboxedCommands":false`} {
+		`"sandbox":{"enabled":true`, `"autoAllowBashIfSandboxed":true`, `"allowUnsandboxedCommands":false`} {
 		if !strings.Contains(args, want) {
 			t.Errorf("argv missing %q:\n%s", want, args)
 		}
@@ -142,6 +145,7 @@ func TestClaudeFailures(t *testing.T) {
 		{"max-turns", StatusClaudeFailed, "error_max_turns"},
 		{"api-error", StatusClaudeFailed, "API Error: 500"},
 		{"ratelimit", StatusRateLimited, "429"},
+		{"ratelimit-multiline", StatusRateLimited, "rate limit"},
 	}
 	for _, c := range cases {
 		t.Run(c.mode, func(t *testing.T) {
@@ -185,12 +189,14 @@ func TestResultJSONNamesTheAgentsExit(t *testing.T) {
 	zero := 0
 	for _, c := range []struct{ agent, want, not string }{{"codex", `"codex_exit":0`, "claude_exit"}, {"claude", `"claude_exit":0`, "codex_exit"}} {
 		b, err := json.Marshal(Result{Status: StatusOK, Agent: c.agent, Exit: &zero})
-		if err != nil || !strings.Contains(string(b), c.want) || strings.Contains(string(b), c.not) {
+		if err != nil || !strings.Contains(string(b), `"agent":"`+c.agent+`"`) || !strings.Contains(string(b), c.want) || strings.Contains(string(b), c.not) {
 			t.Errorf("%s: %s %v", c.agent, b, err)
 		}
 	}
-	b, _ := json.Marshal(Result{Status: StatusTimeout, Agent: "codex"})
-	if !strings.Contains(string(b), `"codex_exit":null`) {
-		t.Errorf("a killed run must report a null exit: %s", b)
+	for _, agent := range []string{"codex", "claude"} {
+		b, _ := json.Marshal(Result{Status: StatusTimeout, Agent: agent})
+		if !strings.Contains(string(b), `"`+agent+`_exit":null`) {
+			t.Errorf("a killed %s run must report a null exit: %s", agent, b)
+		}
 	}
 }

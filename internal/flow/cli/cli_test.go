@@ -84,19 +84,30 @@ func TestNativeEmptyScopeExitsBeforeCodex(t *testing.T) {
 
 func TestOutDirLockRejectsConcurrentRun(t *testing.T) {
 	dir := t.TempDir()
-	unlock, err := lockOutDir(dir)
+	unlock, err := lockOutDir(dir, "codex")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := lockOutDir(dir); err == nil || !strings.Contains(err.Error(), "already in use") {
+	if _, err := lockOutDir(dir, "codex"); err == nil || !strings.Contains(err.Error(), "another agentflow codex run") {
 		t.Fatalf("second lock error = %v, want already in use", err)
 	}
 	unlock()
-	unlockAgain, err := lockOutDir(dir)
+	unlockAgain, err := lockOutDir(dir, "codex")
 	if err != nil {
 		t.Fatalf("lock after release: %v", err)
 	}
 	unlockAgain()
+}
+
+func TestClaudeRejectsNonFiniteBudget(t *testing.T) {
+	for _, value := range []string{"NaN", "+Inf", "-Inf"} {
+		t.Run(value, func(t *testing.T) {
+			code, _, errOut := run(t, "claude", "--prompt", "p", "--max-budget-usd", value)
+			if code != 1 || !strings.Contains(errOut, "finite non-negative") {
+				t.Errorf("code=%d stderr=%q", code, errOut)
+			}
+		})
+	}
 }
 
 func TestVersion(t *testing.T) {

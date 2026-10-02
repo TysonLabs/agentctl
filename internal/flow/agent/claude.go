@@ -111,6 +111,8 @@ func (claudeBackend) handle(line []byte, s *streamState) {
 	}
 	// error_max_turns, error_during_execution, a budget stop, or an API
 	// error reported as a result: never an answer.
-	msg := strings.TrimSpace(strings.SplitN(text, "\n", 2)[0])
+	// Keep the complete result so classification can see a rate-limit marker
+	// even when Claude puts it after a generic first line such as "API Error".
+	msg := strings.TrimSpace(text)
 	s.fail = strings.TrimSpace(fmt.Sprintf("result %s: %s", ev.Subtype, msg))
 }
