@@ -15,11 +15,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -99,7 +101,7 @@ func List(ctx context.Context, env Env, dir string) ([]Worktree, error) {
 			}
 		}
 	}
-	return list, nil
+	return list, sc.Err()
 }
 
 // Find resolves a worktree by path (absolute or relative to dir), by
@@ -127,10 +129,23 @@ func Find(list []Worktree, dir, target string) (Worktree, error) {
 }
 
 func canonical(p string) string {
-	if r, err := filepath.EvalSymlinks(p); err == nil {
-		return r
+	p = filepath.Clean(p)
+	cur := p
+	var suffix []string
+	for {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				r = filepath.Join(r, suffix[i])
+			}
+			return r
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return p
+		}
+		suffix = append(suffix, filepath.Base(cur))
+		cur = parent
 	}
-	return filepath.Clean(p)
 }
 
 // Target is the branch merges are checked against, e.g. "origin/main".
@@ -145,11 +160,21 @@ func (t Target) Ref() string { return t.Remote + "/" + t.Branch }
 func DefaultTarget(ctx context.Context, env Env, dir, into string) (Target, error) {
 	env = env.withDefaults()
 	if into != "" {
-		remote, branch, ok := strings.Cut(into, "/")
-		if !ok {
-			return Target{Remote: "origin", Branch: into}, nil
+		out, err := run(ctx, dir, env.Git, "remote")
+		if err != nil {
+			return Target{}, err
 		}
-		return Target{Remote: remote, Branch: branch}, nil
+		remotes := nonEmptyLines(out)
+		sort.Slice(remotes, func(i, j int) bool { return len(remotes[i]) > len(remotes[j]) })
+		for _, remote := range remotes {
+			if branch, ok := strings.CutPrefix(into, remote+"/"); ok {
+				if branch == "" {
+					return Target{}, fmt.Errorf("--into %q has no branch", into)
+				}
+				return Target{Remote: remote, Branch: branch}, nil
+			}
+		}
+		return Target{Remote: "origin", Branch: into}, nil
 	}
 	out, err := run(ctx, dir, env.Git, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
 	if err != nil {
@@ -180,6 +205,9 @@ type Check struct {
 	KeepBranch string `json:"keep_branch,omitempty"`
 }
 
+// ErrRefused means safety changed after Inspect and removal was not attempted.
+var ErrRefused = errors.New("worktree removal refused")
+
 // Inspect decides whether w can be removed. It never changes anything.
 // target must have been fetched already.
 func Inspect(ctx context.Context, env Env, w Worktree, t Target) (Check, error) {
@@ -209,7 +237,43 @@ func Inspect(ctx context.Context, env Env, w Worktree, t Target) (Check, error) 
 	if lines := nonEmptyLines(dirty); len(lines) > 0 {
 		refuse("%d modified or untracked file(s) would be lost, e.g. %s", len(lines), strings.TrimSpace(lines[0]))
 	}
+	nested, err := nestedWorktrees(ctx, env, w.Path)
+	if err != nil {
+		return c, err
+	}
+	if len(nested) > 0 {
+		refuse("contains registered worktree(s) that would be deleted: %s", strings.Join(nested, ", "))
+	}
+	subs, err := initializedSubmodules(ctx, env, w.Path)
+	if err != nil {
+		return c, err
+	}
+	if len(subs) > 0 {
+		refuse("contains initialized submodule(s), which git cannot remove without --force: %s", strings.Join(subs, ", "))
+	}
+	repos, err := nestedRepositories(w.Path, append(append([]string(nil), nested...), subs...))
+	if err != nil {
+		return c, err
+	}
+	if len(repos) > 0 {
+		refuse("contains nested Git repository/repositories that would be deleted: %s", strings.Join(repos, ", "))
+	}
 
+	targetHead, err := resolveCommit(ctx, env, w.Path, t.Ref())
+	if err != nil {
+		return c, fmt.Errorf("resolve fetched target %s: %w", t.Ref(), err)
+	}
+	via, err := mergeProof(ctx, env, w, t, targetHead)
+	if err != nil {
+		return c, err
+	}
+	if via == "" {
+		refuse("not merged: %s is not contained in %s and no merged PR has exactly this head", short(w.Head), t.Ref())
+	}
+	c.MergedVia = via
+
+	// Keep this last so Remove's second Inspect leaves the smallest possible
+	// window for another process to enter after the in-use check.
 	users, err := cwdUsers(ctx, env, w.Path)
 	if err != nil {
 		refuse("cannot check whether a process is using it (%v)", err)
@@ -220,22 +284,177 @@ func Inspect(ctx context.Context, env Env, w Worktree, t Target) (Check, error) 
 		}
 		refuse("in use: %s %s inside", strings.Join(users, ", "), verb)
 	}
-
-	via, err := mergeProof(ctx, env, w, t)
-	if err != nil {
-		return c, err
-	}
-	if via == "" {
-		refuse("not merged: %s is not contained in %s and no merged PR has exactly this head", short(w.Head), t.Ref())
-	}
-	c.MergedVia = via
 	c.OK = len(c.Refusals) == 0
 	return c, nil
 }
 
+func nestedWorktrees(ctx context.Context, env Env, root string) ([]string, error) {
+	list, err := List(ctx, env, root)
+	if err != nil {
+		return nil, err
+	}
+	root = canonical(root)
+	var nested []string
+	for _, other := range list {
+		path := canonical(other.Path)
+		if path == root || !pathWithin(root, path) {
+			continue
+		}
+		if _, err := os.Stat(other.Path); err == nil {
+			nested = append(nested, other.Path)
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+	}
+	return nested, nil
+}
+
+// nestedRepositories finds Git metadata belonging to repositories beneath the
+// worktree. A nested repository can be ignored by the parent, in which case a
+// plain `git worktree remove` recursively deletes it without warning.
+func nestedRepositories(root string, excluded []string) ([]string, error) {
+	root = filepath.Clean(root)
+	skip := make(map[string]bool, len(excluded))
+	for _, path := range excluded {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(root, path)
+		}
+		skip[canonical(path)] = true
+	}
+	var nested []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Name() == ".git" {
+			if filepath.Dir(path) == root {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			ok, err := isGitMetadata(path, d)
+			if err != nil {
+				return err
+			}
+			if ok && !skip[canonical(filepath.Dir(path))] {
+				nested = append(nested, filepath.Dir(path))
+			}
+			if ok && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// A bare repository has its metadata at its root instead of beneath a
+		// .git entry. Looking only at HEAD keeps this check linear in tree size.
+		if d.Name() == "HEAD" && !d.IsDir() && filepath.Dir(path) != root {
+			ok, err := isGitDir(filepath.Dir(path))
+			if err != nil {
+				return err
+			}
+			if ok && !skip[canonical(filepath.Dir(path))] {
+				nested = append(nested, filepath.Dir(path))
+			}
+		}
+		return nil
+	})
+	return nested, err
+}
+
+func isGitMetadata(path string, d fs.DirEntry) (bool, error) {
+	if d.IsDir() {
+		return isGitDir(path)
+	}
+	if !d.Type().IsRegular() {
+		return false, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, 4097))
+	if err != nil {
+		return false, err
+	}
+	if len(b) > 4096 {
+		return false, nil
+	}
+	target, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "gitdir: ")
+	if !ok || target == "" {
+		return false, nil
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(path), target)
+	}
+	return isGitDir(filepath.Clean(target))
+}
+
+func isGitDir(path string) (bool, error) {
+	head, err := os.ReadFile(filepath.Join(path, "HEAD"))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	headText := strings.TrimSpace(string(head))
+	if !strings.HasPrefix(headText, "ref: refs/") && !isHexOID(headText) {
+		return false, nil
+	}
+	for _, marker := range []string{"objects", "commondir"} {
+		if _, err := os.Stat(filepath.Join(path, marker)); err == nil {
+			return true, nil
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func isHexOID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+			return false
+		}
+	}
+	return true
+}
+
+func initializedSubmodules(ctx context.Context, env Env, dir string) ([]string, error) {
+	out, err := run(ctx, dir, env.Git, "submodule", "status", "--recursive")
+	if err != nil {
+		return nil, err
+	}
+	var initialized []string
+	for _, line := range nonEmptyLines(out) {
+		if line[0] == '-' { // An uninitialized submodule does not block worktree removal.
+			continue
+		}
+		fields := strings.Fields(line[1:])
+		if len(fields) > 1 {
+			initialized = append(initialized, fields[1])
+		}
+	}
+	return initialized, nil
+}
+
+func pathWithin(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func resolveCommit(ctx context.Context, env Env, dir, ref string) (string, error) {
+	out, err := run(ctx, dir, env.Git, "rev-parse", "--verify", "--quiet", "--end-of-options", ref+"^{commit}")
+	return strings.TrimSpace(out), err
+}
+
 // mergeProof returns how the tip is known to be merged, or "".
-func mergeProof(ctx context.Context, env Env, w Worktree, t Target) (string, error) {
-	cmd := exec.CommandContext(ctx, env.Git, "merge-base", "--is-ancestor", w.Head, t.Ref())
+func mergeProof(ctx context.Context, env Env, w Worktree, t Target, targetHead string) (string, error) {
+	cmd := exec.CommandContext(ctx, env.Git, "merge-base", "--is-ancestor", w.Head, targetHead)
 	cmd.Dir = w.Path
 	err := cmd.Run()
 	var ee *exec.ExitError
@@ -247,31 +466,84 @@ func mergeProof(ctx context.Context, env Env, w Worktree, t Target) (string, err
 	default:
 		return "", fmt.Errorf("git merge-base: %v", err)
 	}
-	num, err := mergedPR(ctx, env, w.Path, w.Branch, w.Head)
-	if err != nil || num == "" {
+	pr, err := mergedPR(ctx, env, w.Path, t, w.Branch, w.Head)
+	if err != nil || pr.Number == "" {
 		return "", err
 	}
-	return "PR #" + num, nil
+	return "PR #" + pr.Number, nil
 }
 
-// mergedPR returns the number of a merged PR whose head is exactly
-// branch@head, or "" (also when gh is unavailable or there is no branch).
-func mergedPR(ctx context.Context, env Env, dir, branch, head string) (string, error) {
+type prProof struct {
+	Number   string
+	HeadRepo string
+}
+
+// mergedPR returns a merged PR whose head is exactly branch@head, or an
+// empty proof (also when gh is unavailable or there is no branch).
+func mergedPR(ctx context.Context, env Env, dir string, t Target, branch, head string) (prProof, error) {
 	if branch == "" || env.GH == "" {
-		return "", nil
+		return prProof{}, nil
 	}
-	out, err := run(ctx, dir, env.GH, "pr", "list", "--head", branch, "--state", "merged",
-		"--json", "number,headRefOid", "--jq", `.[] | "\(.number) \(.headRefOid)"`)
+	args := []string{"pr", "list", "--head", branch, "--base", t.Branch, "--state", "merged",
+		"--json", "number,headRefOid,headRepository", "--jq", `.[] | "\(.number) \(.headRefOid) \(.headRepository.nameWithOwner // \"\")"`}
+	repo, _, ok := githubRemote(ctx, env, dir, t.Remote)
+	if !ok {
+		out, err := run(ctx, dir, env.Git, "remote", "get-url", t.Remote)
+		if err != nil {
+			return prProof{}, err
+		}
+		repo = strings.TrimSpace(out)
+	}
+	args = append(args, "--repo", repo)
+	out, err := run(ctx, dir, env.GH, args...)
 	if err != nil {
-		return "", err
+		return prProof{}, err
 	}
 	for _, line := range nonEmptyLines(out) {
-		num, oid, _ := strings.Cut(strings.TrimSpace(line), " ")
-		if strings.EqualFold(oid, head) {
-			return num, nil
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && strings.EqualFold(fields[1], head) {
+			proof := prProof{Number: fields[0]}
+			if len(fields) >= 3 {
+				proof.HeadRepo = fields[2]
+			}
+			return proof, nil
 		}
 	}
-	return "", nil
+	return prProof{}, nil
+}
+
+var scpRemoteRe = regexp.MustCompile(`^(?:[^@/]+@)?([^:/]+):/?(.+)$`)
+
+// githubRemote returns gh's HOST/OWNER/REPO form and the repository owner.
+// Local/file remotes return ok=false; callers still pass their raw URL to gh
+// so repository selection is always explicit and a real gh fails closed.
+func githubRemote(ctx context.Context, env Env, dir, remote string) (repo, owner string, ok bool) {
+	env = env.withDefaults()
+	out, err := run(ctx, dir, env.Git, "remote", "get-url", remote)
+	if err != nil {
+		return "", "", false
+	}
+	raw := strings.TrimSpace(out)
+	var host, path string
+	if m := scpRemoteRe.FindStringSubmatch(raw); m != nil && !strings.Contains(raw, "://") {
+		host, path = m[1], m[2]
+	} else if i := strings.Index(raw, "://"); i >= 0 {
+		rest := raw[i+3:]
+		if at := strings.LastIndex(strings.SplitN(rest, "/", 2)[0], "@"); at >= 0 {
+			rest = rest[at+1:]
+		}
+		host, path, ok = strings.Cut(rest, "/")
+		if !ok || strings.EqualFold(host, "file") {
+			return "", "", false
+		}
+	} else {
+		return "", "", false
+	}
+	parts := strings.Split(strings.TrimSuffix(strings.Trim(path, "/"), ".git"), "/")
+	if len(parts) != 2 || host == "" || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return host + "/" + parts[0] + "/" + parts[1], parts[0], true
 }
 
 // longLived names branches that are never deleted, whatever the proof.
@@ -282,12 +554,13 @@ var longLived = map[string]bool{
 
 // keepBranch says why a branch must survive its worktree, or "".
 func keepBranch(branch string, t Target) string {
+	lower := strings.ToLower(branch)
 	switch {
 	case branch == "":
 		return ""
 	case branch == t.Branch:
 		return "it is the merge target"
-	case longLived[branch], strings.HasPrefix(branch, "release/"), strings.HasPrefix(branch, "hotfix/"):
+	case longLived[lower], strings.HasPrefix(lower, "release/"), strings.HasPrefix(lower, "hotfix/"):
 		return "it looks long-lived"
 	}
 	return ""
@@ -298,9 +571,8 @@ func keepBranch(branch string, t Target) string {
 func cwdUsers(ctx context.Context, env Env, dir string) ([]string, error) {
 	cmd := exec.CommandContext(ctx, env.Lsof, "-d", "cwd", "-Fpcn")
 	out, err := cmd.Output()
-	var ee *exec.ExitError
-	if err != nil && !(errors.As(err, &ee) && len(out) > 0) {
-		// lsof exits 1 when some processes can't be read; keep what it found.
+	if err != nil {
+		// Partial output cannot prove that lsof saw every process.
 		return nil, err
 	}
 	root := canonical(dir)
@@ -368,7 +640,33 @@ func Remove(ctx context.Context, env Env, repoDir string, c Check, t Target, del
 	if !c.OK {
 		return r, errors.New("refusing to remove a worktree that did not pass its checks")
 	}
+	// This can be slow for large ignored build trees, so do it before the
+	// final safety inspection rather than widening the check/remove race.
 	r.FreedBytes = diskUsage(c.Path)
+	list, err := List(ctx, env, repoDir)
+	if err != nil {
+		return r, err
+	}
+	var current *Worktree
+	for i := range list {
+		if canonical(list[i].Path) == canonical(c.Path) {
+			current = &list[i]
+			break
+		}
+	}
+	if current == nil {
+		return r, fmt.Errorf("%w: worktree record disappeared", ErrRefused)
+	}
+	if current.Head != c.Head || current.Branch != c.Branch {
+		return r, fmt.Errorf("%w: HEAD or branch changed after inspection", ErrRefused)
+	}
+	fresh, err := Inspect(ctx, env, *current, t)
+	if err != nil {
+		return r, err
+	}
+	if !fresh.OK {
+		return r, fmt.Errorf("%w: safety changed after inspection: %s", ErrRefused, strings.Join(fresh.Refusals, "; "))
+	}
 	if _, err := run(ctx, repoDir, env.Git, "worktree", "remove", c.Path); err != nil {
 		return r, err
 	}
@@ -380,9 +678,16 @@ func Remove(ctx context.Context, env Env, repoDir string, c Check, t Target, del
 		r.addNote("branch " + c.Branch + " kept: " + keepBranch(c.Branch, t))
 		return r, nil
 	}
+	if branchWorktree, err := worktreeForBranch(ctx, env, repoDir, c.Branch); err != nil {
+		r.addNote("local branch not deleted: " + err.Error())
+		return r, nil
+	} else if branchWorktree != "" {
+		r.addNote("local branch kept: now checked out at " + branchWorktree)
+		return r, nil
+	}
 	// The merge was proven above; `-d` would still refuse a squash-merged
 	// branch, so delete only if the ref still points at the proven head.
-	if _, err := run(ctx, repoDir, env.Git, "update-ref", "-d", "refs/heads/"+c.Branch, c.Head); err != nil {
+	if _, err := run(ctx, repoDir, env.Git, "update-ref", "--no-deref", "-d", "refs/heads/"+c.Branch, c.Head); err != nil {
 		r.addNote("local branch not deleted: " + err.Error())
 	} else {
 		r.BranchDeleted = true
@@ -392,16 +697,25 @@ func Remove(ctx context.Context, env Env, repoDir string, c Check, t Target, del
 	}
 	// A remote branch goes only when it was the head of a merged PR: being
 	// contained in the target proves nothing about whether others use it.
-	pr, err := mergedPR(ctx, env, repoDir, c.Branch, c.Head)
+	pr, err := mergedPR(ctx, env, repoDir, t, c.Branch, c.Head)
 	if err != nil {
 		r.addNote("remote branch kept: " + err.Error())
 		return r, nil
 	}
-	if pr == "" {
+	if pr.Number == "" {
 		r.addNote("remote branch kept: no merged PR has it as head")
 		return r, nil
 	}
-	out, err := run(ctx, repoDir, env.Git, "ls-remote", "--heads", t.Remote, "refs/heads/"+c.Branch)
+	if repo, _, ok := githubRemote(ctx, env, repoDir, t.Remote); ok && !prHeadMatchesRemote(pr.HeadRepo, repo) {
+		r.addNote("remote branch kept: merged PR head belongs to a different or unknown repository")
+		return r, nil
+	}
+	remoteURL, err := matchingFetchPushURL(ctx, env, repoDir, t.Remote)
+	if err != nil {
+		r.addNote("remote branch kept: " + err.Error())
+		return r, nil
+	}
+	out, err := run(ctx, repoDir, env.Git, "ls-remote", "--heads", remoteURL, "refs/heads/"+c.Branch)
 	if err != nil {
 		r.addNote("remote branch not checked: " + err.Error())
 		return r, nil
@@ -413,13 +727,49 @@ func Remove(ctx context.Context, env Env, repoDir string, c Check, t Target, del
 	case !strings.EqualFold(remoteHead, c.Head):
 		r.addNote("remote branch kept: it points at " + short(remoteHead) + ", not the merged head")
 	default:
-		if _, err := run(ctx, repoDir, env.Git, "push", "--quiet", t.Remote, "--delete", c.Branch); err != nil {
+		lease := "--force-with-lease=refs/heads/" + c.Branch + ":" + c.Head
+		if _, err := run(ctx, repoDir, env.Git, "push", "--quiet", lease, remoteURL, ":refs/heads/"+c.Branch); err != nil {
 			r.addNote("remote branch not deleted: " + err.Error())
 		} else {
 			r.RemoteDeleted = true
 		}
 	}
 	return r, nil
+}
+
+func matchingFetchPushURL(ctx context.Context, env Env, repoDir, remote string) (string, error) {
+	fetch, err := run(ctx, repoDir, env.Git, "remote", "get-url", remote)
+	if err != nil {
+		return "", err
+	}
+	push, err := run(ctx, repoDir, env.Git, "remote", "get-url", "--push", "--all", remote)
+	if err != nil {
+		return "", err
+	}
+	fetchURL := strings.TrimSpace(fetch)
+	pushURLs := nonEmptyLines(push)
+	if len(pushURLs) != 1 || pushURLs[0] != fetchURL {
+		return "", fmt.Errorf("remote %s does not have one push URL identical to its fetch URL", remote)
+	}
+	return fetchURL, nil
+}
+
+func prHeadMatchesRemote(headRepo, ghRepo string) bool {
+	_, nameWithOwner, ok := strings.Cut(ghRepo, "/")
+	return ok && headRepo != "" && strings.EqualFold(headRepo, nameWithOwner)
+}
+
+func worktreeForBranch(ctx context.Context, env Env, repoDir, branch string) (string, error) {
+	list, err := List(ctx, env, repoDir)
+	if err != nil {
+		return "", err
+	}
+	for _, w := range list {
+		if w.Branch == branch {
+			return w.Path, nil
+		}
+	}
+	return "", nil
 }
 
 func (r *Removed) addNote(s string) {

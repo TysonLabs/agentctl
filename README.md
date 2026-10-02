@@ -317,25 +317,31 @@ works, and it also deletes uncommitted work and unmerged branches without a word
 `done` proves removal is safe first, and refuses with every reason if it isn't:
 
 - **Merged:** the tip is contained in the freshly fetched target (`--into`, default
-  `origin/HEAD`), or GitHub shows a merged PR whose head is exactly this tip, so squash
-  and rebase merges count.
+  `origin/HEAD`), or GitHub shows a PR merged into that target whose branch and head
+  are exact matches, so squash and rebase merges count.
 - **Clean:** no modified or untracked files. Ignored build output (`target/`,
   `node_modules/`) goes with the worktree, so `--force` is never needed.
 - **Unused:** not locked (the lock reason and whether its owner pid is alive are
-  shown), and no process has its working directory inside (via `lsof`).
+  shown), no process has its working directory inside (via `lsof`), and no
+  registered worktree or other Git repository is nested beneath it. Initialized
+  submodules are also refused because Git cannot remove their worktree without
+  `--force`.
 - **Not** the repository's main working tree.
 
 Then it removes the worktree, deletes the local branch only if it still points at the
-proven head, and deletes the remote branch only when a merged PR had exactly that branch
-and head. Long-lived branches (the target, `main`, `master`, `develop`, `development`,
-`staging`, `production`, `release/*`, `hotfix/*`) are never deleted. `sweep` runs the
-same checks on every worktree; with `--yes` it removes those that pass and prunes the
-records of worktrees whose directories are gone. `--keep-remote` leaves remote branches
-alone.
+proven head, and deletes the remote branch only when a merged PR from that same
+repository had exactly that branch and head. Long-lived branches (the target, `main`,
+`master`, `develop`, `development`, `staging`, `production`, `release/*`, `hotfix/*`)
+are never deleted. `sweep` runs the same checks on every worktree; with `--yes` it
+removes those that pass and prunes the records of worktrees whose directories are gone.
+`--keep-remote` leaves remote branches alone.
 
 JSON on stdout (per worktree: `ok`, `merged_via`, `refusals`, `keep_branch`, and after
-removal `freed_bytes`, `branch_deleted`, `remote_deleted`). Exit codes: 0 removed (or
-would be, or sweep finished) · 1 usage · 2 refused · 3 git/gh error.
+removal `freed_bytes`, `branch_deleted`, `remote_deleted`). Sweep continues after an
+individual worktree error, records it in that entry's `error`, prints the complete
+JSON result, and exits 3. Exit codes: 0 removed (or would be, or sweep finished) ·
+1 usage · 2 refused · 3 git/gh error. A missing or incomplete `lsof` check is a
+safety refusal.
 
 ## Non-goals
 

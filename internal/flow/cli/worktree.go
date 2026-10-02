@@ -18,10 +18,13 @@ agentflow worktree sweep [flags]
 done removes one finished worktree and its branch. It never forces, and it
 refuses (listing every reason) unless all of these hold:
   - merged: the tip is contained in the fetched --into branch, or GitHub
-    shows a merged PR whose head is exactly this tip (squash merges count)
+    shows a PR merged into it whose branch and head are exact matches
+    (squash merges count)
   - clean: no modified or untracked files (ignored build output such as
     target/ is deleted with the worktree)
-  - unused: not locked, and no process has its working directory inside
+  - unused: not locked, no process has its working directory inside, and no
+    registered worktree or other Git repository is nested beneath it
+  - removable without force: no initialized submodules
   - not the repository's main working tree
 
 sweep lists every worktree that passes the same checks; with --yes it
@@ -29,8 +32,8 @@ removes them and prunes records of worktrees whose directories are gone.
 
 Branches: a long-lived branch (the merge target, main, master, develop,
 development, staging, production, release/*, hotfix/*) is never deleted.
-The remote branch is deleted only when a merged PR had exactly that branch
-and head; being merged by ancestry alone keeps it.
+The remote branch is deleted only when a merged PR from that same repository
+had exactly that branch and head; being merged by ancestry alone keeps it.
 
   --repo DIR        any checkout of the repository (default: current dir)
   --into REF        branch merges must reach (default: origin's HEAD, e.g.
@@ -40,8 +43,10 @@ and head; being merged by ancestry alone keeps it.
   --keep-remote     don't delete the remote branch (by default it is deleted
                     when it still points at the merged head)
 
-Output: a JSON result on stdout. Exit codes: 0 removed (or would be, or
-sweep finished) · 1 usage · 2 refused · 3 git/gh error.
+Output: a JSON result on stdout. Sweep records per-worktree errors and keeps
+going. Exit codes: 0 removed (or would be, or sweep finished) · 1 usage ·
+2 refused · 3 git/gh error. An unavailable or incomplete lsof check is a
+safety refusal, not an external-command error.
 `
 
 func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -124,14 +129,24 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	type entry struct {
 		worktree.Check
 		Removed *worktree.Removed `json:"removed,omitempty"`
+		Error   string            `json:"error,omitempty"`
 	}
 	var entries []entry
 	var freed int64
 	removed, eligible := 0, 0
+	hadError := false
 	for _, w := range picked {
 		c, err := worktree.Inspect(ctx, env, w, target)
 		if err != nil {
-			return fail(3, "%s: %v", w.Path, err)
+			if sub == "done" {
+				return fail(3, "%s: %v", w.Path, err)
+			}
+			entries = append(entries, entry{
+				Check: worktree.Check{Path: w.Path, Branch: w.Branch, Head: w.Head},
+				Error: err.Error(),
+			})
+			hadError = true
+			continue
 		}
 		e := entry{Check: c}
 		if c.OK {
@@ -139,7 +154,21 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 			if (sub == "done" && !dryRun) || (sub == "sweep" && yes) {
 				r, err := worktree.Remove(ctx, env, repo, c, target, !keepRem)
 				if err != nil {
-					return fail(3, "%s: %v", w.Path, err)
+					if sub == "done" {
+						if errors.Is(err, worktree.ErrRefused) {
+							return fail(2, "%s: %v", w.Path, err)
+						}
+						return fail(3, "%s: %v", w.Path, err)
+					}
+					e.Error = err.Error()
+					hadError = true
+					if errors.Is(err, worktree.ErrRefused) {
+						e.OK = false
+						e.Refusals = append(e.Refusals, err.Error())
+						eligible--
+					}
+					entries = append(entries, e)
+					continue
 				}
 				e.Removed = &r
 				removed++
@@ -150,6 +179,7 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	}
 
 	pruned := 0
+	var sweepError string
 	if sub == "sweep" && yes {
 		for _, e := range entries {
 			if e.Prunable {
@@ -158,7 +188,9 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		}
 		if pruned > 0 {
 			if err := worktree.Prune(ctx, env, repo); err != nil {
-				return fail(3, "%v", err)
+				sweepError = err.Error()
+				hadError = true
+				pruned = 0
 			}
 		}
 	}
@@ -178,7 +210,8 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 			Pruned     int     `json:"pruned_stale_records"`
 			FreedBytes int64   `json:"freed_bytes"`
 			Worktrees  []entry `json:"worktrees"`
-		}{target.Ref(), eligible, removed, pruned, freed, entries}, "", "  ")
+			Error      string  `json:"error,omitempty"`
+		}{target.Ref(), eligible, removed, pruned, freed, entries, sweepError}, "", "  ")
 	}
 	_, _ = stdout.Write(append(out, '\n'))
 	if sub == "done" && !entries[0].OK {
@@ -186,6 +219,10 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 			fmt.Fprintf(stderr, "agentflow worktree done: refused: %s\n", r)
 		}
 		return 2
+	}
+	if hadError {
+		fmt.Fprintln(stderr, "agentflow worktree sweep: one or more worktrees could not be processed")
+		return 3
 	}
 	return 0
 }

@@ -20,7 +20,9 @@ background and keep working; your harness tells you when it exits. Never wait in
    fix it made: accept it, revert it, or amend it, each one for a stated reason. For a
    read-only review, drop `--write`. For a big diff, run one pass per area with
    `--path`. Exit 0 means `final.md` holds a real answer; anything else means there was
-   no review (see the exit table in the README).
+   no review (see the exit table in the README). **If you are the reviewer,** this step
+   is done by you: review, fix what the brief asks, report, and stop. Don't start
+   another review or follow the rest of this list.
 5. **Run the repo's full gate once**, after the review fixes and any merge from the
    default branch. If it fails, fix it and rerun the failing part.
 6. **Push and open a PR** whose body says what changed, how it was verified, and any

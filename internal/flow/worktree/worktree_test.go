@@ -2,6 +2,7 @@ package worktree
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,11 +50,16 @@ func newFixture(t *testing.T) *fixture {
 	git(t, root, "clone", "-q", f.origin, f.repo)
 
 	gh := filepath.Join(root, "gh")
-	writeFile(t, root, "gh", "#!/bin/sh\ncat \""+filepath.Join(root, "gh.out")+"\" 2>/dev/null\n")
+	writeFile(t, root, "gh", "#!/bin/sh\nprintf '%s\\n' \"$*\" > \""+filepath.Join(root, "gh.args")+"\"\ncat \""+filepath.Join(root, "gh.out")+"\" 2>/dev/null\n")
 	if err := os.Chmod(gh, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	f.env = Env{GH: gh}
+	lsof := filepath.Join(root, "lsof")
+	writeFile(t, root, "lsof", "#!/bin/sh\nexit 0\n")
+	if err := os.Chmod(lsof, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.env = Env{GH: gh, Lsof: lsof}
 	return f
 }
 
@@ -165,6 +171,13 @@ func TestMergedCleanWorktreeIsRemovedWithItsBuildOutput(t *testing.T) {
 	if !c.OK || c.MergedVia != "contained in origin/main" || c.KeepBranch != "" {
 		t.Fatalf("got %+v", c)
 	}
+	gitLog := filepath.Join(f.root, "git.log")
+	gitWrapper := filepath.Join(f.root, "git-wrapper")
+	writeFile(t, f.root, "git-wrapper", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \""+gitLog+"\"\nexec git \"$@\"\n")
+	if err := os.Chmod(gitWrapper, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.env.Git = gitWrapper
 	r := f.remove(c, true)
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("worktree dir still exists (%v)", err)
@@ -177,6 +190,13 @@ func TestMergedCleanWorktreeIsRemovedWithItsBuildOutput(t *testing.T) {
 	}
 	if r.FreedBytes < 4096 {
 		t.Errorf("freed %d bytes, want at least the 4096 of target/", r.FreedBytes)
+	}
+	log, err := os.ReadFile(gitLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(log), "--force-with-lease=refs/heads/feat/a:"+head) {
+		t.Errorf("remote deletion was not protected by an exact lease:\n%s", log)
 	}
 }
 
@@ -192,6 +212,38 @@ func TestRemoteBranchKeptWithoutPRProof(t *testing.T) {
 	}
 	if !r.BranchDeleted {
 		t.Errorf("local branch should still be deleted: %+v", r)
+	}
+}
+
+func TestLocalBranchDeletionDoesNotDereferenceSymbolicRef(t *testing.T) {
+	f := newFixture(t)
+	f.worktree("feat/symbolic-race")
+	// Make the fetched target equal the feature tip so replacing the feature
+	// ref with a symbolic ref to main still satisfies update-ref's old OID.
+	git(t, f.seed, "fetch", "-q", "origin")
+	git(t, f.seed, "reset", "-q", "--hard", "origin/feat/symbolic-race")
+	git(t, f.seed, "push", "-q", "--force", "origin", "main")
+	git(t, f.repo, "fetch", "-q", "origin")
+	git(t, f.repo, "reset", "-q", "--hard", "origin/main")
+	c := f.inspect("feat/symbolic-race")
+	mainHead := git(t, f.repo, "rev-parse", "refs/remotes/origin/main")
+	if mainHead != c.Head {
+		t.Fatalf("test setup target = %s, feature = %s", mainHead, c.Head)
+	}
+
+	gitWrapper := filepath.Join(f.root, "git-symbolic-race")
+	script := "#!/bin/sh\nif [ \"$1\" = update-ref ]; then\n  git symbolic-ref refs/heads/feat/symbolic-race refs/heads/main\nfi\nexec git \"$@\"\n"
+	writeFile(t, f.root, "git-symbolic-race", script)
+	if err := os.Chmod(gitWrapper, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.env.Git = gitWrapper
+	r := f.remove(c, false)
+	if !r.BranchDeleted || localHas(f, "feat/symbolic-race") {
+		t.Fatalf("named feature ref was not deleted: %+v", r)
+	}
+	if got := git(t, f.repo, "rev-parse", "refs/heads/main"); got != mainHead {
+		t.Fatalf("symbolic feature ref deletion changed main from %s to %s", mainHead, got)
 	}
 }
 
@@ -243,6 +295,111 @@ func TestWorkThatWouldBeLostIsRefused(t *testing.T) {
 	}
 }
 
+func TestIgnoredNestedWorktreeIsRefused(t *testing.T) {
+	f := newFixture(t)
+	path := f.worktree("feat/parent")
+	writeFile(t, path, ".gitignore", "target/\nnested/\n")
+	git(t, path, "add", ".gitignore")
+	git(t, path, "commit", "-qm", "ignore nested directory")
+	git(t, path, "push", "-q", "origin", "feat/parent")
+	f.mergeOnOrigin("feat/parent")
+	nested := filepath.Join(path, "nested")
+	git(t, f.repo, "worktree", "add", "-q", "-b", "feat/child", nested, "origin/main")
+	if status := git(t, path, "status", "--porcelain", "--untracked-files=all"); status != "" {
+		t.Fatalf("nested worktree must be ignored for this regression test, status=%q", status)
+	}
+	c := f.inspect("feat/parent")
+	if c.OK || !refusedFor(c, "contains registered worktree") {
+		t.Fatalf("ignored nested worktree must prevent parent deletion: %+v", c)
+	}
+}
+
+func TestIgnoredNestedRepositoryFromAnotherRepoIsRefused(t *testing.T) {
+	f := newFixture(t)
+	path := f.worktree("feat/parent")
+	writeFile(t, path, ".gitignore", "target/\nnested/\n")
+	git(t, path, "add", ".gitignore")
+	git(t, path, "commit", "-qm", "ignore nested directory")
+	git(t, path, "push", "-q", "origin", "feat/parent")
+	f.mergeOnOrigin("feat/parent")
+	nested := filepath.Join(path, "nested")
+	git(t, path, "init", "-q", "-b", "main", nested)
+	writeFile(t, nested, "valuable.txt", "do not delete\n")
+	git(t, nested, "add", "valuable.txt")
+	git(t, nested, "commit", "-qm", "valuable independent work")
+	if status := git(t, path, "status", "--porcelain", "--untracked-files=all"); status != "" {
+		t.Fatalf("nested repository must be ignored for this regression test, status=%q", status)
+	}
+	c := f.inspect("feat/parent")
+	if c.OK || !refusedFor(c, "nested Git repository") {
+		t.Fatalf("ignored nested repository must prevent parent deletion: %+v", c)
+	}
+	if _, err := os.Stat(filepath.Join(nested, "valuable.txt")); err != nil {
+		t.Fatalf("nested repository was changed during inspection: %v", err)
+	}
+}
+
+func TestNestedRepositoryDetectionValidatesMetadataAndFindsBareRepos(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "fixture/.git/README", "not repository metadata\n")
+	bare := filepath.Join(root, "archives", "valuable.git")
+	git(t, root, "init", "-q", "--bare", "-b", "main", bare)
+	repos, err := nestedRepositories(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 1 || canonical(repos[0]) != canonical(bare) {
+		t.Fatalf("nested repositories = %v, want only %s", repos, bare)
+	}
+}
+
+func TestInitializedSubmoduleIsRefusedBeforeRemove(t *testing.T) {
+	f := newFixture(t)
+	sub := filepath.Join(f.root, "sub")
+	git(t, f.root, "init", "-q", "-b", "main", sub)
+	git(t, sub, "commit", "--allow-empty", "-qm", "submodule base")
+	git(t, f.repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "modules/sub")
+	git(t, f.repo, "commit", "-qam", "add submodule")
+	git(t, f.repo, "push", "-q", "origin", "main")
+	path := f.worktree("feat/submodule")
+	git(t, path, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+	f.mergeOnOrigin("feat/submodule")
+	c := f.inspect("feat/submodule")
+	if c.OK || !refusedFor(c, "initialized submodule") {
+		t.Fatalf("initialized submodule must be reported before git remove refuses: %+v", c)
+	}
+}
+
+func TestRemoveRechecksHeadAfterInspection(t *testing.T) {
+	f := newFixture(t)
+	path := f.worktree("feat/race")
+	f.mergeOnOrigin("feat/race")
+	c := f.inspect("feat/race")
+	git(t, path, "switch", "-q", "--detach")
+	writeFile(t, path, "later.txt", "new committed work\n")
+	git(t, path, "add", "later.txt")
+	git(t, path, "commit", "-qm", "commit after inspection")
+	_, err := Remove(context.Background(), f.env, f.repo, c, Target{Remote: "origin", Branch: "main"}, true)
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("Remove error = %v, want ErrRefused", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("worktree changed after inspection was removed: %v", err)
+	}
+}
+
+func TestLsofPartialOutputStillFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	lsof := filepath.Join(dir, "lsof")
+	writeFile(t, dir, "lsof", "#!/bin/sh\nprintf 'p123\\ncworker\\nn/tmp\\n'\nexit 1\n")
+	if err := os.Chmod(lsof, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if users, err := cwdUsers(context.Background(), Env{Lsof: lsof}, dir); err == nil || users != nil {
+		t.Fatalf("cwdUsers = %v, %v; partial lsof output must not be accepted", users, err)
+	}
+}
+
 func TestLockedIsRefused(t *testing.T) {
 	f := newFixture(t)
 	path := f.worktree("feat/locked")
@@ -259,6 +416,7 @@ func TestInUseIsRefused(t *testing.T) {
 		t.Skip("lsof not installed")
 	}
 	f := newFixture(t)
+	f.env.Lsof = "lsof"
 	path := f.worktree("feat/busy")
 	f.mergeOnOrigin("feat/busy")
 	sleeper := exec.Command("sleep", "30")
@@ -333,6 +491,25 @@ func TestRemoteBranchThatMovedIsKept(t *testing.T) {
 	}
 }
 
+func TestRemoteBranchKeptWhenPushURLDiffersFromFetchedRemote(t *testing.T) {
+	f := newFixture(t)
+	path := f.worktree("feat/push-url")
+	f.mergeOnOrigin("feat/push-url")
+	f.setPRs("31 " + git(t, path, "rev-parse", "HEAD"))
+
+	other := filepath.Join(f.root, "other.git")
+	git(t, f.root, "clone", "-q", "--bare", f.origin, other)
+	git(t, f.repo, "remote", "set-url", "--push", "origin", other)
+	c := f.inspect("feat/push-url")
+	r := f.remove(c, true)
+	if r.RemoteDeleted || !remoteHas(t, f, "feat/push-url") || !strings.Contains(r.Note, "push URL identical") {
+		t.Fatalf("remote with a different push URL must be kept: %+v", r)
+	}
+	if got := git(t, f.repo, "ls-remote", "--heads", other, "refs/heads/feat/push-url"); got == "" {
+		t.Fatal("different push repository unexpectedly lost its branch")
+	}
+}
+
 func TestStaleRecordIsPrunable(t *testing.T) {
 	f := newFixture(t)
 	path := f.worktree("feat/gone")
@@ -369,5 +546,49 @@ func TestFind(t *testing.T) {
 	}
 	if _, err := Find(list, "/r", "nope"); err == nil {
 		t.Error("no match: want an error")
+	}
+}
+
+func TestDefaultTargetDistinguishesRemoteFromSlashInBranch(t *testing.T) {
+	f := newFixture(t)
+	git(t, f.repo, "remote", "add", "upstream", f.origin)
+	ctx := context.Background()
+	if got, err := DefaultTarget(ctx, f.env, f.repo, "release/1.2"); err != nil || got != (Target{Remote: "origin", Branch: "release/1.2"}) {
+		t.Fatalf("branch with slash: got %+v, %v", got, err)
+	}
+	if got, err := DefaultTarget(ctx, f.env, f.repo, "upstream/release/1.2"); err != nil || got != (Target{Remote: "upstream", Branch: "release/1.2"}) {
+		t.Fatalf("explicit remote: got %+v, %v", got, err)
+	}
+}
+
+func TestGitHubRemoteScopesPRLookup(t *testing.T) {
+	f := newFixture(t)
+	git(t, f.repo, "remote", "set-url", "origin", "git@github.example:acme/widgets.git")
+	repo, owner, ok := githubRemote(context.Background(), f.env, f.repo, "origin")
+	if !ok || repo != "github.example/acme/widgets" || owner != "acme" {
+		t.Fatalf("githubRemote = %q, %q, %v", repo, owner, ok)
+	}
+	if !prHeadMatchesRemote("acme/widgets", repo) || prHeadMatchesRemote("acme/widgets-fork", repo) || prHeadMatchesRemote("other/widgets", repo) {
+		t.Fatal("remote deletion must require the PR head to come from the exact remote repository")
+	}
+}
+
+func TestMergedPRProofIsRestrictedToTargetBranch(t *testing.T) {
+	f := newFixture(t)
+	path := f.worktree("feat/base")
+	f.squashOnOrigin("feat/base")
+	f.setPRs("9 " + git(t, path, "rev-parse", "HEAD"))
+	if c := f.inspect("feat/base"); !c.OK || c.MergedVia != "PR #9" {
+		t.Fatalf("got %+v", c)
+	}
+	args, err := os.ReadFile(filepath.Join(f.root, "gh.args"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "--base main") {
+		t.Fatalf("merged PR lookup was not restricted to the requested target branch: %s", args)
+	}
+	if !strings.Contains(string(args), "--repo "+f.origin) {
+		t.Fatalf("merged PR lookup did not explicitly name the target repository: %s", args)
 	}
 }
