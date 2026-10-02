@@ -31,7 +31,10 @@ Usage:
   agentflow codex [flags]                      run codex exec safely and report a JSON result
   agentflow ship verify <svc.env> --sha REV    wait until a deployed service runs REV
                                                (see: agentflow ship --help)
-  agentflow version                            print agentflow's own version
+  agentflow worktree done <branch|path>        remove a merged, clean, unused worktree
+  agentflow worktree sweep [--yes]             list (or remove) every such worktree
+                                               (see: agentflow worktree --help)
+  agentflow version                           print agentflow's own version
 
 codex flags:
   --dir DIR               repository to work in (default: current directory)
@@ -85,6 +88,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		return runShip(ctx, args[1:], stdout, stderr)
+	case "worktree":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runWorktree(ctx, args[1:], stdout, stderr)
 	case "version", "--version":
 		fmt.Fprintln(stdout, "agentflow "+Version)
 		return 0
