@@ -1,19 +1,22 @@
-// Package codex runs `codex exec` non-interactively without the failure modes
-// that make hand-typed invocations hang or lie:
+// Package agent runs a coding-agent CLI (Codex or Claude Code) once,
+// non-interactively, without the failure modes that make hand-typed
+// invocations hang or lie:
 //
-//   - stdin is never inherited: it is /dev/null or the prompt file, so codex
-//     can never block on "Reading additional input from stdin...".
-//   - the sandbox is always pinned explicitly (`-c sandbox_mode=...`), which
-//     also covers `codex exec review`, a subcommand that has no --sandbox flag.
+//   - stdin is never inherited: it is /dev/null or the prompt file, so the
+//     agent can never block on, or silently read, the caller's stdin.
+//   - the sandbox is always pinned explicitly by the backend (read-only
+//     unless Write), never left to the user's config.
 //   - a hard timeout and a stall detector kill the whole process group, not
 //     just the direct child.
 //   - "no final answer" is never reported as success.
 //
 // Liveness comes from two sources because neither is enough alone: the
-// `--json` event stream on stdout is silent while the model reasons, and
-// codex's session rollout file (~/.codex/sessions/.../rollout-*-<thread>.jsonl)
-// only exists once the thread has started.
-package codex
+// agent's JSON event stream on stdout is silent while the model reasons, and
+// its session log only exists once the session has started.
+//
+// The backends (codex.go, claude.go) differ only in the argv they build, how
+// they read events, and where their session logs live.
+package agent
 
 import (
 	"bufio"
@@ -36,13 +39,14 @@ import (
 type Status string
 
 const (
-	StatusOK          Status = "ok"           // codex exited 0 and wrote a non-empty final answer
-	StatusNoAnswer    Status = "no_answer"    // codex exited 0 but the final answer is missing or empty
-	StatusFailed      Status = "codex_failed" // codex exited non-zero or reported a failed turn
-	StatusRateLimited Status = "rate_limited" // codex failed on a usage or rate limit: wait, then retry
-	StatusTimeout     Status = "timeout"      // killed: the run exceeded Options.Timeout
-	StatusStalled     Status = "stalled"      // killed: no activity for Options.Stall
-	StatusInterrupted Status = "interrupted"  // killed: the caller's context was cancelled
+	StatusOK           Status = "ok"            // codex exited 0 and wrote a non-empty final answer
+	StatusNoAnswer     Status = "no_answer"     // codex exited 0 but the final answer is missing or empty
+	StatusFailed       Status = "codex_failed"  // codex exited non-zero or reported a failed turn
+	StatusClaudeFailed Status = "claude_failed" // claude exited non-zero or reported an error result
+	StatusRateLimited  Status = "rate_limited"  // codex failed on a usage or rate limit: wait, then retry
+	StatusTimeout      Status = "timeout"       // killed: the run exceeded Options.Timeout
+	StatusStalled      Status = "stalled"       // killed: no activity for Options.Stall
+	StatusInterrupted  Status = "interrupted"   // killed: the caller's context was cancelled
 )
 
 // Scope selects a diff to review. At most one of Base, Commit and Uncommitted
@@ -59,21 +63,30 @@ func (s Scope) IsSet() bool { return s.Base != "" || s.Commit != "" || s.Uncommi
 
 // Options configures one run.
 type Options struct {
-	Bin       string        // codex executable (default "codex")
-	Dir       string        // repository / working root
-	Prompt    string        // full prompt; empty means native `codex exec review` over Scope
-	Scope     Scope         // used natively only when Prompt is empty
-	Write     bool          // workspace-write sandbox instead of read-only
-	Model     string        // optional -m
-	Timeout   time.Duration // hard cap on the whole run
-	Stall     time.Duration // kill after this long without any activity
-	OutDir    string        // artifacts directory (created if missing)
-	CodexHome string        // where rollouts live (default $CODEX_HOME or ~/.codex)
-	Poll      time.Duration // watch interval (default 2s)
-	Grace     time.Duration // SIGTERM → SIGKILL delay (default 5s)
+	Agent        Backend       // Codex (default) or Claude
+	Bin          string        // agent executable (default "codex" / "claude")
+	Dir          string        // repository / working root
+	Prompt       string        // full prompt; empty means native `codex exec review` over Scope (Codex only)
+	Scope        Scope         // used natively only when Prompt is empty
+	Write        bool          // workspace-write sandbox instead of read-only
+	Model        string        // optional model
+	MaxBudgetUSD float64       // Claude only: spending cap for the run (0 = none)
+	Timeout      time.Duration // hard cap on the whole run
+	Stall        time.Duration // kill after this long without any activity
+	OutDir       string        // artifacts directory (created if missing)
+	Home         string        // agent state dir with session logs (default per backend)
+	Poll         time.Duration // watch interval (default 2s)
+	Grace        time.Duration // SIGTERM → SIGKILL delay (default 5s)
 }
 
-// Usage is the token usage from the final turn.completed event.
+// ReviewerNote tells a prompt-driven agent that it is the sub-agent, not the
+// author: do the one task and stop. Without it, an agent that reads the repo's
+// AGENTS.md or CLAUDE.md may try to start a review of its own work.
+const ReviewerNote = "You were started by agentflow as a sub-agent for one task: the prompt below. " +
+	"Do that task, report, and stop. Do not start other agents or reviews (agentflow, codex, claude), " +
+	"and do not commit, push, merge or open pull requests."
+
+// Usage is the token usage reported at the end of the run.
 type Usage struct {
 	InputTokens       int `json:"input_tokens"`
 	CachedInputTokens int `json:"cached_input_tokens"`
@@ -83,29 +96,47 @@ type Usage struct {
 // Result is the machine-readable summary of a run.
 type Result struct {
 	Status    Status   `json:"status"`
-	CodexExit *int     `json:"codex_exit"` // null when agentflow killed the run
+	Agent     string   `json:"agent"`
+	Exit      *int     `json:"-"` // rendered as "<agent>_exit"; null when agentflow killed the run
 	DurationS float64  `json:"duration_s"`
 	Mode      string   `json:"mode"` // "exec" or "review"
 	Sandbox   string   `json:"sandbox"`
 	Dir       string   `json:"dir"`
-	ThreadID  string   `json:"thread_id,omitempty"`
-	Final     string   `json:"final"`  // path of the final answer (may not exist unless ok)
-	Prompt    string   `json:"prompt"` // path of the prompt sent ("" in review mode)
-	Events    string   `json:"events"` // path of the --json event stream
+	ThreadID  string   `json:"thread_id,omitempty"` // Codex thread id or Claude session id
+	Final     string   `json:"final"`               // path of the final answer (may not exist unless ok)
+	Prompt    string   `json:"prompt"`              // path of the prompt sent ("" in review mode)
+	Events    string   `json:"events"`              // path of the --json event stream
 	Stderr    string   `json:"stderr"`
-	Rollout   string   `json:"rollout,omitempty"`
+	Rollout   string   `json:"rollout,omitempty"` // the agent's session log
 	Usage     *Usage   `json:"usage,omitempty"`
+	CostUSD   *float64 `json:"cost_usd,omitempty"` // Claude reports it
 	Error     string   `json:"error,omitempty"`
 	Args      []string `json:"args"`
 }
 
+// MarshalJSON adds the agent's exit code as "codex_exit" or "claude_exit".
+func (r Result) MarshalJSON() ([]byte, error) {
+	type plain Result
+	if r.Agent == Claude.name() {
+		return json.Marshal(struct {
+			plain
+			ClaudeExit *int `json:"claude_exit"`
+		}{plain(r), r.Exit})
+	}
+	return json.Marshal(struct {
+		plain
+		CodexExit *int `json:"codex_exit"`
+	}{plain(r), r.Exit})
+}
+
 var rateLimitRe = regexp.MustCompile(`(?i)usage limit|rate limit|too many requests|\b429\b`)
 
-// Run executes codex once and always returns a Result for a run that started.
+// Run executes the agent once and always returns a Result for a run that started.
 // The error is non-nil only when the run could not be started at all.
 func Run(ctx context.Context, o Options) (Result, error) {
 	o = withDefaults(o)
-	res := Result{Dir: o.Dir, Sandbox: sandbox(o.Write)}
+	b := o.Agent
+	res := Result{Agent: b.name(), Dir: o.Dir, Sandbox: sandbox(o.Write)}
 	if err := os.MkdirAll(o.OutDir, 0o755); err != nil {
 		return res, err
 	}
@@ -122,7 +153,7 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	if o.Prompt != "" {
 		res.Mode = "exec"
 		res.Prompt = filepath.Join(o.OutDir, "prompt.md")
-		if err := os.WriteFile(res.Prompt, []byte(o.Prompt), 0o644); err != nil {
+		if err := os.WriteFile(res.Prompt, []byte(b.wrapPrompt(o.Prompt)), 0o644); err != nil {
 			return res, err
 		}
 		f, err := os.Open(res.Prompt)
@@ -135,9 +166,12 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		if !o.Scope.IsSet() {
 			return res, errors.New("nothing to run: give a prompt or a review scope")
 		}
+		if b.needsPrompt() {
+			return res, fmt.Errorf("%s needs a prompt: it has no built-in reviewer", b.name())
+		}
 		res.Mode = "review"
 	}
-	res.Args = buildArgs(o, res.Final, isGitRepo(o.Dir))
+	res.Args = b.args(o, res.Final, isGitRepo(o.Dir))
 
 	events, err := os.Create(res.Events)
 	if err != nil {
@@ -171,7 +205,7 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	}
 	pw.Close() // the child holds the write end now
 
-	var st streamState
+	st := streamState{backend: b}
 	st.touch()
 	readerDone := make(chan struct{})
 	go func() {
@@ -205,6 +239,16 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	res.ThreadID = st.threadID()
 	res.Rollout = st.rolloutPath()
 	res.Usage = st.usage()
+	res.CostUSD = st.costUSD()
+	if b.answerInStream() {
+		// The answer arrives in the event stream rather than in a file the
+		// agent writes; save it where Final points.
+		if a := st.answerText(); a != "" {
+			if err := os.WriteFile(res.Final, []byte(a), 0o644); err != nil {
+				st.setFailure("writing the final answer: " + err.Error())
+			}
+		}
+	}
 
 	if killed != "" {
 		res.Status = killed
@@ -212,7 +256,7 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		return res, nil
 	}
 	code := exitCode(waitErr)
-	res.CodexExit = &code
+	res.Exit = &code
 	failure := st.failure()
 	switch {
 	case code != 0 || failure != "":
@@ -220,7 +264,7 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		if msg == "" {
 			msg = lastLine(res.Stderr)
 		}
-		res.Status = StatusFailed
+		res.Status = b.failed()
 		stderrText, _ := os.ReadFile(res.Stderr)
 		if rateLimitRe.MatchString(msg) || rateLimitRe.Match(stderrText) {
 			res.Status = StatusRateLimited
@@ -229,9 +273,9 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	case !st.completed() || !nonEmpty(res.Final):
 		res.Status = StatusNoAnswer
 		if !st.completed() {
-			res.Error = "codex exited 0 without a completed turn"
+			res.Error = b.name() + " exited 0 without a completed turn"
 		} else {
-			res.Error = "codex exited 0 but wrote no final answer"
+			res.Error = b.name() + " exited 0 but wrote no final answer"
 		}
 	default:
 		res.Status = StatusOK
@@ -240,8 +284,11 @@ func Run(ctx context.Context, o Options) (Result, error) {
 }
 
 func withDefaults(o Options) Options {
+	if o.Agent == nil {
+		o.Agent = Codex
+	}
 	if o.Bin == "" {
-		o.Bin = "codex"
+		o.Bin = o.Agent.defaultBin()
 	}
 	if o.Dir == "" {
 		o.Dir, _ = os.Getwd()
@@ -252,13 +299,8 @@ func withDefaults(o Options) Options {
 	if o.Grace == 0 {
 		o.Grace = 5 * time.Second
 	}
-	if o.CodexHome == "" {
-		o.CodexHome = os.Getenv("CODEX_HOME")
-	}
-	if o.CodexHome == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			o.CodexHome = filepath.Join(home, ".codex")
-		}
+	if o.Home == "" {
+		o.Home = o.Agent.defaultHome()
 	}
 	return o
 }
@@ -270,39 +312,6 @@ func sandbox(write bool) string {
 	return "read-only"
 }
 
-// buildArgs assembles the codex argv. The sandbox goes through -c because
-// `exec review` has no --sandbox flag and otherwise inherits the user's
-// config default (seen: workspace-write).
-func buildArgs(o Options, finalPath string, inRepo bool) []string {
-	args := []string{"exec"}
-	if o.Prompt == "" {
-		args = append(args, "review")
-		switch {
-		case o.Scope.Base != "":
-			args = append(args, "--base", o.Scope.Base)
-		case o.Scope.Commit != "":
-			args = append(args, "--commit", o.Scope.Commit)
-		case o.Scope.Uncommitted:
-			args = append(args, "--uncommitted")
-		}
-	} else {
-		// `exec review` takes no -C; it reviews the working directory, which
-		// cmd.Dir already sets. Plain exec gets -C as well, for its prompt.
-		args = append(args, "-C", o.Dir)
-	}
-	args = append(args, "--json", "-c", fmt.Sprintf("sandbox_mode=%q", sandbox(o.Write)), "-o", finalPath)
-	if !inRepo {
-		args = append(args, "--skip-git-repo-check")
-	}
-	if o.Model != "" {
-		args = append(args, "-m", o.Model)
-	}
-	if o.Prompt != "" {
-		args = append(args, "-") // prompt from stdin, which is the prompt file
-	}
-	return args
-}
-
 func isGitRepo(dir string) bool {
 	cmd := exec.Command("git", "-C", dir, "rev-parse", "--is-inside-work-tree")
 	out, err := cmd.Output()
@@ -310,8 +319,8 @@ func isGitRepo(dir string) bool {
 }
 
 // watch waits for the process, killing its group on timeout, stall or
-// cancellation. It returns the kill reason ("" if codex exited by itself)
-// and codex's wait error.
+// cancellation. It returns the kill reason ("" if the agent exited by itself)
+// and the agent's wait error.
 func watch(ctx context.Context, o Options, pid int, start time.Time, st *streamState, waitCh <-chan error) (Status, error) {
 	tick := time.NewTicker(o.Poll)
 	defer tick.Stop()
@@ -329,7 +338,7 @@ func watch(ctx context.Context, o Options, pid int, start time.Time, st *streamS
 		case <-deadline.C:
 			reason = StatusTimeout
 		case <-tick.C:
-			st.refreshRollout(o.CodexHome)
+			st.refreshRollout(o.Home)
 			if current := st.activityCount(); current != activity {
 				activity = current
 				lastActivity = time.Now()
@@ -353,7 +362,7 @@ func watch(ctx context.Context, o Options, pid int, start time.Time, st *streamS
 }
 
 // killGroup sends SIGTERM to the whole process group, then SIGKILL after
-// grace if codex is still alive. It always reaps the process.
+// grace if the agent is still alive. It always reaps the process.
 func killGroup(pid int, grace time.Duration, waitCh <-chan error) error {
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	select {
@@ -366,7 +375,7 @@ func killGroup(pid int, grace time.Duration, waitCh <-chan error) error {
 	return <-waitCh
 }
 
-// cleanupGroup terminates descendants left in codex's process group after the
+// cleanupGroup terminates descendants left in the agent's process group after the
 // direct child exits normally. It is bounded even if a descendant ignores
 // SIGTERM.
 func cleanupGroup(pid int, grace time.Duration) {
@@ -429,8 +438,9 @@ func lastLine(path string) string {
 	return strings.TrimSpace(lines[len(lines)-1])
 }
 
-// streamState is what the stdout reader learns from codex's --json events.
+// streamState is what the stdout reader learns from the agent's events.
 type streamState struct {
+	backend  Backend
 	activity atomic.Uint64
 
 	mu       sync.Mutex
@@ -439,22 +449,14 @@ type streamState struct {
 	rollSize int64
 	rollMod  time.Time
 	use      *Usage
+	cost     *float64
+	answer   string
 	fail     string
 	complete bool
 }
 
 func (s *streamState) touch()                { s.activity.Add(1) }
 func (s *streamState) activityCount() uint64 { return s.activity.Load() }
-
-type event struct {
-	Type     string `json:"type"`
-	ThreadID string `json:"thread_id"`
-	Message  string `json:"message"`
-	Error    *struct {
-		Message string `json:"message"`
-	} `json:"error"`
-	Usage *Usage `json:"usage"`
-}
 
 // consume copies every stdout line to the events file and records what it
 // means. Non-JSON lines still count as activity.
@@ -465,51 +467,29 @@ func (s *streamState) consume(r *os.File, sink *os.File) {
 		line := sc.Bytes()
 		s.touch()
 		if _, err := sink.Write(append(append([]byte{}, line...), '\n')); err != nil {
-			s.setFailure("writing codex event stream: " + err.Error())
-		}
-		var ev event
-		if json.Unmarshal(line, &ev) != nil {
-			continue
+			s.setFailure("writing " + s.backend.name() + " event stream: " + err.Error())
 		}
 		s.mu.Lock()
-		switch ev.Type {
-		case "thread.started":
-			s.thread = ev.ThreadID
-		case "turn.completed":
-			s.use = ev.Usage
-			s.complete = true
-		case "turn.failed":
-			if ev.Error != nil && strings.TrimSpace(ev.Error.Message) != "" {
-				s.fail = ev.Error.Message
-			} else {
-				s.fail = "turn failed"
-			}
-		case "error":
-			if strings.TrimSpace(ev.Message) != "" {
-				s.fail = ev.Message
-			} else {
-				s.fail = "codex reported an error"
-			}
-		}
+		s.backend.handle(line, s)
 		s.mu.Unlock()
 	}
 	if err := sc.Err(); err != nil {
-		s.setFailure("reading codex event stream: " + err.Error())
+		s.setFailure("reading " + s.backend.name() + " event stream: " + err.Error())
 	}
 }
 
 // refreshRollout finds the session log for this run's thread and treats its
-// growth as activity: codex writes reasoning there while stdout is silent.
-func (s *streamState) refreshRollout(codexHome string) {
+// growth as activity: agents write reasoning there while stdout is silent.
+func (s *streamState) refreshRollout(home string) {
 	s.mu.Lock()
 	thread := s.thread
 	s.mu.Unlock()
-	if thread == "" || codexHome == "" {
+	if thread == "" || home == "" {
 		return
 	}
-	// Names are rollout-<timestamp>-<thread>.jsonl, so the lexically last
-	// match is the newest file for this thread.
-	matches, _ := filepath.Glob(filepath.Join(codexHome, "sessions", "*", "*", "*", "rollout-*-"+thread+".jsonl"))
+	// When several files match, the lexically last is the newest (Codex
+	// names are rollout-<timestamp>-<thread>.jsonl).
+	matches, _ := filepath.Glob(s.backend.sessionGlob(home, thread))
 	var path string
 	for _, match := range matches {
 		if match > path {
@@ -542,3 +522,5 @@ func (s *streamState) rolloutPath() string   { s.mu.Lock(); defer s.mu.Unlock();
 func (s *streamState) usage() *Usage         { s.mu.Lock(); defer s.mu.Unlock(); return s.use }
 func (s *streamState) failure() string       { s.mu.Lock(); defer s.mu.Unlock(); return s.fail }
 func (s *streamState) completed() bool       { s.mu.Lock(); defer s.mu.Unlock(); return s.complete }
+func (s *streamState) costUSD() *float64     { s.mu.Lock(); defer s.mu.Unlock(); return s.cost }
+func (s *streamState) answerText() string    { s.mu.Lock(); defer s.mu.Unlock(); return s.answer }

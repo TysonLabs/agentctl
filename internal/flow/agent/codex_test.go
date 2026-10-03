@@ -1,4 +1,4 @@
-package codex
+package agent
 
 import (
 	"context"
@@ -19,6 +19,9 @@ import (
 // out one codex behaviour instead of running tests. FAKE_CODEX_REC names a
 // directory where it records its argv, its stdin and any child pid.
 func TestMain(m *testing.M) {
+	if mode := os.Getenv("FAKE_CLAUDE_MODE"); mode != "" {
+		os.Exit(fakeClaude(mode))
+	}
 	switch mode := os.Getenv("FAKE_CODEX_MODE"); mode {
 	case "":
 		os.Exit(m.Run())
@@ -163,15 +166,15 @@ func newHarness(t *testing.T, mode string) *harness {
 
 func (h *harness) opts() Options {
 	return Options{
-		Bin:       os.Args[0],
-		Dir:       h.t.TempDir(),
-		Prompt:    "review this",
-		Timeout:   20 * time.Second,
-		Stall:     10 * time.Second,
-		OutDir:    h.out,
-		CodexHome: h.t.TempDir(),
-		Poll:      50 * time.Millisecond,
-		Grace:     500 * time.Millisecond,
+		Bin:     os.Args[0],
+		Dir:     h.t.TempDir(),
+		Prompt:  "review this",
+		Timeout: 20 * time.Second,
+		Stall:   10 * time.Second,
+		OutDir:  h.out,
+		Home:    h.t.TempDir(),
+		Poll:    50 * time.Millisecond,
+		Grace:   500 * time.Millisecond,
 	}
 }
 
@@ -193,14 +196,14 @@ func TestOKExecMode(t *testing.T) {
 	h := newHarness(t, "ok")
 	o := h.opts()
 	res := run(t, o)
-	if res.Status != StatusOK || res.CodexExit == nil || *res.CodexExit != 0 {
+	if res.Status != StatusOK || res.Exit == nil || *res.Exit != 0 {
 		t.Fatalf("got %+v", res)
 	}
 	if res.Mode != "exec" || res.ThreadID != "thread-ok" || res.Usage == nil || res.Usage.InputTokens != 10 {
 		t.Errorf("summary not parsed: %+v", res)
 	}
-	if got := h.recorded("stdin.txt"); got != "review this" {
-		t.Errorf("codex stdin = %q, want the prompt file", got)
+	if got := h.recorded("stdin.txt"); got != ReviewerNote+"\n\nreview this" {
+		t.Errorf("codex stdin = %q, want the prompt file (reviewer note, then the prompt)", got)
 	}
 	args := h.recorded("args.txt")
 	for _, want := range []string{"exec", "--json", `sandbox_mode="read-only"`, "-C\n" + o.Dir, "--skip-git-repo-check", "-"} {
@@ -241,7 +244,7 @@ func TestBuildArgsForCodex0159(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := buildArgs(tt.o, "/out/final.md", tt.inRepo); !reflect.DeepEqual(got, tt.want) {
+			if got := Codex.args(tt.o, "/out/final.md", tt.inRepo); !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("argv = %#v, want %#v", got, tt.want)
 			}
 		})
@@ -359,7 +362,7 @@ func TestTimeoutKillsWholeProcessGroup(t *testing.T) {
 	o.Timeout = 1 * time.Second
 	start := time.Now()
 	res := run(t, o)
-	if res.Status != StatusTimeout || res.CodexExit != nil {
+	if res.Status != StatusTimeout || res.Exit != nil {
 		t.Fatalf("got %+v", res)
 	}
 	if d := time.Since(start); d > 5*time.Second {
@@ -394,10 +397,10 @@ func TestActivityResetsStall(t *testing.T) {
 func TestRolloutGrowthCountsAsActivity(t *testing.T) {
 	h := newHarness(t, "rollout")
 	o := h.opts()
-	t.Setenv("FAKE_CODEX_HOME", o.CodexHome)
+	t.Setenv("FAKE_CODEX_HOME", o.Home)
 	// A stale file with the same suffix must not capture the watcher and hide
 	// the rollout created by this run.
-	staleDir := filepath.Join(o.CodexHome, "sessions", "2020", "01", "01")
+	staleDir := filepath.Join(o.Home, "sessions", "2020", "01", "01")
 	if err := os.MkdirAll(staleDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +425,7 @@ func TestRolloutGrowthCountsAsActivity(t *testing.T) {
 func TestFutureRolloutMtimeDoesNotDisableStall(t *testing.T) {
 	h := newHarness(t, "future-rollout")
 	o := h.opts()
-	t.Setenv("FAKE_CODEX_HOME", o.CodexHome)
+	t.Setenv("FAKE_CODEX_HOME", o.Home)
 	o.Stall = 500 * time.Millisecond
 	o.Timeout = 3 * time.Second
 	if res := run(t, o); res.Status != StatusStalled {
