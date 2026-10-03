@@ -2,10 +2,12 @@ package worktree
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -50,7 +52,14 @@ func newFixture(t *testing.T) *fixture {
 	git(t, root, "clone", "-q", f.origin, f.repo)
 
 	gh := filepath.Join(root, "gh")
-	writeFile(t, root, "gh", "#!/bin/sh\nprintf '%s\\n' \"$*\" > \""+filepath.Join(root, "gh.args")+"\"\ncat \""+filepath.Join(root, "gh.out")+"\" 2>/dev/null\n")
+	// The fake gh applies the caller's real --jq expression to gh.json with
+	// jq, as gh does, so a malformed expression fails the test. Without
+	// gh.json it answers like gh with no merged PRs, so jq is only needed by
+	// tests that call setPRs.
+	writeFile(t, root, "gh", "#!/bin/sh\nprintf '%s\\n' \"$*\" > \""+filepath.Join(root, "gh.args")+"\"\n"+
+		"expr=''\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --jq ]; then shift; expr=\"$1\"; fi; shift; done\n"+
+		"[ -f \""+filepath.Join(root, "gh.json")+"\" ] || exit 0\n"+
+		"exec jq -r \"$expr\" \""+filepath.Join(root, "gh.json")+"\"\n")
 	if err := os.Chmod(gh, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -74,8 +83,31 @@ func writeFile(t *testing.T, dir, name, body string) {
 	}
 }
 
+// setPRs records merged PRs as "number headOid" pairs; the fake gh returns
+// them as gh's JSON, with headRepository null (unknown) or, via setPRsFrom,
+// {"nameWithOwner": repo}.
 func (f *fixture) setPRs(lines ...string) {
-	writeFile(f.t, f.root, "gh.out", strings.Join(lines, "\n")+"\n")
+	f.setPRsFrom("", lines...)
+}
+
+func (f *fixture) setPRsFrom(repo string, lines ...string) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		f.t.Skip("jq not installed: the fake gh needs it to apply --jq")
+	}
+	prs := []map[string]any{}
+	for _, l := range lines {
+		num, oid, _ := strings.Cut(strings.TrimSpace(l), " ")
+		n, _ := strconv.Atoi(num)
+		pr := map[string]any{"number": n, "headRefOid": oid}
+		if repo != "" {
+			pr["headRepository"] = map[string]any{"nameWithOwner": repo}
+		} else {
+			pr["headRepository"] = nil
+		}
+		prs = append(prs, pr)
+	}
+	b, _ := json.Marshal(prs)
+	writeFile(f.t, f.root, "gh.json", string(b))
 }
 
 // worktree adds a worktree on a new branch with one pushed commit.
@@ -590,5 +622,22 @@ func TestMergedPRProofIsRestrictedToTargetBranch(t *testing.T) {
 	}
 	if !strings.Contains(string(args), "--repo "+f.origin) {
 		t.Fatalf("merged PR lookup did not explicitly name the target repository: %s", args)
+	}
+}
+
+func TestMergedPRParsesHeadRepository(t *testing.T) {
+	f := newFixture(t)
+	path := f.worktree("feat/fork")
+	head := git(t, path, "rev-parse", "HEAD")
+	tg, _ := DefaultTarget(context.Background(), f.env, f.repo, "")
+	f.setPRsFrom("someone/fork", "41 "+head)
+	pr, err := mergedPR(context.Background(), f.env.withDefaults(), f.repo, tg, "feat/fork", head)
+	if err != nil || pr.Number != "41" || pr.HeadRepo != "someone/fork" {
+		t.Fatalf("named head repo: %+v %v", pr, err)
+	}
+	f.setPRs("42 " + head)
+	pr, err = mergedPR(context.Background(), f.env.withDefaults(), f.repo, tg, "feat/fork", head)
+	if err != nil || pr.Number != "42" || pr.HeadRepo != "" {
+		t.Fatalf("null head repo: %+v %v", pr, err)
 	}
 }

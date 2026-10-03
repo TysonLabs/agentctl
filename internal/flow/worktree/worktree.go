@@ -485,7 +485,7 @@ func mergedPR(ctx context.Context, env Env, dir string, t Target, branch, head s
 		return prProof{}, nil
 	}
 	args := []string{"pr", "list", "--head", branch, "--base", t.Branch, "--state", "merged",
-		"--json", "number,headRefOid,headRepository", "--jq", `.[] | "\(.number) \(.headRefOid) \(.headRepository.nameWithOwner // \"\")"`}
+		"--json", "number,headRefOid,headRepository", "--jq", `.[] | "\(.number) \(.headRefOid) \(.headRepository.nameWithOwner // "")"`}
 	repo, _, ok := githubRemote(ctx, env, dir, t.Remote)
 	if !ok {
 		out, err := run(ctx, dir, env.Git, "remote", "get-url", t.Remote)
