@@ -53,10 +53,9 @@ func newFixture(t *testing.T) *fixture {
 
 	gh := filepath.Join(root, "gh")
 	// The fake gh applies the caller's real --jq expression to gh.json with
-	// jq, as gh does, so a malformed expression fails the test.
-	if _, err := exec.LookPath("jq"); err != nil {
-		t.Skip("jq not installed")
-	}
+	// jq, as gh does, so a malformed expression fails the test. Without
+	// gh.json it answers like gh with no merged PRs, so jq is only needed by
+	// tests that call setPRs.
 	writeFile(t, root, "gh", "#!/bin/sh\nprintf '%s\\n' \"$*\" > \""+filepath.Join(root, "gh.args")+"\"\n"+
 		"expr=''\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --jq ]; then shift; expr=\"$1\"; fi; shift; done\n"+
 		"[ -f \""+filepath.Join(root, "gh.json")+"\" ] || exit 0\n"+
@@ -85,12 +84,16 @@ func writeFile(t *testing.T, dir, name, body string) {
 }
 
 // setPRs records merged PRs as "number headOid" pairs; the fake gh returns
-// them as gh's JSON (headRepository.nameWithOwner = repo, "" for unknown).
+// them as gh's JSON, with headRepository null (unknown) or, via setPRsFrom,
+// {"nameWithOwner": repo}.
 func (f *fixture) setPRs(lines ...string) {
 	f.setPRsFrom("", lines...)
 }
 
 func (f *fixture) setPRsFrom(repo string, lines ...string) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		f.t.Skip("jq not installed: the fake gh needs it to apply --jq")
+	}
 	prs := []map[string]any{}
 	for _, l := range lines {
 		num, oid, _ := strings.Cut(strings.TrimSpace(l), " ")
@@ -619,5 +622,22 @@ func TestMergedPRProofIsRestrictedToTargetBranch(t *testing.T) {
 	}
 	if !strings.Contains(string(args), "--repo "+f.origin) {
 		t.Fatalf("merged PR lookup did not explicitly name the target repository: %s", args)
+	}
+}
+
+func TestMergedPRParsesHeadRepository(t *testing.T) {
+	f := newFixture(t)
+	path := f.worktree("feat/fork")
+	head := git(t, path, "rev-parse", "HEAD")
+	tg, _ := DefaultTarget(context.Background(), f.env, f.repo, "")
+	f.setPRsFrom("someone/fork", "41 "+head)
+	pr, err := mergedPR(context.Background(), f.env.withDefaults(), f.repo, tg, "feat/fork", head)
+	if err != nil || pr.Number != "41" || pr.HeadRepo != "someone/fork" {
+		t.Fatalf("named head repo: %+v %v", pr, err)
+	}
+	f.setPRs("42 " + head)
+	pr, err = mergedPR(context.Background(), f.env.withDefaults(), f.repo, tg, "feat/fork", head)
+	if err != nil || pr.Number != "42" || pr.HeadRepo != "" {
+		t.Fatalf("null head repo: %+v %v", pr, err)
 	}
 }
