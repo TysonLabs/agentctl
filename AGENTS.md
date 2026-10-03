@@ -42,7 +42,11 @@ background and keep working; your harness tells you when it exits. Never wait in
 
 **When something looks wrong in a running service,** read it, don't guess:
 `agentctl endpoints <service.env>` lists what it exposes; `agentctl get <service.env>
-<path>` reads it. agentctl is read-only, so it is always safe to run.
+<path>` reads it. For logs, use `agentctl logs <service.env> --q <text> --since 30m`: it
+prints readable lines, so you don't need a script to parse them. To wait for an event in a
+running service, run `agentctl logs <service.env> --q <text> --wait 20m` in the background
+(exit 0 = it appeared, 4 = it didn't); never sleep and re-poll. agentctl is read-only, so
+it is always safe to run.
 
 **Report** what you verified and how (commands, exit codes, SHAs), what you skipped,
 and anything left for a human.
