@@ -25,8 +25,9 @@ func (e *TransportError) Unwrap() error { return e.Err }
 
 // Response is a completed HTTP exchange (any status).
 type Response struct {
-	Status int
-	Body   []byte
+	Status     int
+	Body       []byte
+	ServerDate time.Time
 }
 
 // Client is the single HTTP path in agentctl. GET only, by construction.
@@ -122,7 +123,8 @@ func (c *Client) Get(ctx context.Context, p, rawQuery string) (*Response, error)
 	if len(body) > MaxBodyBytes {
 		return nil, &TransportError{Err: fmt.Errorf("response body exceeds %d MiB cap", MaxBodyBytes>>20)}
 	}
-	return &Response{Status: resp.StatusCode, Body: body}, nil
+	serverDate, _ := http.ParseTime(resp.Header.Get("Date"))
+	return &Response{Status: resp.StatusCode, Body: body, ServerDate: serverDate}, nil
 }
 
 func scrubErr(err error, sec registry.Secret) error {

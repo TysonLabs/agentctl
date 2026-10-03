@@ -157,6 +157,7 @@ letting anyone enumerate users or sessions.
 | `agentctl ls` | list services/envs, wiring status, base URLs (never token material) |
 | `agentctl get <svc.env> <path> [--raw]` | GET under `/agent/`; pretty-print JSON, `--raw` for bytes |
 | `agentctl endpoints <svc.env>` | fetch `GET /agent` and render the descriptor table |
+| `agentctl logs <svc.env> [log flags]` | `GET /agent/logs` as one readable line per entry (see below) |
 | `agentctl status [svc.env ...]` | fan out `/agent/version` + `/agent/health`, one line per service |
 | `agentctl version` | print agentctl's own version |
 
@@ -170,9 +171,34 @@ Global flags: `--config PATH`, `--timeout DUR` (default 10s; `status` default 8s
 | 1 | usage error, config error, unknown service.env, not-wired target, rejected path |
 | 2 | HTTP status ≥ 400 (body still printed to stdout) |
 | 3 | transport: DNS/dial/TLS/timeout, refused redirect, body over cap |
+| 4 | `logs --wait`: no matching entry before the deadline |
 
 Output is designed for LLM agents: stdout is the answer only; stderr carries one-line
 `agentctl:`-prefixed diagnostics. No color, no spinners, no prompts.
+
+### `agentctl logs`
+
+```sh
+agentctl logs recursivecx.prod --level warn --since 30m       # recent warnings, readable
+agentctl logs vector-dialer.prod --q "dial-customer" --limit 50
+agentctl logs recursivecx.prod --q "E911 link" --wait 20m     # exit 0 when it shows up, 4 if it doesn't
+```
+
+It reads the `entries` list from `/agent/logs` and prints one line per entry:
+`time LEVEL [source]  message | key=value ...`. The three shapes services emit today
+(`ts`/`target`/`message`, `time`/`message`/`fields`, `dt`/`msg`/`fields`) render the same
+way, and `--json` prints the normalized entries instead. Newlines are flattened and terminal
+controls (C0, DEL, C1, and Unicode bidirectional controls) are dropped, so log content can't
+inject escapes or visually reorder an entry. Configured bearer-token values are scrubbed.
+
+`--q` (substring), `--level` (minimum severity) and `--limit` are passed to the service,
+which does the filtering. `--since` takes a duration back from now (`30m`) or an RFC 3339
+time. `--wait DUR` polls every `--interval` (default 15s) until an entry matches, counting only
+entries newer than the start of the wait (or `--since`). Without an explicit `--since`, an
+initial read uses the service's HTTP `Date` to account for clock skew; subsequent polls keep
+that resolved `since` fixed. It retries transport errors and 5xx, which happen mid-deploy, and
+fails fast on any other HTTP error. The wait duration is an overall deadline, including time
+spent in requests. It's still only GET requests under `/agent/`.
 
 ## Security model
 
