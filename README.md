@@ -187,15 +187,18 @@ agentctl logs recursivecx.prod --q "E911 link" --wait 20m     # exit 0 when it s
 It reads the `entries` list from `/agent/logs` and prints one line per entry:
 `time LEVEL [source]  message | key=value ...`. The three shapes services emit today
 (`ts`/`target`/`message`, `time`/`message`/`fields`, `dt`/`msg`/`fields`) render the same
-way, and `--json` prints the normalized entries instead. Newlines are flattened and control
-characters (C0 and C1) are dropped, so a log line can't inject terminal escapes.
+way, and `--json` prints the normalized entries instead. Newlines are flattened and terminal
+controls (C0, DEL, C1, and Unicode bidirectional controls) are dropped, so log content can't
+inject escapes or visually reorder an entry. Configured bearer-token values are scrubbed.
 
 `--q` (substring), `--level` (minimum severity) and `--limit` are passed to the service,
 which does the filtering. `--since` takes a duration back from now (`30m`) or an RFC 3339
 time. `--wait DUR` polls every `--interval` (default 15s) until an entry matches, counting only
-entries newer than the start of the wait (or `--since`). It retries transport errors and
-5xx, which happen mid-deploy, and fails fast on any other HTTP error. It's still only GET
-requests under `/agent/`.
+entries newer than the start of the wait (or `--since`). Without an explicit `--since`, an
+initial read uses the service's HTTP `Date` to account for clock skew; subsequent polls keep
+that resolved `since` fixed. It retries transport errors and 5xx, which happen mid-deploy, and
+fails fast on any other HTTP error. The wait duration is an overall deadline, including time
+spent in requests. It's still only GET requests under `/agent/`.
 
 ## Security model
 

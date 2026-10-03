@@ -1,16 +1,19 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/TysonLabs/agentctl/internal/client"
+	"github.com/TysonLabs/agentctl/internal/registry"
 	"github.com/TysonLabs/agentctl/internal/render"
 )
 
@@ -138,37 +141,37 @@ func (a *app) cmdLogs(args []string) error {
 	if lo.level != "" {
 		query.Set("level", lo.level)
 	}
-	if !since.IsZero() {
-		query.Set("since", since.UTC().Format(time.RFC3339Nano))
-	}
 	if lo.limit > 0 {
 		query.Set("limit", strconv.Itoa(lo.limit))
+	}
+	if lo.since != "" {
+		query.Set("since", since.UTC().Format(time.RFC3339Nano))
 	}
 	p, _, err := client.NormalizePath("/agent/logs")
 	if err != nil {
 		return usageError(err.Error())
 	}
 
-	fetch := func() ([]render.LogEntry, []byte, error) {
-		resp, err := c.Get(context.Background(), p, query.Encode())
+	fetch := func(ctx context.Context) ([]render.LogEntry, []byte, time.Time, error) {
+		resp, err := c.Get(ctx, p, query.Encode())
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, time.Time{}, err
 		}
 		if resp.Status >= 400 {
-			return nil, resp.Body, &httpError{status: resp.Status, msg: fmt.Sprintf("HTTP %d from %s %s", resp.Status, name, p)}
+			return nil, resp.Body, resp.ServerDate, &httpError{status: resp.Status, msg: fmt.Sprintf("HTTP %d from %s %s", resp.Status, name, p)}
 		}
 		entries, ok := render.ParseLogs(resp.Body)
 		if !ok {
-			return nil, resp.Body, usageError(name + " /agent/logs did not return an entries list; see: agentctl get " + name + " logs")
+			return nil, resp.Body, resp.ServerDate, usageError(name + " /agent/logs did not return an entries list; see: agentctl get " + name + " logs")
 		}
-		return entries, resp.Body, nil
+		return entries, resp.Body, resp.ServerDate, nil
 	}
 
 	if lo.wait == 0 {
-		entries, body, err := fetch()
+		entries, body, _, err := fetch(context.Background())
 		if err != nil {
 			if body != nil {
-				a.printBody(body)
+				a.printLogBody(body)
 			}
 			return err
 		}
@@ -176,9 +179,65 @@ func (a *app) cmdLogs(args []string) error {
 	}
 
 	deadline := start.Add(lo.wait)
+	waitCtx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
 	var lastErr error
+	timedOut := func() error {
+		msg := fmt.Sprintf("no matching entry in %s after %s", name, lo.wait)
+		if lastErr != nil {
+			msg += " (last error: " + lastErr.Error() + ")"
+		}
+		return &waitTimeoutError{msg: msg}
+	}
+	waitInterval := func() error {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return timedOut()
+		}
+		timer := time.NewTimer(min(lo.interval, remaining))
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return nil
+		case <-waitCtx.Done():
+			return timedOut()
+		}
+	}
+
+	if lo.since == "" {
+		// Calibrate the local start against the service's HTTP Date before
+		// polling. Otherwise a service clock behind this machine would reject
+		// every entry created during the wait as older than local start.
+		for {
+			_, body, serverDate, err := fetch(waitCtx)
+			switch {
+			case err == nil:
+				if !serverDate.IsZero() {
+					since = serverDate.Add(start.Sub(time.Now()))
+				}
+				query.Set("since", since.UTC().Format(time.RFC3339Nano))
+				lastErr = nil
+				goto calibrated
+			case retryableWait(err):
+				lastErr = err
+			default:
+				if body != nil {
+					a.printLogBody(body)
+				}
+				return err
+			}
+			if err := waitInterval(); err != nil {
+				return err
+			}
+		}
+	}
+
+calibrated:
 	for {
-		entries, _, err := fetch()
+		if time.Until(deadline) <= 0 {
+			return timedOut()
+		}
+		entries, body, _, err := fetch(waitCtx)
 		switch {
 		case err == nil && len(entries) > 0:
 			return a.printLogs(entries)
@@ -187,18 +246,14 @@ func (a *app) cmdLogs(args []string) error {
 		case retryableWait(err):
 			lastErr = err // the service may be restarting
 		default:
+			if body != nil {
+				a.printLogBody(body)
+			}
 			return err
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			msg := fmt.Sprintf("no matching entry in %s after %s", name, lo.wait)
-			if lastErr != nil {
-				msg += " (last error: " + lastErr.Error() + ")"
-			}
-			return &waitTimeoutError{msg: msg}
+		if err := waitInterval(); err != nil {
+			return err
 		}
-		// The last poll lands on the deadline, not an interval short of it.
-		time.Sleep(min(lo.interval, remaining))
 	}
 }
 
@@ -207,10 +262,12 @@ func (a *app) cmdLogs(args []string) error {
 func retryableWait(err error) bool {
 	var te *client.TransportError
 	var he *httpError
-	return errors.As(err, &te) || (errors.As(err, &he) && he.status >= 500)
+	return errors.As(err, &te) || (errors.As(err, &he) && he.status >= 500 && he.status <= 599)
 }
 
 func (a *app) printLogs(entries []render.LogEntry) error {
+	entries = scrubLogEntries(entries, a.secrets)
+	entries = render.SanitizeLogEntries(entries)
 	if a.opts.logs.json {
 		if entries == nil {
 			entries = []render.LogEntry{}
@@ -228,4 +285,60 @@ func (a *app) printLogs(entries []render.LogEntry) error {
 	}
 	render.LogLines(a.stdout, entries)
 	return nil
+}
+
+func (a *app) printLogBody(body []byte) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var value any
+	if dec.Decode(&value) == nil {
+		var extra any
+		if dec.Decode(&extra) == io.EOF {
+			if out, err := json.Marshal(scrubLogValue(value, a.secrets)); err == nil {
+				a.printBody([]byte(render.SanitizeLogText(string(out))))
+				return
+			}
+		}
+	}
+	a.printBody([]byte(render.SanitizeLogText(client.Scrub(string(body), a.secrets...))))
+}
+
+func scrubLogEntries(entries []render.LogEntry, secrets []registry.Secret) []render.LogEntry {
+	out := make([]render.LogEntry, len(entries))
+	for i, entry := range entries {
+		out[i] = entry
+		out[i].Time = client.Scrub(entry.Time, secrets...)
+		out[i].Level = client.Scrub(entry.Level, secrets...)
+		out[i].Source = client.Scrub(entry.Source, secrets...)
+		out[i].Message = client.Scrub(entry.Message, secrets...)
+		if entry.Fields != nil {
+			out[i].Fields = scrubLogMap(entry.Fields, secrets)
+		}
+	}
+	return out
+}
+
+func scrubLogMap(in map[string]any, secrets []registry.Secret) map[string]any {
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[client.Scrub(key, secrets...)] = scrubLogValue(value, secrets)
+	}
+	return out
+}
+
+func scrubLogValue(value any, secrets []registry.Secret) any {
+	switch value := value.(type) {
+	case string:
+		return client.Scrub(value, secrets...)
+	case map[string]any:
+		return scrubLogMap(value, secrets)
+	case []any:
+		out := make([]any, len(value))
+		for i := range value {
+			out[i] = scrubLogValue(value[i], secrets)
+		}
+		return out
+	default:
+		return value
+	}
 }

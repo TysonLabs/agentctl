@@ -26,6 +26,9 @@ func logSurface(t *testing.T, h http.HandlerFunc) (cfg string, queries *[]url.Va
 	var mu sync.Mutex
 	var qs []url.Values
 	srv := newSurface(t, map[string]http.HandlerFunc{"/agent/logs": func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("/agent/logs method = %s, want GET", r.Method)
+		}
 		mu.Lock()
 		qs = append(qs, r.URL.Query())
 		mu.Unlock()
@@ -85,14 +88,39 @@ func TestLogsJSON(t *testing.T) {
 }
 
 func TestLogsStripsTerminalEscapes(t *testing.T) {
-	body := `{"entries":[{"ts":"t","level":"info","message":"a\u001b[31mred\u009b2Jb\nnext","fields":{"k\u001b":"v\u0007"}}]}`
+	body := `{"entries":[{"ts":"t","level":"info","message":"a\u001b[31mred\u009b2Jb\u007f\u202eevil\u2028next","fields":{"k\u001b":"v\u0007"}}]}`
 	cfg, _ := logSurface(t, jsonHandler(body))
 	_, out, _ := run(t, "--config", cfg, "logs", "payments.dev")
-	if strings.ContainsAny(out, "\x1b\x07") || strings.ContainsRune(out, '\u009b') || strings.Count(out, "\n") != 1 {
+	if strings.ContainsAny(out, "\x1b\x07\x7f") || strings.ContainsRune(out, '\u009b') || strings.ContainsRune(out, '\u202e') || strings.ContainsRune(out, '\u2028') || strings.Count(out, "\n") != 1 {
 		t.Fatalf("control characters or extra lines leaked: %q", out)
 	}
-	if !strings.Contains(out, "a[31mred2Jb ⏎ next") {
+	if !strings.Contains(out, "a[31mred2Jbevil ⏎ next") {
 		t.Errorf("message text lost: %q", out)
+	}
+	_, out, _ = run(t, "--config", cfg, "logs", "payments.dev", "--json")
+	if strings.ContainsRune(out, '\u202e') || strings.ContainsRune(out, '\u2028') {
+		t.Fatalf("dangerous Unicode leaked in JSON output: %q", out)
+	}
+}
+
+func TestLogsScrubsConfiguredToken(t *testing.T) {
+	body := fmt.Sprintf(`{"entries":[{"ts":"t","level":%q,"message":%q,"fields":{%q:[%q]}}]}`, testToken, testToken, testToken, testToken)
+	cfg, _ := logSurface(t, jsonHandler(body))
+	for _, extra := range [][]string{nil, {"--json"}} {
+		args := append([]string{"--config", cfg, "logs", "payments.dev"}, extra...)
+		code, out, errOut := run(t, args...)
+		if code != 0 || strings.Contains(out+errOut, testToken) || !strings.Contains(out, "tok:") {
+			t.Errorf("%v: exit %d stdout %q stderr %q", extra, code, out, errOut)
+		}
+	}
+}
+
+func TestLogsPreservesLargeFieldNumbers(t *testing.T) {
+	body := `{"entries":[{"ts":"t","level":"info","message":"m","fields":{"external_id":9007199254740993}}]}`
+	cfg, _ := logSurface(t, jsonHandler(body))
+	code, out, errOut := run(t, "--config", cfg, "logs", "payments.dev")
+	if code != 0 || !strings.Contains(out, "external_id=9007199254740993") {
+		t.Fatalf("exit %d stdout %q stderr %q", code, out, errOut)
 	}
 }
 
@@ -112,15 +140,40 @@ func TestLogsWaitMatchesLater(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "workqueue item dispatched") || calls.Load() != 3 {
 		t.Fatalf("exit %d calls %d out %q err %q", code, calls.Load(), out, errOut)
 	}
-	// Without --since, only entries after the wait began count.
-	first := (*qs)[0].Get("since")
-	if _, err := time.Parse(time.RFC3339Nano, first); err != nil {
-		t.Errorf("--wait must send since=<start>, got %q", first)
+	// The first request calibrates against the service's Date; actual polls
+	// then keep one fixed since value.
+	if first := (*qs)[0].Get("since"); first != "" {
+		t.Errorf("calibration request since = %q, want empty", first)
 	}
-	for _, q := range *qs {
-		if q.Get("since") != first {
-			t.Errorf("since moved between polls: %q then %q", first, q.Get("since"))
+	fixed := (*qs)[1].Get("since")
+	if _, err := time.Parse(time.RFC3339Nano, fixed); err != nil {
+		t.Errorf("--wait must send a fixed since after calibration, got %q", fixed)
+	}
+	for _, q := range (*qs)[1:] {
+		if q.Get("since") != fixed {
+			t.Errorf("since moved between polls: %q then %q", fixed, q.Get("since"))
 		}
+	}
+}
+
+func TestLogsWaitAdjustsForServiceClock(t *testing.T) {
+	var calls atomic.Int32
+	serviceNow := time.Now().Add(-10 * time.Minute).Truncate(time.Second)
+	cfg, qs := logSurface(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Date", serviceNow.UTC().Format(http.TimeFormat)) // HTTP dates are GMT
+		if calls.Add(1) == 1 {
+			fmt.Fprint(w, emptyLogs)
+			return
+		}
+		fmt.Fprint(w, ccLogs)
+	})
+	code, _, errOut := run(t, "--config", cfg, "logs", "payments.dev", "--wait", "2s", "--interval", "20ms")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	since, err := time.Parse(time.RFC3339Nano, (*qs)[1].Get("since"))
+	if err != nil || since.Before(serviceNow.Add(-2*time.Second)) || since.After(serviceNow.Add(2*time.Second)) {
+		t.Fatalf("clock-adjusted since = %q (%v), want about %s", (*qs)[1].Get("since"), err, serviceNow)
 	}
 }
 
@@ -149,10 +202,28 @@ func TestLogsWaitFailsFastOnPermanentHTTP(t *testing.T) {
 	cfg, _ := logSurface(t, func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprintf(w, "{\"error\":\"denied \u202e%s\"}", testToken)
 	})
-	code, _, _ := run(t, "--config", cfg, "logs", "payments.dev", "--wait", "5s", "--interval", "10ms")
-	if code != 2 || calls.Load() != 1 {
-		t.Fatalf("exit %d after %d calls, want 2 after 1", code, calls.Load())
+	code, out, _ := run(t, "--config", cfg, "logs", "payments.dev", "--wait", "5s", "--interval", "10ms")
+	if code != 2 || calls.Load() != 1 || !strings.Contains(out, "denied") || strings.Contains(out, testToken) || strings.ContainsRune(out, '\u202e') {
+		t.Fatalf("exit %d after %d calls with stdout %q, want 2 after 1 with body", code, calls.Load(), out)
+	}
+}
+
+func TestLogsWaitRequestCannotOutliveDeadline(t *testing.T) {
+	cfg, _ := logSurface(t, func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	})
+	start := time.Now()
+	code, _, _ := run(t, "--config", cfg, "logs", "payments.dev", "--wait", "100ms", "--interval", "20ms", "--timeout", "5s")
+	if elapsed := time.Since(start); code != 4 || elapsed > time.Second {
+		t.Fatalf("exit %d after %s, want exit 4 near the 100ms wait deadline", code, elapsed)
+	}
+}
+
+func TestRetryableWaitOnlyRetries5xx(t *testing.T) {
+	if !retryableWait(&httpError{status: 599}) || retryableWait(&httpError{status: 600}) {
+		t.Fatal("retryableWait must accept exactly the 5xx HTTP range")
 	}
 }
 

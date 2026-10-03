@@ -1,6 +1,7 @@
 package render
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,13 +29,19 @@ func ParseLogs(body []byte) (entries []LogEntry, ok bool) {
 	var doc struct {
 		Entries []map[string]any `json:"entries"`
 	}
-	if json.Unmarshal(body, &doc) != nil || doc.Entries == nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if dec.Decode(&doc) != nil || doc.Entries == nil {
+		return nil, false
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
 		return nil, false
 	}
 	for _, raw := range doc.Entries {
 		e := LogEntry{
 			Time:    firstString(raw, "ts", "time", "dt", "timestamp"),
-			Level:   strings.ToUpper(firstString(raw, "level", "lvl", "severity")),
+			Level:   firstString(raw, "level", "lvl", "severity"),
 			Source:  firstString(raw, "target", "logger", "source"),
 			Message: firstString(raw, "message", "msg"),
 		}
@@ -44,6 +51,52 @@ func ParseLogs(body []byte) (entries []LogEntry, ok bool) {
 		entries = append(entries, e)
 	}
 	return entries, true
+}
+
+// SanitizeLogEntries returns a copy safe for terminal and structured output.
+// It flattens line separators and removes terminal and bidirectional controls
+// from every string, including nested field keys and values.
+func SanitizeLogEntries(entries []LogEntry) []LogEntry {
+	out := make([]LogEntry, len(entries))
+	for i, entry := range entries {
+		out[i] = entry
+		out[i].Time = clean(entry.Time)
+		out[i].Level = strings.ToUpper(clean(entry.Level))
+		out[i].Source = clean(entry.Source)
+		out[i].Message = clean(entry.Message)
+		if entry.Fields != nil {
+			out[i].Fields = sanitizeLogMap(entry.Fields)
+		}
+	}
+	return out
+}
+
+// SanitizeLogText makes arbitrary text from the logs endpoint safe to print.
+func SanitizeLogText(s string) string { return clean(s) }
+
+func sanitizeLogMap(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[clean(key)] = sanitizeLogValue(value)
+	}
+	return out
+}
+
+func sanitizeLogValue(value any) any {
+	switch value := value.(type) {
+	case string:
+		return clean(value)
+	case map[string]any:
+		return sanitizeLogMap(value)
+	case []any:
+		out := make([]any, len(value))
+		for i := range value {
+			out[i] = sanitizeLogValue(value[i])
+		}
+		return out
+	default:
+		return value
+	}
 }
 
 func firstString(m map[string]any, keys ...string) string {
@@ -66,7 +119,7 @@ func LogLines(w io.Writer, entries []LogEntry) {
 		var b strings.Builder
 		b.WriteString(clean(e.Time))
 		b.WriteString(" ")
-		fmt.Fprintf(&b, "%-5s", clean(e.Level))
+		fmt.Fprintf(&b, "%-5s", clean(strings.ToUpper(e.Level)))
 		if e.Source != "" {
 			b.WriteString(" ")
 			b.WriteString(clean(e.Source))
@@ -97,15 +150,23 @@ func LogLines(w io.Writer, entries []LogEntry) {
 	}
 }
 
-// clean flattens newlines and drops other control characters, C1 included
-// (U+0080..U+009F: some terminals treat U+009B as an escape introducer).
+// clean flattens line separators and drops other control characters, DEL,
+// C1, and bidirectional formatting controls. Some terminals treat U+009B as
+// an escape introducer, while bidi controls can visually reorder a log line.
 func clean(s string) string {
-	s = strings.NewReplacer("\r\n", " ⏎ ", "\n", " ⏎ ", "\r", " ", "\t", " ").Replace(s)
+	s = strings.NewReplacer("\r\n", " ⏎ ", "\n", " ⏎ ", "\r", " ", "\t", " ", "\u2028", " ⏎ ", "\u2029", " ⏎ ").Replace(s)
 	s = strings.Map(func(r rune) rune {
-		if r >= 0x80 && r <= 0x9f {
+		if r == 0x7f || (r >= 0x80 && r <= 0x9f) || isBidiControl(r) {
 			return -1
 		}
 		return r
 	}, s)
 	return string(StripControl([]byte(s)))
+}
+
+func isBidiControl(r rune) bool {
+	return r == '\u061c' ||
+		(r >= '\u200e' && r <= '\u200f') ||
+		(r >= '\u202a' && r <= '\u202e') ||
+		(r >= '\u2066' && r <= '\u206f')
 }
