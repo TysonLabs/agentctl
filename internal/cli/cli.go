@@ -24,6 +24,7 @@ Usage:
   agentctl ls                                 list registered services and wiring status
   agentctl get <service.env> <path> [--raw]   GET /agent/<path>  (e.g. agentctl get payments.dev version)
   agentctl endpoints <service.env>            fetch and render the GET /agent index
+  agentctl logs <service.env> [log flags]     GET /agent/logs as readable lines (all log shapes)
   agentctl status [service.env ...]           /agent/version + /agent/health across services
   agentctl version                            print agentctl's own version
 
@@ -33,7 +34,19 @@ Flags (before or after the subcommand):
   --raw            (get) byte-for-byte body passthrough
   --help           this screen
 
+Log flags (logs only):
+  --q TEXT         case-insensitive substring filter (the service applies it)
+  --level LEVEL    minimum severity: error, warn, info, debug or trace
+  --since WHEN     a duration back from now (30m, 2h) or an RFC 3339 time
+  --limit N        at most N entries (the service caps it)
+  --json           normalized entries as JSON instead of lines
+  --wait DUR       poll until an entry matches, then print and exit 0; exit 4
+                   if none appears within DUR (only entries newer than the
+                   start, or --since, count)
+  --interval DUR   delay between --wait polls (default 15s)
+
 Exit codes: 0 ok · 1 usage/config error · 2 HTTP >= 400 · 3 transport/timeout
+            · 4 logs --wait saw no match in time
 `
 
 type usageError string
@@ -53,6 +66,7 @@ type opts struct {
 	timeoutSet bool
 	raw        bool
 	help       bool
+	logs       logOpts
 }
 
 type app struct {
@@ -146,6 +160,10 @@ func parseArgs(args []string) (opts, []string, error) {
 			o.timeoutSet = true
 		case "raw":
 			o.raw = true
+		case "q", "level", "since", "limit", "json", "wait", "interval":
+			if err := o.logs.set(name, hasVal, val, take); err != nil {
+				return o, nil, err
+			}
 		case "help":
 			o.help = true
 		default:
@@ -181,6 +199,10 @@ func Run(args []string, stdout, stderr io.Writer) (code int) {
 	}
 
 	cmd, rest := pos[0], pos[1:]
+	if cmd != "logs" && o.logs.used {
+		a.errf("--q, --level, --since, --limit, --json, --wait and --interval only apply to logs")
+		return 1
+	}
 	var cmdErr error
 	switch cmd {
 	case "ls":
@@ -189,6 +211,8 @@ func Run(args []string, stdout, stderr io.Writer) (code int) {
 		cmdErr = a.cmdGet(rest)
 	case "endpoints":
 		cmdErr = a.cmdEndpoints(rest)
+	case "logs":
+		cmdErr = a.cmdLogs(rest)
 	case "status":
 		cmdErr = a.cmdStatus(rest)
 	case "version":
@@ -207,7 +231,11 @@ func (a *app) exitCode(err error) int {
 	var ue usageError
 	var he *httpError
 	var te *client.TransportError
+	var we *waitTimeoutError
 	switch {
+	case errors.As(err, &we):
+		a.errf("%v", we)
+		return 4
 	case errors.As(err, &ue):
 		a.errf("%v", ue)
 		return 1
