@@ -2,10 +2,12 @@ package worktree
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -50,7 +52,15 @@ func newFixture(t *testing.T) *fixture {
 	git(t, root, "clone", "-q", f.origin, f.repo)
 
 	gh := filepath.Join(root, "gh")
-	writeFile(t, root, "gh", "#!/bin/sh\nprintf '%s\\n' \"$*\" > \""+filepath.Join(root, "gh.args")+"\"\ncat \""+filepath.Join(root, "gh.out")+"\" 2>/dev/null\n")
+	// The fake gh applies the caller's real --jq expression to gh.json with
+	// jq, as gh does, so a malformed expression fails the test.
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not installed")
+	}
+	writeFile(t, root, "gh", "#!/bin/sh\nprintf '%s\\n' \"$*\" > \""+filepath.Join(root, "gh.args")+"\"\n"+
+		"expr=''\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --jq ]; then shift; expr=\"$1\"; fi; shift; done\n"+
+		"[ -f \""+filepath.Join(root, "gh.json")+"\" ] || exit 0\n"+
+		"exec jq -r \"$expr\" \""+filepath.Join(root, "gh.json")+"\"\n")
 	if err := os.Chmod(gh, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -74,8 +84,27 @@ func writeFile(t *testing.T, dir, name, body string) {
 	}
 }
 
+// setPRs records merged PRs as "number headOid" pairs; the fake gh returns
+// them as gh's JSON (headRepository.nameWithOwner = repo, "" for unknown).
 func (f *fixture) setPRs(lines ...string) {
-	writeFile(f.t, f.root, "gh.out", strings.Join(lines, "\n")+"\n")
+	f.setPRsFrom("", lines...)
+}
+
+func (f *fixture) setPRsFrom(repo string, lines ...string) {
+	prs := []map[string]any{}
+	for _, l := range lines {
+		num, oid, _ := strings.Cut(strings.TrimSpace(l), " ")
+		n, _ := strconv.Atoi(num)
+		pr := map[string]any{"number": n, "headRefOid": oid}
+		if repo != "" {
+			pr["headRepository"] = map[string]any{"nameWithOwner": repo}
+		} else {
+			pr["headRepository"] = nil
+		}
+		prs = append(prs, pr)
+	}
+	b, _ := json.Marshal(prs)
+	writeFile(f.t, f.root, "gh.json", string(b))
 }
 
 // worktree adds a worktree on a new branch with one pushed commit.
