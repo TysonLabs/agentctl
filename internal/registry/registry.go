@@ -9,10 +9,12 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/BurntSushi/toml"
 
 	"github.com/TysonLabs/agentctl/internal/configpath"
+	"github.com/TysonLabs/agentctl/internal/keychain"
 )
 
 // Service is one [name.env] table from services.toml.
@@ -21,6 +23,7 @@ type Service struct {
 	Env            string
 	BaseURL        string
 	Token          Secret
+	TokenRef       string // "keychain:<account>" when the token lives in the Keychain
 	Wired          bool
 	NotWiredReason string
 	Meta           map[string]string // from the sibling [name.meta] table
@@ -50,19 +53,35 @@ func ResolvePath(flagVal string) string { return configpath.Resolve(flagVal) }
 // webhook, a write credential) and agentctl never decodes it.
 var reservedTables = map[string]bool{"meta": true, "announce": true}
 
-// Load reads and validates the registry file.
+// Load reads and validates the registry file, then reads every token_ref
+// from the Keychain.
 func Load(path string) (*Registry, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("config file not found: %s\nCreate it with entries like:\n\n%s", path, ExampleTOML)
 	}
-	reg := &Registry{Path: path}
-	if runtime.GOOS != "windows" && fi.Mode().Perm()&0o077 != 0 {
-		reg.Warnings = append(reg.Warnings, fmt.Sprintf("config file %s is readable by group/other — consider chmod 600", path))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %v", path, err)
 	}
+	reg, err := Parse(path, data)
+	if err != nil {
+		return nil, err
+	}
+	if runtime.GOOS != "windows" && fi.Mode().Perm()&0o077 != 0 {
+		reg.Warnings = append([]string{fmt.Sprintf("config file %s is readable by group/other — consider chmod 600", path)}, reg.Warnings...)
+	}
+	reg.ResolveKeychain()
+	return reg, nil
+}
 
+// Parse validates registry file content without touching the Keychain:
+// services with a token_ref come back not wired until ResolveKeychain runs.
+// path is used only in messages. agentcfg runs it on every file it writes.
+func Parse(path string, data []byte) (*Registry, error) {
+	reg := &Registry{Path: path}
 	var raw map[string]map[string]toml.Primitive
-	md, err := toml.DecodeFile(path, &raw)
+	md, err := toml.Decode(string(data), &raw)
 	if err != nil {
 		return nil, sanitizeTOMLError(path, err)
 	}
@@ -85,8 +104,9 @@ func Load(path string) (*Registry, error) {
 	}
 
 	type envTable struct {
-		BaseURL string `toml:"base_url"`
-		Token   string `toml:"token"`
+		BaseURL  string `toml:"base_url"`
+		Token    string `toml:"token"`
+		TokenRef string `toml:"token_ref"`
 	}
 
 	for _, name := range names {
@@ -117,6 +137,12 @@ func Load(path string) (*Registry, error) {
 						return nil, fmt.Errorf("[%s.%s] token must be a string in %s", name, env, path)
 					}
 					et.Token = s
+				case "token_ref":
+					s, ok := v.(string)
+					if !ok {
+						return nil, fmt.Errorf("[%s.%s] token_ref must be a string in %s", name, env, path)
+					}
+					et.TokenRef = s
 				default:
 					reg.Warnings = append(reg.Warnings, fmt.Sprintf("[%s.%s] unknown key %q ignored", name, env, k))
 				}
@@ -125,15 +151,25 @@ func Load(path string) (*Registry, error) {
 			if err != nil {
 				return nil, fmt.Errorf("[%s.%s] in %s: %v", name, env, path, err)
 			}
-			svc := Service{
-				Name:    name,
-				Env:     env,
-				BaseURL: base,
-				Token:   NewSecret(et.Token),
-				Meta:    metas[name],
+			_, hasToken := loose["token"]
+			_, hasTokenRef := loose["token_ref"]
+			if hasToken && hasTokenRef {
+				return nil, fmt.Errorf("[%s.%s] in %s: set token or token_ref, not both", name, env, path)
 			}
-			if reason := placeholderReason(et.Token); reason != "" {
-				svc.Wired = false
+			svc := Service{
+				Name:     name,
+				Env:      env,
+				BaseURL:  base,
+				Token:    NewSecret(et.Token),
+				TokenRef: et.TokenRef,
+				Meta:     metas[name],
+			}
+			if hasTokenRef {
+				if _, err := keychain.ParseRef(et.TokenRef); err != nil {
+					return nil, fmt.Errorf("[%s.%s] in %s: %v", name, env, path, err)
+				}
+				svc.NotWiredReason = "keychain token not read yet"
+			} else if reason := placeholderReason(et.Token); reason != "" {
 				svc.NotWiredReason = reason
 			} else {
 				svc.Wired = true
@@ -142,6 +178,42 @@ func Load(path string) (*Registry, error) {
 		}
 	}
 	return reg, nil
+}
+
+// ResolveKeychain reads every token_ref, in parallel (one security call each,
+// ~20 ms). A missing or unreadable item leaves the service not wired, with the
+// reason; it never falls back to another token.
+func (r *Registry) ResolveKeychain() {
+	var wg sync.WaitGroup
+	for i := range r.Services {
+		svc := &r.Services[i]
+		if svc.TokenRef == "" {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Start from not wired every time, so a rerun never keeps a token
+			// whose item is gone.
+			svc.Token, svc.Wired = Secret{}, false
+			acct, _ := keychain.ParseRef(svc.TokenRef) // validated by Parse
+			tok, err := keychain.Get(acct)
+			switch {
+			case errors.Is(err, keychain.ErrNotFound):
+				svc.NotWiredReason = fmt.Sprintf("no keychain item %s/%s — run: agentcfg token %s", keychain.Service, acct, svc.FullName())
+			case err != nil:
+				svc.NotWiredReason = err.Error()
+			default:
+				svc.Token = NewSecret(tok)
+				if reason := placeholderReason(tok); reason != "" {
+					svc.NotWiredReason = "keychain " + reason
+				} else {
+					svc.Wired, svc.NotWiredReason = true, ""
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // sanitizeTOMLError converts a TOML decode error into a message that never
@@ -209,7 +281,10 @@ func validateBaseURL(raw string) (string, error) {
 
 var fillerOnly = regexp.MustCompile(`^[xX*._\x{2026}-]+$`)
 
-// placeholderReason returns a non-empty reason if the token is a placeholder.
+// PlaceholderReason returns a non-empty reason if the token is a placeholder.
+// agentcfg uses it to refuse storing one.
+func PlaceholderReason(tok string) string { return placeholderReason(tok) }
+
 func placeholderReason(tok string) string {
 	t := strings.TrimSpace(tok)
 	if t == "" {

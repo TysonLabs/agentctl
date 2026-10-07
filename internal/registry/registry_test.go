@@ -4,9 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/TysonLabs/agentctl/internal/keychain"
+	"github.com/TysonLabs/agentctl/internal/keychain/keychaintest"
 )
 
 func writeConfig(t *testing.T, content string) string {
@@ -275,5 +279,105 @@ func TestNonParseDecodeErrorRedacted(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "hunter2") {
 		t.Fatalf("decode error leaks file content: %q", err.Error())
+	}
+}
+
+func TestTokenRefResolvesFromKeychain(t *testing.T) {
+	keychaintest.Temp(t)
+	keychaintest.Put(t, "pay.prod", "kc_realtoken_123")
+	keychaintest.Put(t, "pay.stage", "REPLACE_ME")
+	p := writeConfig(t, `
+[pay.prod]
+base_url  = "https://pay.example.com"
+token_ref = "keychain:pay.prod"
+
+[pay.dev]
+base_url  = "https://dev.example.com"
+token_ref = "keychain:pay.dev"
+
+[pay.stage]
+base_url  = "https://stage.example.com"
+token_ref = "keychain:pay.stage"
+`)
+	reg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prod, _ := reg.Lookup("pay.prod")
+	if !prod.Wired || prod.Token.Reveal() != "kc_realtoken_123" {
+		t.Fatalf("pay.prod should be wired from the keychain: %+v", prod)
+	}
+	dev, _ := reg.Lookup("pay.dev")
+	if dev.Wired || !strings.Contains(dev.NotWiredReason, "agentcfg token pay.dev") {
+		t.Fatalf("pay.dev has no item and must be not wired with a fix: %+v", dev)
+	}
+	stage, _ := reg.Lookup("pay.stage")
+	if stage.Wired || !strings.Contains(stage.NotWiredReason, "placeholder") {
+		t.Fatalf("a placeholder in the keychain must not wire: %+v", stage)
+	}
+	if got := reg.Secrets(); len(got) != 2 {
+		t.Fatalf("Secrets() = %d, want the 2 resolved keychain tokens for scrubbing", len(got))
+	}
+}
+
+// Parse never touches the Keychain: a ref is reported, not resolved.
+func TestParseLeavesRefUnresolved(t *testing.T) {
+	reg, err := Parse("x.toml", []byte("[a.b]\nbase_url = \"https://a\"\ntoken_ref = \"keychain:a.b\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := reg.Services[0]
+	if s.Wired || s.TokenRef != "keychain:a.b" || !s.Token.IsZero() {
+		t.Fatalf("got %+v", s)
+	}
+}
+
+func TestTokenRefRejects(t *testing.T) {
+	cases := map[string]string{
+		"both":            "[a.b]\nbase_url = \"https://a\"\ntoken = \"abcdefgh12\"\ntoken_ref = \"keychain:a.b\"\n",
+		"empty-token+ref": "[a.b]\nbase_url = \"https://a\"\ntoken = \"\"\ntoken_ref = \"keychain:a.b\"\n",
+		"token+empty-ref": "[a.b]\nbase_url = \"https://a\"\ntoken = \"abcdefgh12\"\ntoken_ref = \"\"\n",
+		"empty-ref":       "[a.b]\nbase_url = \"https://a\"\ntoken_ref = \"\"\n",
+		"scheme":          "[a.b]\nbase_url = \"https://a\"\ntoken_ref = \"vault:a.b\"\n",
+		"account":         "[a.b]\nbase_url = \"https://a\"\ntoken_ref = \"keychain:a b\"\n",
+		"type":            "[a.b]\nbase_url = \"https://a\"\ntoken_ref = 3\n",
+	}
+	for name, content := range cases {
+		if _, err := Parse("x.toml", []byte(content)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestTokenRefErrorNeverEchoesValue(t *testing.T) {
+	const secret = "bearer_token_accidentally_pasted_here"
+	content := "[a.b]\nbase_url = \"https://a\"\ntoken_ref = \"" + secret + "\"\n"
+	_, err := Parse("x.toml", []byte(content))
+	if err == nil {
+		t.Fatal("accepted malformed token_ref")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("token_ref error leaked its value: %q", err)
+	}
+}
+
+// A second resolve after the item is deleted must not keep the old token.
+func TestResolveKeychainRerunDropsDeletedItem(t *testing.T) {
+	kc := keychaintest.Temp(t)
+	keychaintest.Put(t, "pay.prod", "kc_realtoken_123")
+	reg, err := Parse("x.toml", []byte("[pay.prod]\nbase_url = \"https://a\"\ntoken_ref = \"keychain:pay.prod\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.ResolveKeychain()
+	if !reg.Services[0].Wired {
+		t.Fatalf("first resolve: %+v", reg.Services[0])
+	}
+	if out, err := exec.Command(keychain.Bin, "delete-generic-password", "-s", keychain.Service, "-a", "pay.prod", kc).CombinedOutput(); err != nil {
+		t.Fatalf("delete: %v %s", err, out)
+	}
+	reg.ResolveKeychain()
+	if s := reg.Services[0]; s.Wired || !s.Token.IsZero() {
+		t.Fatalf("second resolve kept the deleted token: %+v", s)
 	}
 }
