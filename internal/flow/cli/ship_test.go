@@ -137,7 +137,7 @@ func TestShipAnnounceChainsFromVerify(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(dir, "state"))
 	cfg := filepath.Join(dir, "services.toml")
 	if err := os.WriteFile(cfg, []byte("[rcx.prod]\nbase_url = \"https://rcx.example.com\"\ntoken = \"REPLACE_ME\"\n\n"+
-		"[rcx.announce]\nwebhook = \"https://hooks.slack.com/services/T0/B0/fakeSecretPart123\"\nchannel = \"#rcx-releases\"\n"), 0o600); err != nil {
+		"[rcx.announce]\nwebhook = \"https://hooks.slack.com/services/T0FAKE1/B0FAKE1/fakeSecretPart123\"\nchannel = \"#rcx-releases\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENTCTL_CONFIG", cfg)
