@@ -205,6 +205,9 @@ func (r *Registry) ResolveKeychain() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// Start from not wired every time, so a rerun never keeps a token
+			// whose item is gone.
+			svc.Token, svc.Wired = Secret{}, false
 			acct, _ := keychain.ParseRef(svc.TokenRef) // validated by Parse
 			tok, err := keychain.Get(acct)
 			switch {

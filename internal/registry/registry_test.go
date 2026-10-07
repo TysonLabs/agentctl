@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/TysonLabs/agentctl/internal/keychain"
 	"github.com/TysonLabs/agentctl/internal/keychain/keychaintest"
 )
 
@@ -332,5 +334,26 @@ func TestTokenRefErrorNeverEchoesValue(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Fatalf("token_ref error leaked its value: %q", err)
+	}
+}
+
+// A second resolve after the item is deleted must not keep the old token.
+func TestResolveKeychainRerunDropsDeletedItem(t *testing.T) {
+	kc := keychaintest.Temp(t)
+	keychaintest.Put(t, "pay.prod", "kc_realtoken_123")
+	reg, err := Parse("x.toml", []byte("[pay.prod]\nbase_url = \"https://a\"\ntoken_ref = \"keychain:pay.prod\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.ResolveKeychain()
+	if !reg.Services[0].Wired {
+		t.Fatalf("first resolve: %+v", reg.Services[0])
+	}
+	if out, err := exec.Command(keychain.Bin, "delete-generic-password", "-s", keychain.Service, "-a", "pay.prod", kc).CombinedOutput(); err != nil {
+		t.Fatalf("delete: %v %s", err, out)
+	}
+	reg.ResolveKeychain()
+	if s := reg.Services[0]; s.Wired || !s.Token.IsZero() {
+		t.Fatalf("second resolve kept the deleted token: %+v", s)
 	}
 }
