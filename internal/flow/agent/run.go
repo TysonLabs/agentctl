@@ -47,6 +47,11 @@ const (
 	StatusTimeout      Status = "timeout"       // killed: the run exceeded Options.Timeout
 	StatusStalled      Status = "stalled"       // killed: no activity for Options.Stall
 	StatusInterrupted  Status = "interrupted"   // killed: the caller's context was cancelled
+
+	// statusEndedAfterResult is internal and never reported: agentflow ended
+	// a process that outlived its final result, and the stream decides the
+	// outcome.
+	statusEndedAfterResult Status = "ended_after_result"
 )
 
 // Scope selects a diff to review. At most one of Base, Commit and Uncommitted
@@ -76,7 +81,7 @@ type Options struct {
 	OutDir       string        // artifacts directory (created if missing)
 	Home         string        // agent state dir with session logs (default per backend)
 	Poll         time.Duration // watch interval (default 2s)
-	Grace        time.Duration // SIGTERM → SIGKILL delay (default 5s)
+	Grace        time.Duration // SIGTERM → SIGKILL delay, and how long a process may outlive its final result (default 5s)
 }
 
 // ReviewerNote tells a prompt-driven agent that it is the sub-agent, not the
@@ -84,6 +89,7 @@ type Options struct {
 // AGENTS.md or CLAUDE.md may try to start a review of its own work.
 const ReviewerNote = "You were started by agentflow as a sub-agent for one task: the prompt below. " +
 	"Do that task, report, and stop. Do not start other agents or reviews (agentflow, codex, claude), " +
+	"do not run commands in the background, " +
 	"and do not commit, push, merge or open pull requests."
 
 // Usage is the token usage reported at the end of the run.
@@ -205,7 +211,7 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	}
 	pw.Close() // the child holds the write end now
 
-	st := streamState{backend: b}
+	st := streamState{backend: b, ended: make(chan struct{})}
 	st.touch()
 	readerDone := make(chan struct{})
 	go func() {
@@ -219,7 +225,10 @@ func Run(ctx context.Context, o Options) (Result, error) {
 
 	killed, waitErr := watch(ctx, o, cmd.Process.Pid, start, &st, waitCh)
 	res.DurationS = time.Since(start).Round(10 * time.Millisecond).Seconds()
-	if killed == "" {
+	endedAfterResult := killed == statusEndedAfterResult
+	if endedAfterResult {
+		killed = "" // killGroup already reaped the whole group
+	} else if killed == "" {
 		// cmd.Wait only reaps the direct child. Do not leave helpers from a
 		// normally exiting codex process running in its process group.
 		cleanupGroup(cmd.Process.Pid, o.Grace)
@@ -255,8 +264,13 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		res.Error = killMessage(killed, o)
 		return res, nil
 	}
-	code := exitCode(waitErr)
-	res.Exit = &code
+	// An exit code from a process agentflow ended means nothing: Exit stays
+	// null and the stream alone decides the status.
+	code := 0
+	if !endedAfterResult {
+		code = exitCode(waitErr)
+		res.Exit = &code
+	}
 	failure := st.failure()
 	switch {
 	case code != 0 || failure != "":
@@ -319,8 +333,9 @@ func isGitRepo(dir string) bool {
 }
 
 // watch waits for the process, killing its group on timeout, stall or
-// cancellation. It returns the kill reason ("" if the agent exited by itself)
-// and the agent's wait error.
+// cancellation, or a grace period after the stream reported the end of the
+// turn. It returns the kill reason ("" if the agent exited by itself) and the
+// agent's wait error.
 func watch(ctx context.Context, o Options, pid int, start time.Time, st *streamState, waitCh <-chan error) (Status, error) {
 	tick := time.NewTicker(o.Poll)
 	defer tick.Stop()
@@ -328,11 +343,20 @@ func watch(ctx context.Context, o Options, pid int, start time.Time, st *streamS
 	defer deadline.Stop()
 	lastActivity := start
 	activity := st.activityCount()
+	ended := st.ended // closed by endTurn; set to nil once handled
+	var linger <-chan time.Time
 	for {
 		var reason Status
 		select {
 		case err := <-waitCh:
 			return "", err
+		case <-ended:
+			ended = nil
+			t := time.NewTimer(o.Grace)
+			defer t.Stop()
+			linger = t.C
+		case <-linger:
+			reason = statusEndedAfterResult
 		case <-ctx.Done():
 			reason = StatusInterrupted
 		case <-deadline.C:
@@ -453,6 +477,19 @@ type streamState struct {
 	answer   string
 	fail     string
 	complete bool
+
+	// ended is closed when the backend reports the end of the task's turn
+	// (endTurn). Backends that never call endTurn run until the agent exits.
+	ended     chan struct{}
+	turnEnded bool
+}
+
+// endTurn records that the task's turn is over; called with s.mu held.
+func (s *streamState) endTurn() {
+	if !s.turnEnded {
+		s.turnEnded = true
+		close(s.ended)
+	}
 }
 
 func (s *streamState) touch()                { s.activity.Add(1) }

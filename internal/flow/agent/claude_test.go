@@ -53,6 +53,18 @@ func fakeClaude(mode string) int {
 	case "ratelimit-multiline":
 		result("error_during_execution", true, "API Error\nrate limit exceeded, retry later")
 		return 1
+	case "lingers":
+		// Claude Code 2.1.292+ waits for a backgrounded Bash command after the
+		// answer, then reports the command's completion as a second turn.
+		result("success", false, "DONE\n")
+		time.Sleep(100 * time.Millisecond)
+		result("success", false, "Background command completed.\n")
+		time.Sleep(time.Hour)
+		return 0
+	case "lingers-error":
+		result("error_during_execution", true, "API Error: 500 internal error")
+		time.Sleep(time.Hour)
+		return 1
 	case "session-log":
 		// Silent on stdout for 3s while the session log grows.
 		day := filepath.Join(os.Getenv("FAKE_CODEX_HOME"), "projects", "-tmp-repo")
@@ -163,6 +175,35 @@ func TestClaudeErrorResultIsNeverTheAnswer(t *testing.T) {
 	res := run(t, o)
 	if _, err := os.Stat(res.Final); err == nil {
 		t.Errorf("an error result was written as the final answer")
+	}
+}
+
+func TestClaudeRunEndsAfterTheFirstResult(t *testing.T) {
+	cases := []struct {
+		mode  string
+		want  Status
+		final string
+	}{
+		{"lingers", StatusOK, "DONE\n"},
+		{"lingers-error", StatusClaudeFailed, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.mode, func(t *testing.T) {
+			_, o := claudeHarness(t, c.mode)
+			o.Stall = 20 * time.Second // longer than the test may take: only the result may end it
+			start := time.Now()
+			res := run(t, o)
+			if d := time.Since(start); d > 5*time.Second {
+				t.Errorf("took %s: the run must end a grace period after the first result", d)
+			}
+			if res.Status != c.want || res.Exit != nil {
+				t.Fatalf("got status=%s exit=%v error=%q, want %s with a null exit", res.Status, res.Exit, res.Error, c.want)
+			}
+			b, _ := os.ReadFile(res.Final)
+			if string(b) != c.final {
+				t.Errorf("final = %q, want %q: a later turn must not replace the first answer", b, c.final)
+			}
+		})
 	}
 }
 

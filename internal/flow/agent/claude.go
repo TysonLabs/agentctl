@@ -96,6 +96,14 @@ func (claudeBackend) handle(line []byte, s *streamState) {
 	if ev.Type != "result" {
 		return
 	}
+	// Since Claude Code 2.1.292, -p waits for a backgrounded command after the
+	// result, and the command's completion starts a second turn with its own
+	// result. The first result is the answer to the task; the run watcher ends
+	// the process a grace period after it.
+	if s.turnEnded {
+		return
+	}
+	s.endTurn()
 	s.cost = ev.CostUSD
 	if ev.Usage != nil {
 		s.use = &Usage{InputTokens: ev.Usage.InputTokens, CachedInputTokens: ev.Usage.CacheReadTokens, OutputTokens: ev.Usage.OutputTokens}
