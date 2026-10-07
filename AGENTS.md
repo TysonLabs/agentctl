@@ -36,7 +36,9 @@ background and keep working; your harness tells you when it exits. Never wait in
    `agentflow ship verify <service.env> --sha <merge-sha>`. Exit 0 means the service runs
    that commit; on a timeout, the JSON's `running` says what is live. Add `--contains
    --repo <checkout>` only for a forward deploy, never when verifying a rollback. Never
-   report "deployed" without this check.
+   report "deployed" without this check. If the service has a release channel, announce
+   it from that proof: `agentflow ship announce <service.env> --verified <verify.json>
+   --title ... --body-file ...` (what changed and how to test it, in plain language).
 10. **Clean up:** sync any long-lived branches the repo keeps, then remove the worktree
     and the merged branches.
 

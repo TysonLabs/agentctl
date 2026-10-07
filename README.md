@@ -145,6 +145,8 @@ letting anyone enumerate users or sessions.
 - Location: `--config PATH` > `$AGENTCTL_CONFIG` > `~/.config/agentctl/services.toml`.
 - Each `[service.env]` table needs `base_url` (http/https, no userinfo/query/fragment) and `token`.
 - A `[service.meta]` table is informational (repo, unit, owner, …) — shown by `ls`, never fetched.
+- A `[service.announce]` table belongs to `agentflow ship announce` (a Slack webhook). agentctl
+  skips it without decoding it, so agentctl never holds a write credential.
 - Placeholder tokens (`REPLACE_ME`, `CHANGEME`, `TODO`, `…`, `<...>`, all-`x`, anything under
   8 chars) mark a service **not wired**: `ls` shows it with the reason, `get`/`endpoints` refuse
   it, `status` skips it.
@@ -368,6 +370,50 @@ hand-written `until …; sleep` loops agents write after every merge.
 | 3 | `unreadable` | `/agent/version` has no recognizable commit |
 | 124 | `timeout` | never matched before `--timeout`; `running`/`error` show the last state |
 | 130 | `interrupted` | interrupted |
+
+### `agentflow ship announce`: tell a channel what shipped, only once it is live
+
+```sh
+agentflow ship verify myservice.prod --sha "$MERGE_SHA" > verify.json &&
+agentflow ship announce myservice.prod --verified verify.json \
+  --title "Exports: CSV now includes the time zone" --body-file note.md \
+  --pr-url https://github.com/acme/myservice/pull/42
+```
+
+The channel is configured once per service, next to its environments in `services.toml`:
+
+```toml
+[myservice.announce]
+webhook = "https://hooks.slack.com/services/..."   # a Slack incoming webhook: a secret
+channel = "#myservice-releases"                     # label for output; the webhook picks the channel
+envs    = ["prod"]                                  # envs that announce (default ["prod"])
+```
+
+The agent writes the title and a plain-language body (what changed, how to test it);
+agentflow adds the header line (service, env, short SHA, PR link, verify time) and posts it.
+
+- **No proof, no post.** `--verified` must be the JSON from `ship verify` for this
+  service: `status` `deployed`, a running commit, and a `checked_at` within `--max-age`
+  (default 1h). There is no override.
+- **Once per commit.** A second announce of the same `service.env` and commit exits 3; a
+  lock file stops two sessions from both posting. `--force` posts again. The record is
+  `$XDG_STATE_HOME/agentflow/announce.json` (default `~/.local/state`).
+- **Scrubbed.** The webhook, token-shaped strings (hex and base64 keys, Slack, GitHub and
+  AWS tokens) and invisible or bidi characters are removed. `&`, `<` and `>` are escaped,
+  so a body can't ping `@channel` or forge a link. Title and body are cut to Slack's limits.
+- The webhook is only ever sent to `https://hooks.slack.com/services/...`. Redirects are
+  not followed, and errors never include the URL. agentflow reads only the
+  `[service.announce]` table of `services.toml`; the `/agent` tokens stay undecoded.
+- `--dry-run` prints the exact Slack payload and posts nothing.
+
+| Exit | Status | Meaning |
+|---|---|---|
+| 0 | `posted` / `dry_run` | Slack accepted it, or the dry-run payload is in `payload` |
+| 1 | — | usage error |
+| 2 | `refused` | no fresh proof, env not in `envs`, or a missing or bad `[service.announce]` |
+| 3 | `already_announced` | this commit was posted before (`posted_at` says when) |
+| 4 | `slack_error` | Slack or the network rejected the post; nothing is recorded, so a rerun retries |
+| 130 | — | interrupted |
 
 ### `agentflow worktree done` / `sweep`: remove finished worktrees, never by force
 
