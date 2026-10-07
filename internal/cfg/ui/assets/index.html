@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>agentcfg</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h16M4 18h7" /><circle cx="17" cy="6" r="2.2" /><circle cx="14" cy="18" r="2.2" /></svg>
+    <div>
+      <div class="title">agentcfg</div>
+      <div class="sub mono" id="path">loading…</div>
+    </div>
+  </div>
+  <div class="topbar-actions">
+    <span class="muted small" id="appver"></span>
+    <button class="btn" id="done" type="button">Done</button>
+  </div>
+</header>
+
+<main class="wrap">
+  <div id="alerts"></div>
+
+  <section class="section-head">
+    <div>
+      <h1>Services</h1>
+      <p class="muted" id="summary"></p>
+    </div>
+    <button class="btn primary" id="add" type="button">Add service</button>
+  </section>
+
+  <div id="services"></div>
+
+  <p class="foot muted small">
+    agentctl reads this registry; agentcfg is the only tool that writes it.
+    Tokens marked <span class="chip ok">Keychain</span> live in your login Keychain
+    (service <span class="mono">agentctl</span>), not in the file.
+  </p>
+</main>
+
+<dialog id="dlg">
+  <form id="dlg-form" method="dialog" novalidate>
+    <h2 id="dlg-title"></h2>
+    <p class="muted small" id="dlg-hint"></p>
+    <div id="dlg-fields"></div>
+    <p class="form-error" id="dlg-error" role="alert"></p>
+    <div class="dlg-actions">
+      <button class="btn" type="button" id="dlg-cancel">Cancel</button>
+      <button class="btn primary" type="submit" id="dlg-ok">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toasts" aria-live="polite"></div>
+
+<div id="stopped" hidden>
+  <div class="stopped-card">
+    <h2>agentcfg stopped</h2>
+    <p class="muted">Your changes are saved. You can close this tab.</p>
+    <p class="muted small">Run <span class="mono">agentcfg ui</span> to open it again.</p>
+  </div>
+</div>
+</body>
+</html>
