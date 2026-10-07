@@ -381,22 +381,29 @@ func watch(ctx context.Context, o Options, pid int, start time.Time, st *streamS
 			return "", err
 		default:
 		}
-		return reason, killGroup(pid, o.Grace, waitCh)
+		naturalExit, waitErr := killGroup(pid, o.Grace, waitCh)
+		if naturalExit {
+			return "", waitErr
+		}
+		return reason, waitErr
 	}
 }
 
 // killGroup sends SIGTERM to the whole process group, then SIGKILL after
-// grace if the agent is still alive. It always reaps the process.
-func killGroup(pid int, grace time.Duration, waitCh <-chan error) error {
+// grace if the agent is still alive. It always reaps the process. The bool
+// reports that the direct child had already been reaped before signaling, so
+// its exit was natural even if descendants still needed cleanup.
+func killGroup(pid int, grace time.Duration, waitCh <-chan error) (bool, error) {
+	naturalExit := errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	select {
 	case err := <-waitCh:
 		_ = syscall.Kill(-pid, syscall.SIGKILL) // stragglers in the group
-		return err
+		return naturalExit, err
 	case <-time.After(grace):
 	}
 	_ = syscall.Kill(-pid, syscall.SIGKILL)
-	return <-waitCh
+	return naturalExit, <-waitCh
 }
 
 // cleanupGroup terminates descendants left in the agent's process group after the

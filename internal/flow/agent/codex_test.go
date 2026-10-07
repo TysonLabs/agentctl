@@ -448,6 +448,32 @@ func TestNormalExitKillsStdoutHoldingDescendant(t *testing.T) {
 	assertDead(t, pid)
 }
 
+func TestWatchPreservesNaturalExitBeforeKillDecision(t *testing.T) {
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(), "FAKE_CODEX_MODE=natural-exit", "FAKE_CODEX_REC="+t.TempDir())
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	waitErr := cmd.Wait() // Reap the natural exit before watch decides to kill.
+
+	// Delay publishing cmd.Wait's result to exercise the gap between reaping
+	// the child and waitCh becoming ready.
+	waitCh := make(chan error)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		waitCh <- waitErr
+	}()
+	st := streamState{backend: Codex, ended: make(chan struct{})}
+	close(st.ended)
+	o := Options{Poll: time.Second, Timeout: time.Second, Grace: 5 * time.Millisecond}
+	reason, gotErr := watch(context.Background(), o, pid, time.Now(), &st, waitCh)
+	if reason != "" || exitCode(gotErr) != 99 {
+		t.Fatalf("reason=%q exit=%d, want a natural exit 99", reason, exitCode(gotErr))
+	}
+}
+
 func TestCancelInterruptsAndKills(t *testing.T) {
 	h := newHarness(t, "hang")
 	o := h.opts()
