@@ -440,7 +440,8 @@ no token.
 - **Open threads, ready to handle.** On exit 10, `open_threads` lists each unresolved
   CodeRabbit thread with its GraphQL `id` (what `addPullRequestReviewThreadReply` and
   `resolveReviewThread` take), `path`, `line`, `url` and the first lines of its comment.
-  `threads_complete` is false when there are over 100 threads and the list is cut.
+  All thread pages are read; `threads_complete` is false only if the last page still
+  reports more.
 - **Fails fast.** A wrong repo, PR number or login fails on the first check. Later gh
   errors are retried until `--timeout` (default 45m, every `--interval`, default 30s).
   A PR that is closed or merged with an unreviewed head exits 5 instead of waiting out

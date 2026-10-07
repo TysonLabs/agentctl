@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -105,6 +106,21 @@ func TestTruncatedThreadListIsNeverClean(t *testing.T) {
 	}
 }
 
+func TestThreadsAcrossSlurpedPages(t *testing.T) {
+	page := func(id string, more bool) string {
+		return fmt.Sprintf(`{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":%t,"endCursor":"c"},"nodes":[`+
+			`{"id":%q,"isResolved":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"x.go","line":1,"url":"u","body":"b"}]}}]}}}}}`, more, id)
+	}
+	r := run(&fake{summary: covered(head), threads: "[" + page("T1", true) + "," + page("T2", false) + "]"}, true)
+	if r.Status != StatusOpenThreads || len(r.OpenThreads) != 2 || r.OpenThreads[1].ID != "T2" || r.ThreadsComplete == nil || !*r.ThreadsComplete {
+		t.Fatalf("got %+v", r)
+	}
+	r = run(&fake{summary: covered(head), threads: "[" + page("T1", false) + "," + `{"errors":[{"message":"boom"}]}` + "]"}, true)
+	if r.Status != StatusGHError || !strings.Contains(r.Error, "boom") {
+		t.Fatalf("an error on a later page must fail: %+v", r)
+	}
+}
+
 func TestOlderRoundIsNotTheHead(t *testing.T) {
 	r := run(&fake{summary: covered(older)}, true)
 	if r.Status != StatusWaiting || r.Reviewed != older {
@@ -164,7 +180,8 @@ func TestSummaryOnALaterPage(t *testing.T) {
 			sawPaginatedComments = strings.Contains(joined, "--paginate") && strings.Contains(joined, "--slurp")
 		}
 		if len(args) > 1 && args[0] == "api" && args[1] == "graphql" {
-			sawBoundedThreads = strings.Contains(joined, "reviewThreads(first:100)") && strings.Contains(joined, "pageInfo{hasNextPage}")
+			sawBoundedThreads = strings.Contains(joined, "--paginate --slurp") &&
+				strings.Contains(joined, "reviewThreads(first:100,after:$endCursor)") && strings.Contains(joined, "pageInfo{hasNextPage endCursor}")
 		}
 		return f.gh(ctx, args...)
 	}

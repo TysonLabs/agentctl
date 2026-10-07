@@ -70,7 +70,7 @@ type Result struct {
 	Head            string   `json:"head,omitempty"`
 	Reviewed        string   `json:"reviewed,omitempty"` // the commit CodeRabbit last covered
 	OpenThreads     []Thread `json:"open_threads"`
-	ThreadsComplete *bool    `json:"threads_complete,omitempty"` // set once the head is reviewed; false: more than 100 threads, list cut
+	ThreadsComplete *bool    `json:"threads_complete,omitempty"` // set once the head is reviewed; false: GitHub still reported more pages
 	Next            string   `json:"next,omitempty"`             // what to do next, one line
 	Attempts        int      `json:"attempts"`
 	DurationS       float64  `json:"duration_s"`
@@ -230,7 +230,8 @@ func read(ctx context.Context, o Options) (snapshot, error) {
 	}
 
 	owner, name, _ := strings.Cut(o.Repo, "/")
-	out, err = o.GH(ctx, "api", "graphql", "-F", "o="+owner, "-F", "n="+name, "-F", fmt.Sprintf("p=%d", o.PR), "-f", "query="+threadsQuery)
+	// --paginate follows reviewThreads by $endCursor; --slurp returns every page.
+	out, err = o.GH(ctx, "api", "graphql", "--paginate", "--slurp", "-F", "o="+owner, "-F", "n="+name, "-F", fmt.Sprintf("p=%d", o.PR), "-f", "query="+threadsQuery)
 	if err != nil {
 		return snap, err
 	}
@@ -238,74 +239,94 @@ func read(ctx context.Context, o Options) (snapshot, error) {
 	return snap, err
 }
 
-const threadsQuery = `query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){` +
-	`reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved ` +
+const threadsQuery = `query($o:String!,$n:String!,$p:Int!,$endCursor:String){repository(owner:$o,name:$n){pullRequest(number:$p){` +
+	`reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved ` +
 	`comments(first:1){nodes{author{login} path line originalLine url body}}}}}}}`
 
+// threadsPage is one page of the reviewThreads query.
+type threadsPage struct {
+	Data struct {
+		Repository *struct {
+			PullRequest *struct {
+				ReviewThreads *struct {
+					PageInfo *struct {
+						HasNextPage bool `json:"hasNextPage"`
+					} `json:"pageInfo"`
+					Nodes []struct {
+						ID         string `json:"id"`
+						IsResolved bool   `json:"isResolved"`
+						Comments   struct {
+							Nodes []struct {
+								Author struct {
+									Login string `json:"login"`
+								} `json:"author"`
+								Path         string `json:"path"`
+								Line         *int   `json:"line"`
+								OriginalLine *int   `json:"originalLine"`
+								URL          string `json:"url"`
+								Body         string `json:"body"`
+							} `json:"nodes"`
+						} `json:"comments"`
+					} `json:"nodes"`
+				} `json:"reviewThreads"`
+			} `json:"pullRequest"`
+		} `json:"repository"`
+	} `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
+// parseThreads reads gh's slurped pages (a JSON array) or a single page,
+// and reports whether the last page says there are no more threads.
 func parseThreads(out []byte) ([]Thread, bool, error) {
-	var doc struct {
-		Data struct {
-			Repository *struct {
-				PullRequest *struct {
-					ReviewThreads *struct {
-						PageInfo *struct {
-							HasNextPage bool `json:"hasNextPage"`
-						} `json:"pageInfo"`
-						Nodes []struct {
-							ID         string `json:"id"`
-							IsResolved bool   `json:"isResolved"`
-							Comments   struct {
-								Nodes []struct {
-									Author struct {
-										Login string `json:"login"`
-									} `json:"author"`
-									Path         string `json:"path"`
-									Line         *int   `json:"line"`
-									OriginalLine *int   `json:"originalLine"`
-									URL          string `json:"url"`
-									Body         string `json:"body"`
-								} `json:"nodes"`
-							} `json:"comments"`
-						} `json:"nodes"`
-					} `json:"reviewThreads"`
-				} `json:"pullRequest"`
-			} `json:"repository"`
-		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
+	var pages []threadsPage
+	if trimmed := bytes.TrimSpace(out); len(trimmed) > 0 && trimmed[0] == '[' {
+		if err := json.Unmarshal(trimmed, &pages); err != nil {
+			return nil, false, fmt.Errorf("gh api graphql: %w", err)
+		}
+	} else {
+		var one threadsPage
+		if err := json.Unmarshal(out, &one); err != nil {
+			return nil, false, fmt.Errorf("gh api graphql: %w", err)
+		}
+		pages = []threadsPage{one}
 	}
-	if err := json.Unmarshal(out, &doc); err != nil {
-		return nil, false, fmt.Errorf("gh api graphql: %w", err)
-	}
-	if len(doc.Errors) > 0 {
-		return nil, false, fmt.Errorf("gh api graphql: %s", doc.Errors[0].Message)
-	}
-	if doc.Data.Repository == nil || doc.Data.Repository.PullRequest == nil || doc.Data.Repository.PullRequest.ReviewThreads == nil {
-		return nil, false, fmt.Errorf("gh api graphql: response has no reviewThreads")
-	}
-	rt := doc.Data.Repository.PullRequest.ReviewThreads
-	if rt.PageInfo == nil || rt.Nodes == nil {
-		return nil, false, fmt.Errorf("gh api graphql: incomplete reviewThreads response")
+	if len(pages) == 0 {
+		return nil, false, fmt.Errorf("gh api graphql: no pages")
 	}
 	threads := []Thread{}
-	for _, n := range rt.Nodes {
-		if n.IsResolved || len(n.Comments.Nodes) == 0 {
-			continue
+	complete := false
+	for _, doc := range pages {
+		if len(doc.Errors) > 0 {
+			return nil, false, fmt.Errorf("gh api graphql: %s", doc.Errors[0].Message)
 		}
-		c := n.Comments.Nodes[0]
-		if !strings.EqualFold(c.Author.Login, "coderabbitai") {
-			continue
+		if doc.Data.Repository == nil || doc.Data.Repository.PullRequest == nil || doc.Data.Repository.PullRequest.ReviewThreads == nil {
+			return nil, false, fmt.Errorf("gh api graphql: response has no reviewThreads")
 		}
-		t := Thread{ID: n.ID, Path: c.Path, URL: c.URL, Excerpt: excerpt(c.Body)}
-		if c.Line != nil {
-			t.Line = *c.Line
-		} else if c.OriginalLine != nil {
-			t.Line = *c.OriginalLine // an outdated thread keeps its original line
+		rt := doc.Data.Repository.PullRequest.ReviewThreads
+		if rt.PageInfo == nil || rt.Nodes == nil {
+			return nil, false, fmt.Errorf("gh api graphql: incomplete reviewThreads response")
 		}
-		threads = append(threads, t)
+		for _, n := range rt.Nodes {
+			if n.IsResolved || len(n.Comments.Nodes) == 0 {
+				continue
+			}
+			c := n.Comments.Nodes[0]
+			if !strings.EqualFold(c.Author.Login, "coderabbitai") {
+				continue
+			}
+			t := Thread{ID: n.ID, Path: c.Path, URL: c.URL, Excerpt: excerpt(c.Body)}
+			if c.Line != nil {
+				t.Line = *c.Line
+			} else if c.OriginalLine != nil {
+				t.Line = *c.OriginalLine // an outdated thread keeps its original line
+			}
+			threads = append(threads, t)
+		}
+		complete = !rt.PageInfo.HasNextPage
 	}
-	return threads, !rt.PageInfo.HasNextPage, nil
+	return threads, complete, nil
 }
 
 // excerpt keeps the first meaningful line of a thread's opening comment
