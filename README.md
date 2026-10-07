@@ -421,6 +421,45 @@ agentflow adds the header line (service, env, short SHA, PR link, verify time) a
 | 4 | `slack_error` | Slack or the network rejected the post; nothing is recorded, so a rerun retries |
 | 130 | — | interrupted |
 
+### `agentflow pr wait`: wait for CodeRabbit's review of the PR head
+
+```sh
+agentflow pr wait 42                       # repo from the current directory (via gh)
+agentflow pr wait 42 --repo acme/myservice # explicit repo
+agentflow pr wait 42 --once                # one check, no waiting
+```
+
+Run it in the background after you push; it exits when there is something to do. All
+GitHub access goes through the `gh` CLI (`$AGENTFLOW_GH`, then `PATH`), so agentflow holds
+no token.
+
+- **The current head, not any review.** "Reviewed" means CodeRabbit's summary comment
+  covers the PR's head commit (`coveredCommitId`) and no review is in progress. An older
+  round's review, the "CodeRabbit" commit status (it can stay pending after the review)
+  and empty-body bot reviews (replies to thread replies) are all ignored.
+- **Open threads, ready to handle.** On exit 10, `open_threads` lists each unresolved
+  CodeRabbit thread with its GraphQL `id` (what `addPullRequestReviewThreadReply` and
+  `resolveReviewThread` take), `path`, `line`, `url` and the first lines of its comment.
+  `threads_complete` is false when there are over 100 threads and the list is cut.
+- **Fails fast.** A wrong repo, PR number or login fails on the first check. Later gh
+  errors are retried until `--timeout` (default 45m, every `--interval`, default 30s).
+  A PR that is closed or merged with an unreviewed head exits 5 instead of waiting out
+  the timeout. The repo is never guessed: without `--repo` it comes from `gh repo view`.
+- `next` in the JSON says what to do: handle the threads, comment `@coderabbitai review`
+  (skipped or rate-limited), or nothing.
+
+| Exit | Status | Meaning |
+|---|---|---|
+| 0 | `clean` | the head is reviewed and no CodeRabbit thread is open |
+| 1 | `gh_error` / — | usage error, or gh failed on the first check |
+| 2 | `waiting` | `--once` only: the head is not reviewed yet |
+| 3 | `skipped` | review skipped (draft, non-default base, paused): comment `@coderabbitai review` |
+| 4 | `rate_limited` | wait the time in CodeRabbit's comment, then `@coderabbitai review` |
+| 5 | `closed` | the PR is closed or merged and its head was never reviewed |
+| 10 | `open_threads` | the head is reviewed; fix, reply, then resolve each thread |
+| 124 | `timeout` | never reviewed before `--timeout`: request a review once, then ask a human |
+| 130 | `interrupted` | interrupted |
+
 ### `agentflow worktree done` / `sweep`: remove finished worktrees, never by force
 
 ```sh
