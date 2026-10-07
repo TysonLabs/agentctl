@@ -31,7 +31,8 @@ agentctl is what curl looks like after you delete everything an agent could misu
   a single `http.MethodGet` literal (enforced by a test that greps the sources).
 - **Path confinement.** Requests can only go to paths under `/agent/` on base URLs registered
   in the config file. No `--url` flag exists. Traversal (`..`, encoded variants) is rejected.
-- **Token hygiene.** Tokens live in one config file, never on the command line. Internally they
+- **Token hygiene.** Tokens live in the macOS Keychain (or, legacy, in one config file), never
+  on the command line. Internally they
   are wrapped in a `Secret` type whose every formatting path (fmt verbs, JSON) yields a
   fingerprint (`tok:1a2b3c4d`), and all diagnostics are scrubbed before printing.
 - **Redirect pinning.** Max 3 hops, same scheme+host+port as the registered base URL, and the
@@ -143,7 +144,12 @@ letting anyone enumerate users or sessions.
 ## Configuration
 
 - Location: `--config PATH` > `$AGENTCTL_CONFIG` > `~/.config/agentctl/services.toml`.
-- Each `[service.env]` table needs `base_url` (http/https, no userinfo/query/fragment) and `token`.
+- Each `[service.env]` table needs `base_url` (http/https, no userinfo/query/fragment) and a
+  token: `token_ref = "keychain:<service>.<env>"` (the token lives in the login Keychain as
+  service `agentctl`, account `<service>.<env>`) or, legacy, a plaintext `token = "..."`. Set
+  one, not both. `agentcfg` (below) writes both forms; `agentcfg migrate` moves plaintext
+  tokens into the Keychain. A missing Keychain item marks the service **not wired** with the fix.
+- `[service.announce]` belongs to agentflow; agentctl never reads it.
 - A `[service.meta]` table is informational (repo, unit, owner, …) — shown by `ls`, never fetched.
 - Placeholder tokens (`REPLACE_ME`, `CHANGEME`, `TODO`, `…`, `<...>`, all-`x`, anything under
   8 chars) mark a service **not wired**: `ls` shows it with the reason, `get`/`endpoints` refuse
@@ -202,11 +208,12 @@ spent in requests. It's still only GET requests under `/agent/`.
 
 ## Security model
 
-Capabilities that **do not exist**: non-GET methods, arbitrary URLs, custom headers,
-`--insecure`, request bodies, tokens on the CLI, config-write commands (a `wire`/`add`
-command would put tokens in shell history).
+Capabilities that **do not exist** in agentctl: non-GET methods, arbitrary URLs, custom
+headers, `--insecure`, request bodies, tokens on the CLI, config-write commands. Writing the
+registry and the Keychain is agentcfg's job, a separate binary kept off agent allowlists; an
+import-boundary test keeps its code out of agentctl.
 
-What does exist: bearer auth from a 600-mode file, fingerprint-only token rendering,
+What does exist: bearer auth from the Keychain or a 600-mode file, fingerprint-only token rendering,
 output scrubbing, host+path-pinned redirects, timeouts, and a response size cap.
 
 ## For agents (CLAUDE.md snippet)
@@ -409,10 +416,42 @@ JSON result, and exits 3. Exit codes: 0 removed (or would be, or sweep finished)
 1 usage · 2 refused · 3 git/gh error. A missing or incomplete `lsof` check is a
 safety refusal.
 
+## agentcfg (companion binary): edit the registry, keep tokens in the Keychain
+
+```sh
+go install github.com/TysonLabs/agentctl/cmd/agentcfg@latest
+agentcfg ui                                   # settings page in your browser
+agentcfg migrate                              # move every plaintext token into the Keychain
+agentcfg set payments.prod --base-url https://pay.example.com
+pbpaste | agentcfg token payments.prod        # or type it: no echo on a terminal
+agentcfg test payments.prod                   # GET /agent/version with the stored token
+agentcfg ls · agentcfg meta payments repo=~/src/payments unit=payments.service · agentcfg rm payments.prod
+```
+
+agentcfg is for a person, not for agents: it is a separate binary so agentctl keeps its
+read-only guarantee, and it belongs on no agent allowlist. Exit codes: 0 ok · 1 error ·
+2 usage · 3 test failed.
+
+- **Writes are safe.** Each edit runs under a file lock, re-decodes its output to prove nothing
+  was lost (tables it does not know, like `[x.announce]`, come through unchanged), passes the
+  same validation agentctl runs, and replaces the file atomically at mode 0600 (a symlinked
+  file keeps its link). Comments are not kept: the file is machine-managed once agentcfg writes it.
+- **Tokens never touch argv or the file.** A token goes to `security -i` on stdin, hex-encoded,
+  and is read back before the file points at it. If the Keychain write fails, the file is
+  unchanged. Removing an env deletes its Keychain item.
+- **The settings page** (`agentcfg ui`) listens on 127.0.0.1 only. Each launch makes a random
+  key that reaches the page in the URL fragment (never sent to a server) and must be on every
+  API call. The server checks the Host header exactly (DNS rebinding), refuses cross-origin
+  and non-JSON writes, sends a strict CSP, shows token fingerprints only, rejects an edit made
+  against a stale copy of the file (409), and stops after 15 minutes idle (`--idle`) or on Done.
+- **What the Keychain protects:** tokens are out of the file, its backups and `cat`. Items are
+  readable by `/usr/bin/security` without a prompt, so a process running as you can still read
+  them on purpose; deny `security find-generic-password` in agent permissions if that matters.
+
 ## Non-goals
 
-Color/TTY niceties, retries, response caching, keychain integration, `--json` listing output,
-shell completions, config-write commands, per-service schema rendering. PRs adding request
+Color/TTY niceties, retries, response caching, `--json` listing output, shell completions,
+config-write commands in agentctl (agentcfg owns writes), per-service schema rendering. PRs adding request
 capabilities beyond GET-under-/agent will be declined on principle.
 
 ## Contributing
