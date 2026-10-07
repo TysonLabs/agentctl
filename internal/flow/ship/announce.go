@@ -23,7 +23,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
@@ -86,19 +85,7 @@ const (
 	maxContextRunes = 2900 // under the 3000-char text-object limit
 )
 
-var (
-	prURLRe   = regexp.MustCompile(`^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/([0-9]+)$`)
-	secretRes = []*regexp.Regexp{
-		regexp.MustCompile(`https?://hooks\.slack\.com/\S*`),
-		regexp.MustCompile(`xox[a-z]-[A-Za-z0-9-]+`),
-		regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
-		regexp.MustCompile(`github_pat_[A-Za-z0-9_]{20,}`),
-		regexp.MustCompile(`sk-[A-Za-z0-9_-]{20,}`),
-		regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
-		regexp.MustCompile(`\b[0-9A-Fa-f]{48,}\b`), // hex tokens; a 40-char commit SHA stays
-	}
-	base64Re = regexp.MustCompile(`[A-Za-z0-9+/]{32,}={0,2}`)
-)
+var prURLRe = regexp.MustCompile(`^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/([0-9]+)$`)
 
 // Announce checks every guard, then posts once per service.env and commit.
 func Announce(ctx context.Context, o AnnounceOptions) AnnounceResult {
@@ -336,56 +323,11 @@ func buildPayload(name, env string, o AnnounceOptions, checkedAt time.Time, webh
 // cleanText removes secrets and characters that can hide or reorder text.
 // Secrets go first, before any escaping changes their spelling.
 func cleanText(s, webhook string) string {
-	s = redactSecret(s, webhook)
-	for _, re := range secretRes {
-		s = re.ReplaceAllString(s, "[redacted]")
-	}
-	s = base64Re.ReplaceAllStringFunc(s, func(m string) string {
-		if looksLikeBase64Secret(m) {
-			return "[redacted]"
-		}
-		return m
-	})
-	return strings.Map(func(r rune) rune {
-		switch {
-		case r == '\n' || r == '\t':
-			return r
-		case unicode.IsControl(r), unicode.Is(unicode.Cf, r):
-			return -1
-		}
-		return r
-	}, strings.ToValidUTF8(s, ""))
+	return slackhook.CleanText(s, webhook)
 }
 
 func redactSecret(s, secret string) string {
-	if secret == "" {
-		return s
-	}
-	s = strings.ReplaceAll(s, secret, "[redacted]")
-	if u, err := url.Parse(secret); err == nil && len(u.Path) > len("/services/") {
-		tail := strings.TrimPrefix(u.Path, "/services/")
-		s = strings.ReplaceAll(s, tail, "[redacted]")
-		// Any path component can identify the incoming webhook. Errors from
-		// proxies and transports sometimes print components separately.
-		for _, part := range strings.Split(tail, "/") {
-			if part != "" {
-				s = strings.ReplaceAll(s, part, "[redacted]")
-			}
-		}
-	}
-	return s
-}
-
-// looksLikeBase64Secret flags base64 runs with mixed case, a digit and a
-// '+' or '=': random keys have them, file paths and prose almost never do.
-func looksLikeBase64Secret(s string) bool {
-	var upper, lower, digit bool
-	for _, r := range s {
-		upper = upper || unicode.IsUpper(r)
-		lower = lower || unicode.IsLower(r)
-		digit = digit || unicode.IsDigit(r)
-	}
-	return upper && lower && digit && strings.ContainsAny(s, "+=")
+	return slackhook.RedactSecret(s, secret)
 }
 
 // escapeMrkdwn escapes Slack's control characters, so a body can't ping

@@ -223,26 +223,31 @@ func (a *app) cmdLs(args []string) error {
 	if st.Error != "" {
 		return errors.New(st.Error)
 	}
-	if len(st.Services) == 0 {
+	if len(st.Services) == 0 && len(st.Announces) == 0 {
 		fmt.Fprintf(a.stdout, "no services in %s — add one: agentcfg set <name.env> --base-url URL\n", st.Path)
 		return nil
 	}
-	tw := tabwriter.NewWriter(a.stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "SERVICE\tBASE URL\tTOKEN\tSTATUS")
-	for _, s := range st.Services {
-		tok := s.Token.Source
-		if s.Token.Fingerprint != "" {
-			tok += " " + s.Token.Fingerprint
+	var tw *tabwriter.Writer
+	if len(st.Services) > 0 {
+		tw = tabwriter.NewWriter(a.stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "SERVICE\tBASE URL\tTOKEN\tSTATUS")
+		for _, s := range st.Services {
+			tok := s.Token.Source
+			if s.Token.Fingerprint != "" {
+				tok += " " + s.Token.Fingerprint
+			}
+			status := "wired"
+			if !s.Token.Wired {
+				status = "not wired: " + s.Token.Reason
+			}
+			fmt.Fprintf(tw, "%s.%s\t%s\t%s\t%s\n", s.Name, s.Env, s.BaseURL, tok, status)
 		}
-		status := "wired"
-		if !s.Token.Wired {
-			status = "not wired: " + s.Token.Reason
-		}
-		fmt.Fprintf(tw, "%s.%s\t%s\t%s\t%s\n", s.Name, s.Env, s.BaseURL, tok, status)
+		tw.Flush()
 	}
-	tw.Flush()
 	if len(st.Announces) > 0 {
-		fmt.Fprintln(a.stdout)
+		if len(st.Services) > 0 {
+			fmt.Fprintln(a.stdout)
+		}
 		tw = tabwriter.NewWriter(a.stdout, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(tw, "SLACK\tCHANNEL\tENVS\tWEBHOOK\tSTATUS")
 		for _, an := range st.Announces {

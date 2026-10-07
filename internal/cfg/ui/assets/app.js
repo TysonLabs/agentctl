@@ -113,6 +113,9 @@
       if (!by.has(s.name)) by.set(s.name, { name: s.name, meta: s.meta || {}, envs: [] });
       by.get(s.name).envs.push(s);
     }
+    for (const an of state.announces || []) {
+      if (!by.has(an.name)) by.set(an.name, { name: an.name, meta: {}, envs: [] });
+    }
     return [...by.values()];
   }
 
@@ -143,11 +146,11 @@
 
     const gs = groups();
     const wired = state.services.filter((s) => s.token.wired).length;
-    $("summary").textContent = state.services.length
+    $("summary").textContent = gs.length
       ? `${plural(gs.length, "service", "services")} · ${plural(state.services.length, "environment", "environments")} · ${wired} wired`
       : "";
 
-    if (!state.services.length && !state.error) {
+    if (!gs.length && !state.error) {
       $("services").replaceChildren(h("div", { class: "card empty" },
         h("h2", { text: "No services yet" }),
         h("p", { class: "muted", text: "Add the first service agentctl should talk to." }),
@@ -380,7 +383,7 @@
       "agentflow ship announce posts a verified deploy here.", fields, "Save",
       async () => {
         const form = { channel: val("f-channel"), envs: val("f-envs"), hook: $("f-hook").value };
-        const envs = form.envs ? form.envs.split(",").map((e) => e.trim()).filter(Boolean) : null;
+        const envs = form.envs ? form.envs.split(",").map((e) => e.trim()).filter(Boolean) : ["prod"];
         await write("/api/announce", { name, channel: form.channel, envs, webhook: form.hook });
         toast("Saved Slack announce for " + name);
       });

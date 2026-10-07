@@ -233,3 +233,15 @@ func TestAnnounceCommand(t *testing.T) {
 		t.Fatalf("ls after remove:\n%s", out)
 	}
 }
+
+func TestLsShowsAnnounceWithoutAnEnvironment(t *testing.T) {
+	const hook = "https://hooks.slack.com/services/T0FAKE1/B0FAKE1/fakeSecretPart123"
+	cfgPath := filepath.Join(t.TempDir(), "services.toml")
+	if err := os.WriteFile(cfgPath, []byte("[pay.announce]\nwebhook = \""+hook+"\"\nchannel = \"#pay\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errs := run(t, "", "ls", "--config", cfgPath)
+	if code != 0 || !strings.Contains(out, "SLACK") || !strings.Contains(out, "pay") || !strings.Contains(out, "1 secret(s)") || strings.Contains(out+errs, "fakeSecretPart123") {
+		t.Fatalf("ls: %d\nstdout: %s\nstderr: %s", code, out, errs)
+	}
+}

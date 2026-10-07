@@ -1,6 +1,7 @@
 package cfg
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -227,10 +228,14 @@ func (s *Store) Remove(expect, full string) (*Result, error) {
 }
 
 func (d *Doc) refersTo(ref string) bool {
+	return d.refersToKey("token_ref", ref)
+}
+
+func (d *Doc) refersToKey(key, ref string) bool {
 	for _, sv := range d.Tree {
 		svc, _ := sv.(map[string]any)
 		for _, tv := range svc {
-			if tbl, ok := tv.(map[string]any); ok && tbl["token_ref"] == ref {
+			if tbl, ok := tv.(map[string]any); ok && tbl[key] == ref {
 				return true
 			}
 		}
@@ -363,12 +368,86 @@ func checkAnnounceEdit(e AnnounceEdit) error {
 		}
 		for _, env := range e.Envs {
 			if !nameRe.MatchString(env) || reservedEnvs[env] {
-				return fmt.Errorf("env %q must be 1-64 letters, digits, _ or -", env)
+				// Do not quote the submitted value: a webhook pasted into the
+				// wrong field must not be reflected in an API/CLI error.
+				return fmt.Errorf("envs entries must be 1-64 letters, digits, _ or -")
 			}
 		}
 	}
 	if e.Webhook != "" && !slackhook.Valid(e.Webhook) {
 		return fmt.Errorf("webhook must be a Slack incoming webhook (https://hooks.slack.com/services/...)")
+	}
+	return nil
+}
+
+var announceKeys = map[string]bool{"webhook": true, "webhook_ref": true, "channel": true, "envs": true}
+
+// validateAnnounceTable applies agentflow's full-table rules to the result of
+// an edit. pendingWebhook is the value that a BeforeSave callback will put at
+// name.announce; it lets validation happen before that external side effect.
+func validateAnnounceTable(name string, tbl map[string]any, pendingWebhook string) error {
+	for key := range tbl {
+		if !announceKeys[key] {
+			return fmt.Errorf("%s.announce has an unknown key; fix the file by hand", name)
+		}
+	}
+	rawHook, hasHook := tbl["webhook"]
+	rawRef, hasRef := tbl["webhook_ref"]
+	if hasHook && hasRef {
+		return fmt.Errorf("%s.announce sets both webhook and webhook_ref; refusing to choose one", name)
+	}
+	if !hasHook && !hasRef {
+		return fmt.Errorf("%s.announce needs a webhook — add --webhook (read from stdin)", name)
+	}
+
+	var hook string
+	if hasHook {
+		var ok bool
+		hook, ok = rawHook.(string)
+		if !ok {
+			return fmt.Errorf("%s.announce webhook must be a string", name)
+		}
+	} else {
+		ref, ok := rawRef.(string)
+		if !ok {
+			return fmt.Errorf("%s.announce webhook_ref must be a string", name)
+		}
+		acct, err := keychain.ParseRef(ref)
+		if err != nil {
+			return fmt.Errorf("%s.announce webhook_ref is malformed", name)
+		}
+		if pendingWebhook != "" && acct == announceAccount(name) {
+			hook = pendingWebhook
+		} else {
+			hook, err = keychain.GetFrom(keychain.AgentflowService, acct)
+			if errors.Is(err, keychain.ErrNotFound) {
+				return fmt.Errorf("%s.announce has no Keychain webhook; add --webhook", name)
+			}
+			if err != nil {
+				return fmt.Errorf("%s.announce cannot read its Keychain webhook: %v", name, err)
+			}
+		}
+	}
+	if !slackhook.Valid(hook) {
+		return fmt.Errorf("%s.announce webhook must be a Slack incoming webhook", name)
+	}
+	channel, ok := tbl["channel"].(string)
+	if !ok || strings.TrimSpace(channel) == "" {
+		return fmt.Errorf("%s.announce needs a channel label — add --channel \"#releases\"", name)
+	}
+	if len(channel) > 80 || !slackhook.SafeLabel(channel, hook) {
+		return fmt.Errorf("channel must be a short label such as \"#releases\"")
+	}
+	if raw, exists := tbl["envs"]; exists {
+		envs, ok := raw.([]any)
+		if !ok {
+			return fmt.Errorf("%s.announce envs must be a list of strings", name)
+		}
+		for _, env := range envs {
+			if _, ok := env.(string); !ok {
+				return fmt.Errorf("%s.announce envs must be a list of strings", name)
+			}
+		}
 	}
 	return nil
 }
@@ -406,22 +485,24 @@ func (s *Store) SetAnnounce(expect, name string, e AnnounceEdit) (*Result, error
 			}
 			tbl["envs"] = envs
 		}
+		oldRef, _ := tbl["webhook_ref"].(string)
 		if e.Webhook != "" {
 			acct := announceAccount(name)
-			d.BeforeSave(func() error { return keychainSet(keychain.AgentflowService, acct, e.Webhook) })
 			delete(tbl, "webhook")
 			tbl["webhook_ref"] = keychain.RefPrefix + acct
 		}
-		_, hasHook := tbl["webhook"]
-		_, hasRef := tbl["webhook_ref"]
-		switch {
-		case hasHook && hasRef:
-			return fmt.Errorf("%s.announce sets both webhook and webhook_ref; refusing to choose one", name)
-		case !hasHook && !hasRef:
-			return fmt.Errorf("%s.announce needs a webhook — add --webhook (read from stdin)", name)
+		if err := validateAnnounceTable(name, tbl, e.Webhook); err != nil {
+			return err
 		}
-		if c, _ := tbl["channel"].(string); strings.TrimSpace(c) == "" {
-			return fmt.Errorf("%s.announce needs a channel label — add --channel \"#releases\"", name)
+		if e.Webhook != "" {
+			acct := announceAccount(name)
+			d.BeforeSave(func() error { return keychainSet(keychain.AgentflowService, acct, e.Webhook) })
+			newRef := keychain.RefPrefix + acct
+			if oldRef != "" && oldRef != newRef && !d.refersToKey("webhook_ref", oldRef) {
+				if oldAcct, err := keychain.ParseRef(oldRef); err == nil {
+					d.OnSaved(func() error { return keychainDelete(keychain.AgentflowService, oldAcct) })
+				}
+			}
 		}
 		svc["announce"] = tbl
 		return nil
@@ -446,7 +527,7 @@ func (s *Store) RemoveAnnounce(expect, name string) (*Result, error) {
 		if len(svc) == 0 {
 			delete(d.Tree, name)
 		}
-		if ref, _ := tbl["webhook_ref"].(string); ref != "" {
+		if ref, _ := tbl["webhook_ref"].(string); ref != "" && !d.refersToKey("webhook_ref", ref) {
 			if acct, err := keychain.ParseRef(ref); err == nil {
 				d.OnSaved(func() error { return keychainDelete(keychain.AgentflowService, acct) })
 			}

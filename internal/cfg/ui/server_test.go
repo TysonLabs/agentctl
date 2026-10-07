@@ -287,6 +287,22 @@ func TestBrowserCodeKeepsSecretsAndAddFormStable(t *testing.T) {
 	if reject < 0 || stopped < 0 || reject > stopped {
 		t.Fatal("quit flow reports stopped before handling an HTTP rejection")
 	}
+	slackStart := strings.Index(source, "function openSlack(")
+	slackEnd := strings.Index(source, "function openMeta(")
+	if slackStart < 0 || slackEnd <= slackStart {
+		t.Fatal("could not find Slack flow")
+	}
+	if !strings.Contains(source[slackStart:slackEnd], `: ["prod"]`) {
+		t.Fatal("clearing the Slack env list does not restore agentflow's prod default")
+	}
+	groupsStart := strings.Index(source, "function groups(")
+	renderStart := strings.Index(source, "function render(")
+	if groupsStart < 0 || renderStart <= groupsStart || !strings.Contains(source[groupsStart:renderStart], "state.announces") {
+		t.Fatal("service cards omit announce-only services")
+	}
+	if !strings.Contains(source[renderStart:slackStart], "!gs.length") {
+		t.Fatal("announce-only services are replaced by the empty state")
+	}
 }
 
 func TestQuit(t *testing.T) {

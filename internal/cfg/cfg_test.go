@@ -589,3 +589,100 @@ func TestMigrateMovesWebhooks(t *testing.T) {
 		t.Fatal("skip reason echoes the webhook")
 	}
 }
+
+func TestRemoveAnnounceKeepsSharedKeychainItem(t *testing.T) {
+	kc := keychaintest.Temp(t)
+	keychaintest.PutIn(t, keychain.AgentflowService, "shared.announce", testHook)
+	s := newStore(t, `[a.prod]
+base_url = "https://a.example.com"
+
+[a.announce]
+webhook_ref = "keychain:shared.announce"
+channel = "#a"
+
+[b.prod]
+base_url = "https://b.example.com"
+
+[b.announce]
+webhook_ref = "keychain:shared.announce"
+channel = "#b"
+`)
+	if _, err := s.RemoveAnnounce("", "a"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(keychain.Bin, "find-generic-password", "-s", keychain.AgentflowService, "-a", "shared.announce", "-w", kc).Output()
+	if err != nil || strings.TrimSpace(string(out)) != testHook {
+		t.Fatalf("shared keychain item was removed: value=%q err=%v", out, err)
+	}
+}
+
+func TestSetAnnounceDeletesReplacedKeychainItem(t *testing.T) {
+	kc := keychaintest.Temp(t)
+	keychaintest.PutIn(t, keychain.AgentflowService, "old.announce", testHook)
+	s := newStore(t, `[pay.prod]
+base_url = "https://pay.example.com"
+
+[pay.announce]
+webhook_ref = "keychain:old.announce"
+channel = "#pay"
+`)
+	const replacement = "https://hooks.slack.com/services/T0FAKE1/B0FAKE1/replacementSecret456"
+	if _, err := s.SetAnnounce("", "pay", AnnounceEdit{Webhook: replacement}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.Command(keychain.Bin, "find-generic-password", "-s", keychain.AgentflowService, "-a", "old.announce", "-w", kc).Output(); err == nil {
+		t.Fatal("replaced keychain item survived")
+	}
+	if hook, ok := announceItem(t, kc, "pay"); !ok || hook != replacement {
+		t.Fatalf("replacement keychain item = %q, %v", hook, ok)
+	}
+}
+
+func TestSetAnnounceValidatesTheFinalTable(t *testing.T) {
+	for name, table := range map[string]string{
+		"invalid existing webhook": `webhook = "https://evil.example.com/fakeSecretPart123"
+channel = "#old"`,
+		"unknown key": `webhook = "` + testHook + `"
+channel = "#old"
+typo = true`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newStore(t, "[pay.prod]\nbase_url = \"https://pay.example.com\"\n\n[pay.announce]\n"+table+"\n")
+			before := read(t, s)
+			channel := "#new"
+			if _, err := s.SetAnnounce("", "pay", AnnounceEdit{Channel: &channel}); err == nil {
+				t.Fatal("edit accepted a table agentflow refuses")
+			} else if strings.Contains(err.Error(), "fakeSecretPart123") {
+				t.Fatalf("error leaked the webhook: %v", err)
+			}
+			if got := read(t, s); got != before {
+				t.Fatal("refused edit changed the file")
+			}
+		})
+	}
+
+	channel := "fakeSecretPart123"
+	s := newStore(t, "[pay.prod]\nbase_url = \"https://pay.example.com\"\n")
+	if _, err := s.SetAnnounce("", "pay", AnnounceEdit{Channel: &channel, Webhook: testHook}); err == nil {
+		t.Fatal("accepted a channel containing the webhook credential")
+	} else if strings.Contains(err.Error(), "fakeSecretPart123") {
+		t.Fatalf("error leaked the webhook: %v", err)
+	}
+	channel = "#pay"
+	if _, err := s.SetAnnounce("", "pay", AnnounceEdit{Channel: &channel, Envs: []string{testHook}, Webhook: testHook}); err == nil {
+		t.Fatal("accepted a webhook pasted into envs")
+	} else if strings.Contains(err.Error(), "fakeSecretPart123") || strings.Contains(err.Error(), testHook) {
+		t.Fatalf("env validation error leaked the webhook: %v", err)
+	}
+}
+
+func TestAnnounceStateRedactsWebhookFromDisplayedFields(t *testing.T) {
+	s := newStore(t, "[pay.prod]\nbase_url = \"https://pay.example.com\"\n\n[pay.announce]\nwebhook = \""+testHook+"\"\nchannel = \"release "+testHook+"\"\nenvs = [\"prod\", \"fakeSecretPart123\"]\n")
+	st := s.State()
+	if st.Plaintext != 1 {
+		t.Fatalf("plaintext = %d, want the unsafe but valid inline webhook counted", st.Plaintext)
+	}
+	if got := fmt.Sprintf("%#v", st); strings.Contains(got, testHook) || strings.Contains(got, "fakeSecretPart123") {
+		t.Fatalf("announce state leaks webhook material: %s", got)
+	}
+}

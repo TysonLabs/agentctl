@@ -101,22 +101,22 @@ func (s *Store) State() *State {
 		v.Token.Wired, v.Token.Reason = svc.Wired, svc.NotWiredReason
 		st.Services = append(st.Services, v)
 	}
-	st.Announces = announceViews(data)
-	for _, a := range st.Announces {
-		if a.Webhook.Source == "file" && a.Webhook.Wired {
-			st.Plaintext++
-		}
-	}
+	var inline int
+	st.Announces, inline = announceViews(data)
+	st.Plaintext += inline
 	return st
 }
 
-// announceViews reads every [name.announce] table. Wired means agentflow
-// would accept it: a channel and a Slack webhook it can read.
-func announceViews(data []byte) []AnnounceView {
+// announceViews reads every [name.announce] table and counts the inline
+// webhooks Migrate would move. Ready (Webhook.Wired) comes from
+// validateAnnounceTable, the same rules SetAnnounce enforces and agentflow
+// applies, so the page and the CLI never disagree with them.
+func announceViews(data []byte) ([]AnnounceView, int) {
 	out := []AnnounceView{}
+	plaintext := 0
 	tree := map[string]any{}
 	if _, err := toml.Decode(string(data), &tree); err != nil {
-		return out
+		return out, 0
 	}
 	for _, name := range sortedKeys(tree) {
 		svc, _ := tree[name].(map[string]any)
@@ -125,54 +125,47 @@ func announceViews(data []byte) []AnnounceView {
 			continue
 		}
 		v := AnnounceView{Name: name, Envs: []string{"prod"}}
-		v.Channel, _ = tbl["channel"].(string)
-		if envs, ok := tbl["envs"].([]any); ok {
-			v.Envs = v.Envs[:0]
-			for _, e := range envs {
-				if s, ok := e.(string); ok {
-					v.Envs = append(v.Envs, s)
-				}
-			}
-		}
-		hook, hasHook := tbl["webhook"].(string)
-		ref, hasRef := tbl["webhook_ref"].(string)
+		hook, isStr := tbl["webhook"].(string)
+		_, hasRef := tbl["webhook_ref"]
 		switch {
-		case hasHook && hasRef:
-			v.Webhook = TokenView{Source: "file", Reason: "sets both webhook and webhook_ref"}
 		case hasRef:
 			v.Webhook.Source = "keychain"
-			acct, err := keychain.ParseRef(ref)
-			if err != nil {
-				v.Webhook.Reason = "webhook_ref is malformed"
-				break
+			if ref, ok := tbl["webhook_ref"].(string); ok {
+				if acct, err := keychain.ParseRef(ref); err == nil {
+					hook, _ = keychain.GetFrom(keychain.AgentflowService, acct)
+				}
 			}
-			got, err := keychain.GetFrom(keychain.AgentflowService, acct)
-			switch {
-			case errors.Is(err, keychain.ErrNotFound):
-				v.Webhook.Reason = fmt.Sprintf("no keychain item %s/%s", keychain.AgentflowService, acct)
-			case err != nil:
-				v.Webhook.Reason = err.Error()
-			default:
-				hook = got
-			}
-		case hasHook:
+		case isStr:
 			v.Webhook.Source = "file"
+			if slackhook.Valid(hook) {
+				plaintext++
+			}
 		default:
-			v.Webhook = TokenView{Source: "none", Reason: "no webhook"}
+			v.Webhook.Source = "none"
 		}
 		if hook != "" {
 			v.Webhook.Fingerprint = registry.NewSecret(hook).Fingerprint()
-			if !slackhook.Valid(hook) {
-				v.Webhook.Reason = "not a Slack incoming webhook"
+		}
+		// Display values pass through agentflow's cleaner, so a webhook
+		// pasted into the wrong field is never shown.
+		v.Channel, _ = tbl["channel"].(string)
+		v.Channel = slackhook.CleanText(v.Channel, hook)
+		if envs, ok := tbl["envs"].([]any); ok {
+			v.Envs = []string{}
+			for _, e := range envs {
+				if s, ok := e.(string); ok {
+					v.Envs = append(v.Envs, slackhook.CleanText(s, hook))
+				}
 			}
 		}
-		if v.Webhook.Reason == "" && strings.TrimSpace(v.Channel) == "" {
-			v.Webhook.Reason = "no channel label"
+		if err := validateAnnounceTable(name, tbl, ""); err != nil {
+			v.Webhook.Reason = err.Error()
+		} else {
+			v.Webhook.Wired = true
 		}
-		v.Webhook.Wired = hook != "" && v.Webhook.Reason == ""
 		out = append(out, v)
 	}
-	return out
+	return out, plaintext
 }
 
 // TestResult is one GET /agent/version with the stored token.
