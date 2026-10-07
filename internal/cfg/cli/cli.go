@@ -268,8 +268,11 @@ func (a *app) cmdMeta(args []string) error {
 	kv := map[string]string{}
 	for _, p := range args[1:] {
 		k, v, ok := strings.Cut(p, "=")
-		if !ok {
+		if !ok || k == "" {
 			return usageError(fmt.Sprintf("want key=value, got %q", p))
+		}
+		if _, dup := kv[k]; dup {
+			return usageError(fmt.Sprintf("meta key %q given twice", k))
 		}
 		kv[k] = v
 	}

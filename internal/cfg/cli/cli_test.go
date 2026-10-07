@@ -50,6 +50,8 @@ func TestUsageAndExitCodes(t *testing.T) {
 		{"version", "extra"},
 		{"set", "not-a-full-name", "--base-url", "https://x", "--config", cfgPath},
 		{"meta", "bad.name", "repo=x", "--config", cfgPath},
+		{"meta", "pay", "repo=a", "repo=b", "--config", cfgPath},
+		{"meta", "pay", "=x", "--config", cfgPath},
 		{"rm", "not-a-full-name", "--config", cfgPath},
 		{"test", "not-a-full-name", "--config", cfgPath},
 	} {
