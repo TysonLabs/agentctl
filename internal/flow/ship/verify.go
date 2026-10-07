@@ -57,6 +57,7 @@ type Result struct {
 	StartedAt string  `json:"started_at,omitempty"`
 	Attempts  int     `json:"attempts"`
 	DurationS float64 `json:"duration_s"`
+	CheckedAt string  `json:"checked_at"` // RFC 3339 UTC time of the final check; ship announce requires it fresh
 	Error     string  `json:"error,omitempty"`
 }
 
@@ -72,6 +73,7 @@ func Verify(ctx context.Context, o Options) Result {
 	res := Result{Service: o.Service, Expected: o.Expected}
 	finish := func(s Status, msg string) Result {
 		res.Status, res.DurationS = s, time.Since(start).Round(10*time.Millisecond).Seconds()
+		res.CheckedAt = time.Now().UTC().Format(time.RFC3339)
 		if msg != "" {
 			res.Error = msg
 		}

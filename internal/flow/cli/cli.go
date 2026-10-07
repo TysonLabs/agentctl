@@ -32,6 +32,8 @@ Usage:
   agentflow codex [flags]                      run Codex (codex exec) safely; JSON result
   agentflow claude [flags]                     run Claude Code (claude -p) safely; JSON result
   agentflow ship verify <svc.env> --sha REV    wait until a deployed service runs REV
+  agentflow ship announce <svc.env> --verified FILE ...
+                                               post a verified deploy to Slack
                                                (see: agentflow ship --help)
   agentflow worktree done <branch|path>        remove a merged, clean, unused worktree
   agentflow worktree sweep [--yes]             list (or remove) every such worktree

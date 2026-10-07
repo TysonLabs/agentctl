@@ -55,6 +55,30 @@ unit = "payments.service"
 	}
 }
 
+func TestLoadSkipsTheAnnounceTable(t *testing.T) {
+	const hook = "https://hooks.slack.com/services/T000/B000/secretpart"
+	p := writeConfig(t, `
+[payments.prod]
+base_url = "https://pay.example.com"
+token    = "at_realtoken123"
+
+[payments.announce]
+webhook = "`+hook+`"
+channel = "#payments-releases"
+envs    = ["prod"]
+`)
+	reg, err := Load(p)
+	if err != nil {
+		t.Fatalf("an announce table must not break agentctl: %v", err)
+	}
+	if len(reg.Services) != 1 || reg.Services[0].FullName() != "payments.prod" {
+		t.Fatalf("announce read as an environment: %+v", reg.Services)
+	}
+	if dump := fmt.Sprintf("%+v %v", reg, reg.Warnings); strings.Contains(dump, "secretpart") || strings.Contains(dump, "announce") {
+		t.Errorf("agentctl decoded the announce table: %s", dump)
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "nope.toml"))
 	if err == nil {

@@ -5,13 +5,14 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/TysonLabs/agentctl/internal/configpath"
 )
 
 // Service is one [name.env] table from services.toml.
@@ -42,19 +43,12 @@ token    = "REPLACE_ME"
 `
 
 // ResolvePath picks the config path: --config flag > AGENTCTL_CONFIG > default.
-func ResolvePath(flagVal string) string {
-	if flagVal != "" {
-		return flagVal
-	}
-	if p := os.Getenv("AGENTCTL_CONFIG"); p != "" {
-		return p
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = "."
-	}
-	return filepath.Join(home, ".config", "agentctl", "services.toml")
-}
+func ResolvePath(flagVal string) string { return configpath.Resolve(flagVal) }
+
+// reservedTables are per-service tables that are not environments. agentctl
+// reads [name.meta]; [name.announce] belongs to agentflow (it holds a Slack
+// webhook, a write credential) and agentctl never decodes it.
+var reservedTables = map[string]bool{"meta": true, "announce": true}
 
 // Load reads and validates the registry file.
 func Load(path string) (*Registry, error) {
@@ -98,7 +92,7 @@ func Load(path string) (*Registry, error) {
 	for _, name := range names {
 		envs := make([]string, 0, len(raw[name]))
 		for env := range raw[name] {
-			if env != "meta" {
+			if !reservedTables[env] {
 				envs = append(envs, env)
 			}
 		}
