@@ -8,6 +8,7 @@ import (
 
 	"github.com/TysonLabs/agentctl/internal/keychain"
 	"github.com/TysonLabs/agentctl/internal/registry"
+	"github.com/TysonLabs/agentctl/internal/slackhook"
 )
 
 var nameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
@@ -180,7 +181,7 @@ func (s *Store) SetToken(expect, full, tok string) (*Result, error) {
 			return fmt.Errorf("%v — add it first with a base URL", err)
 		}
 		acct := account(name, env)
-		d.BeforeSave(func() error { return keychainSet(acct, tok) })
+		d.BeforeSave(func() error { return keychainSet(keychain.Service, acct, tok) })
 		delete(tbl, "token")
 		tbl["token_ref"] = keychain.RefPrefix + acct
 		return nil
@@ -219,7 +220,7 @@ func (s *Store) Remove(expect, full string) (*Result, error) {
 			delete(d.Tree, name)
 		}
 		if acct, err := keychain.ParseRef(ref); err == nil && !d.refersTo(ref) {
-			d.OnSaved(func() error { return keychainDelete(acct) })
+			d.OnSaved(func() error { return keychainDelete(keychain.Service, acct) })
 		}
 		return nil
 	})
@@ -273,7 +274,7 @@ func (s *Store) Migrate(expect string) (*MigrateResult, error) {
 				}
 				acct := account(name, env)
 				d.BeforeSave(func() error {
-					if err := keychainSet(acct, tok); err != nil {
+					if err := keychainSet(keychain.Service, acct, tok); err != nil {
 						return fmt.Errorf("%s: %v (file unchanged)", full, err)
 					}
 					return nil
@@ -281,6 +282,9 @@ func (s *Store) Migrate(expect string) (*MigrateResult, error) {
 				delete(tbl, "token")
 				tbl["token_ref"] = keychain.RefPrefix + acct
 				mr.Moved = append(mr.Moved, full)
+			}
+			if err := migrateWebhook(d, name, svc, mr); err != nil {
+				return err
 			}
 		}
 		if len(mr.Moved) == 0 {
@@ -299,3 +303,154 @@ func (s *Store) Migrate(expect string) (*MigrateResult, error) {
 }
 
 var errNothingToDo = fmt.Errorf("nothing to do")
+
+// migrateWebhook moves an inline [name.announce] webhook into the Keychain
+// (service "agentflow"), the same way Migrate moves tokens.
+func migrateWebhook(d *Doc, name string, svc map[string]any, mr *MigrateResult) error {
+	tbl, _ := svc["announce"].(map[string]any)
+	hook, isStr := tbl["webhook"].(string)
+	if tbl == nil || !isStr {
+		return nil
+	}
+	full := name + ".announce"
+	if _, hasRef := tbl["webhook_ref"]; hasRef {
+		return fmt.Errorf("%s sets both webhook and webhook_ref; refusing to choose one", full)
+	}
+	if !nameRe.MatchString(name) {
+		mr.Skipped = append(mr.Skipped, full+": name has characters a keychain account cannot hold")
+		return nil
+	}
+	if !slackhook.Valid(hook) {
+		mr.Skipped = append(mr.Skipped, full+": webhook is not a Slack incoming webhook")
+		return nil
+	}
+	acct := announceAccount(name)
+	d.BeforeSave(func() error {
+		if err := keychainSet(keychain.AgentflowService, acct, hook); err != nil {
+			return fmt.Errorf("%s: %v (file unchanged)", full, err)
+		}
+		return nil
+	})
+	delete(tbl, "webhook")
+	tbl["webhook_ref"] = keychain.RefPrefix + acct
+	mr.Moved = append(mr.Moved, full)
+	return nil
+}
+
+// AnnounceEdit changes [name.announce], agentflow's Slack settings. A nil
+// field keeps its current value.
+type AnnounceEdit struct {
+	Channel *string
+	Envs    []string // nil keeps; agentflow defaults a missing list to ["prod"]
+	Webhook string   // "" keeps; otherwise stored in the Keychain
+}
+
+// announceAccount is the Keychain account (service "agentflow") of name's
+// Slack webhook.
+func announceAccount(name string) string { return name + ".announce" }
+
+func checkAnnounceEdit(e AnnounceEdit) error {
+	if e.Channel != nil {
+		c := strings.TrimSpace(*e.Channel)
+		if c == "" || len(c) > 80 || strings.ContainsFunc(c, unicode.IsControl) || strings.Contains(c, "hooks.slack.com") {
+			return fmt.Errorf("channel must be a short label such as \"#releases\"")
+		}
+		*e.Channel = c
+	}
+	if e.Envs != nil {
+		if len(e.Envs) == 0 {
+			return fmt.Errorf("envs must name at least one env")
+		}
+		for _, env := range e.Envs {
+			if !nameRe.MatchString(env) || reservedEnvs[env] {
+				return fmt.Errorf("env %q must be 1-64 letters, digits, _ or -", env)
+			}
+		}
+	}
+	if e.Webhook != "" && !slackhook.Valid(e.Webhook) {
+		return fmt.Errorf("webhook must be a Slack incoming webhook (https://hooks.slack.com/services/...)")
+	}
+	return nil
+}
+
+// SetAnnounce edits [name.announce]. A new webhook goes to the Keychain
+// (service "agentflow") and the table points at it with webhook_ref; any
+// inline webhook is removed. The result must have a channel and exactly one
+// webhook source, or nothing is written.
+func (s *Store) SetAnnounce(expect, name string, e AnnounceEdit) (*Result, error) {
+	if err := checkName(name); err != nil {
+		return nil, err
+	}
+	if err := checkAnnounceEdit(e); err != nil {
+		return nil, err
+	}
+	return s.Edit(expect, func(d *Doc) error {
+		svc, err := d.service(name, false)
+		if err != nil {
+			return err
+		}
+		tbl, ok := svc["announce"].(map[string]any)
+		if !ok {
+			if _, exists := svc["announce"]; exists {
+				return fmt.Errorf("%s.announce is not a table; fix the file by hand", name)
+			}
+			tbl = map[string]any{}
+		}
+		if e.Channel != nil {
+			tbl["channel"] = *e.Channel
+		}
+		if e.Envs != nil {
+			envs := make([]any, len(e.Envs))
+			for i, env := range e.Envs {
+				envs[i] = env
+			}
+			tbl["envs"] = envs
+		}
+		if e.Webhook != "" {
+			acct := announceAccount(name)
+			d.BeforeSave(func() error { return keychainSet(keychain.AgentflowService, acct, e.Webhook) })
+			delete(tbl, "webhook")
+			tbl["webhook_ref"] = keychain.RefPrefix + acct
+		}
+		_, hasHook := tbl["webhook"]
+		_, hasRef := tbl["webhook_ref"]
+		switch {
+		case hasHook && hasRef:
+			return fmt.Errorf("%s.announce sets both webhook and webhook_ref; refusing to choose one", name)
+		case !hasHook && !hasRef:
+			return fmt.Errorf("%s.announce needs a webhook — add --webhook (read from stdin)", name)
+		}
+		if c, _ := tbl["channel"].(string); strings.TrimSpace(c) == "" {
+			return fmt.Errorf("%s.announce needs a channel label — add --channel \"#releases\"", name)
+		}
+		svc["announce"] = tbl
+		return nil
+	})
+}
+
+// RemoveAnnounce deletes [name.announce] and then its Keychain webhook.
+func (s *Store) RemoveAnnounce(expect, name string) (*Result, error) {
+	if err := checkName(name); err != nil {
+		return nil, err
+	}
+	return s.Edit(expect, func(d *Doc) error {
+		svc, err := d.service(name, false)
+		if err != nil {
+			return err
+		}
+		tbl, ok := svc["announce"].(map[string]any)
+		if !ok {
+			return fmt.Errorf("no [%s.announce] table", name)
+		}
+		delete(svc, "announce")
+		if len(svc) == 0 {
+			delete(d.Tree, name)
+		}
+		if ref, _ := tbl["webhook_ref"].(string); ref != "" {
+			if acct, err := keychain.ParseRef(ref); err == nil {
+				d.OnSaved(func() error { return keychainDelete(keychain.AgentflowService, acct) })
+			}
+		}
+		return nil
+	})
+}

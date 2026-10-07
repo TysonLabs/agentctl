@@ -170,6 +170,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/token", s.api(s.handleToken))
 	mux.HandleFunc("POST /api/remove", s.api(s.handleRemove))
 	mux.HandleFunc("POST /api/migrate", s.api(s.handleMigrate))
+	mux.HandleFunc("POST /api/announce", s.api(s.handleAnnounce))
+	mux.HandleFunc("POST /api/announce/remove", s.api(s.handleAnnounceRemove))
 	mux.HandleFunc("POST /api/test", s.api(s.handleTest))
 	mux.HandleFunc("POST /api/quit", s.api(s.handleQuit))
 	return s.guard(mux)
@@ -368,6 +370,39 @@ func (s *server) handleMigrate(r *http.Request) (any, error) {
 		notes = append(notes, "Skipped "+sk)
 	}
 	return s.reply(notes...), nil
+}
+
+func (s *server) handleAnnounce(r *http.Request) (any, error) {
+	var req struct {
+		Version string   `json:"version"`
+		Name    string   `json:"name"`
+		Channel *string  `json:"channel"`
+		Envs    []string `json:"envs"`
+		Webhook string   `json:"webhook"` // "" keeps the stored one
+	}
+	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	res, err := s.store.SetAnnounce(req.Version, req.Name, cfg.AnnounceEdit{Channel: req.Channel, Envs: req.Envs, Webhook: req.Webhook})
+	if err != nil {
+		return nil, err
+	}
+	return s.reply(res.Warnings...), nil
+}
+
+func (s *server) handleAnnounceRemove(r *http.Request) (any, error) {
+	var req struct {
+		Version string `json:"version"`
+		Name    string `json:"name"`
+	}
+	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	res, err := s.store.RemoveAnnounce(req.Version, req.Name)
+	if err != nil {
+		return nil, err
+	}
+	return s.reply(res.Warnings...), nil
 }
 
 func (s *server) handleTest(r *http.Request) (any, error) {

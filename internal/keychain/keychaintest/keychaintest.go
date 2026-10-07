@@ -27,10 +27,13 @@ func Temp(t *testing.T) string {
 	return p
 }
 
-// Put stores a token directly with security(1), bypassing agentcfg.
-func Put(t *testing.T, account, token string) {
+// Put stores an agentctl token directly with security(1), bypassing agentcfg.
+func Put(t *testing.T, account, token string) { PutIn(t, keychain.Service, account, token) }
+
+// PutIn stores a secret under any Keychain service.
+func PutIn(t *testing.T, service, account, secret string) {
 	t.Helper()
-	run(t, "add-generic-password", "-U", "-s", keychain.Service, "-a", account, "-w", token, keychain.Path())
+	run(t, "add-generic-password", "-U", "-s", service, "-a", account, "-w", secret, keychain.Path())
 }
 
 func run(t *testing.T, args ...string) {

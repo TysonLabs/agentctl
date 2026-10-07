@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/TysonLabs/agentctl/internal/flow/ship"
 	"github.com/TysonLabs/agentctl/internal/keychain"
 	"github.com/TysonLabs/agentctl/internal/keychain/keychaintest"
 	"github.com/TysonLabs/agentctl/internal/registry"
@@ -329,8 +330,10 @@ func TestMigrate(t *testing.T) {
 	if strings.Join(mr.Moved, ",") != "pay.prod,web.prod" {
 		t.Fatalf("moved %v", mr.Moved)
 	}
-	if len(mr.Skipped) != 1 || !strings.HasPrefix(mr.Skipped[0], "dial.dev") {
-		t.Fatalf("skipped %v; want the placeholder dial.dev", mr.Skipped)
+	// dial.dev holds a placeholder; the sample's announce webhook is not a
+	// Slack URL, so it stays where it is too.
+	if len(mr.Skipped) != 2 || !strings.HasPrefix(mr.Skipped[0], "dial.dev") || !strings.HasPrefix(mr.Skipped[1], "pay.announce") {
+		t.Fatalf("skipped %v; want dial.dev and pay.announce", mr.Skipped)
 	}
 	got := read(t, s)
 	for _, tok := range []string{"plain_prod_token_1", "web_token_abc1"} {
@@ -479,5 +482,110 @@ func TestSafeVersionHidesTokenMaterial(t *testing.T) {
 		if got := safeVersion(v, secrets); got != v {
 			t.Errorf("safeVersion(%q) = %q, want it kept", v, got)
 		}
+	}
+}
+
+const testHook = "https://hooks.slack.com/services/T0FAKE1/B0FAKE1/fakeSecretPart123"
+
+func announceItem(t *testing.T, kc, name string) (string, bool) {
+	t.Helper()
+	out, err := exec.Command(keychain.Bin, "find-generic-password", "-s", keychain.AgentflowService, "-a", name+".announce", "-w", kc).Output()
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(out)), true
+}
+
+func TestSetAnnounceStoresWebhookInAgentflowKeychain(t *testing.T) {
+	kc := keychaintest.Temp(t)
+	s := newStore(t, "[pay.prod]\nbase_url = \"https://pay.example.com\"\n")
+	ch := "#pay-releases"
+	if _, err := s.SetAnnounce("", "pay", AnnounceEdit{Channel: &ch}); err == nil || !strings.Contains(err.Error(), "needs a webhook") {
+		t.Fatalf("a new table without a webhook: err = %v", err)
+	}
+	if _, err := s.SetAnnounce("", "pay", AnnounceEdit{Webhook: testHook}); err == nil || !strings.Contains(err.Error(), "channel") {
+		t.Fatalf("a new table without a channel: err = %v", err)
+	}
+	if _, err := s.SetAnnounce("", "nope", AnnounceEdit{Channel: &ch, Webhook: testHook}); err == nil {
+		t.Fatal("announce for a missing service accepted")
+	}
+	before := read(t, s)
+	for _, bad := range []AnnounceEdit{
+		{Channel: &ch, Webhook: "https://evil.example.com/services/fakeSecretPart123"},
+		{Channel: &ch, Webhook: testHook, Envs: []string{"meta"}},
+		{Channel: &ch, Webhook: testHook, Envs: []string{}},
+		{Channel: ptr("  "), Webhook: testHook},
+		{Channel: ptr(testHook), Webhook: testHook},
+	} {
+		if _, err := s.SetAnnounce("", "pay", bad); err == nil {
+			t.Errorf("accepted %+v", bad)
+		} else if strings.Contains(err.Error(), "fakeSecretPart123") {
+			t.Errorf("error leaks the webhook: %v", err)
+		}
+	}
+	if read(t, s) != before {
+		t.Fatal("a refused edit changed the file")
+	}
+	if _, err := s.SetAnnounce("", "pay", AnnounceEdit{Channel: &ch, Webhook: testHook, Envs: []string{"prod", "dev"}}); err != nil {
+		t.Fatal(err)
+	}
+	got := read(t, s)
+	if strings.Contains(got, "fakeSecretPart123") || !strings.Contains(got, `webhook_ref = "keychain:pay.announce"`) || !strings.Contains(got, `envs = ["prod", "dev"]`) {
+		t.Fatalf("file:\n%s", got)
+	}
+	if hook, ok := announceItem(t, kc, "pay"); !ok || hook != testHook {
+		t.Fatalf("keychain item = %q, %v", hook, ok)
+	}
+	// What agentcfg writes is what agentflow reads.
+	ac, err := ship.LoadAnnounceConfig(s.Path, "pay")
+	if err != nil || ac.Webhook != testHook || ac.Channel != ch || strings.Join(ac.Envs, ",") != "prod,dev" {
+		t.Fatalf("agentflow reads %+v, %v", ac, err)
+	}
+	// Changing only the channel keeps the stored webhook.
+	ch2 := "#pay"
+	if _, err := s.SetAnnounce("", "pay", AnnounceEdit{Channel: &ch2}); err != nil {
+		t.Fatal(err)
+	}
+	st := s.State()
+	if len(st.Announces) != 1 || st.Announces[0].Channel != "#pay" || !st.Announces[0].Webhook.Wired || st.Announces[0].Webhook.Source != "keychain" {
+		t.Fatalf("announce view %+v", st.Announces)
+	}
+	if strings.Contains(fmt.Sprintf("%#v", st), "fakeSecretPart123") {
+		t.Fatal("state leaks the webhook")
+	}
+	if _, err := s.RemoveAnnounce("", "pay"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(read(t, s), "announce") {
+		t.Fatal("announce table survived the remove")
+	}
+	if _, ok := announceItem(t, kc, "pay"); ok {
+		t.Fatal("the keychain webhook survived the remove")
+	}
+}
+
+func ptr(s string) *string { return &s }
+
+func TestMigrateMovesWebhooks(t *testing.T) {
+	kc := keychaintest.Temp(t)
+	s := newStore(t, "[pay.prod]\nbase_url = \"https://pay.example.com\"\ntoken_ref = \"keychain:pay.prod\"\n\n[pay.announce]\nwebhook = \""+testHook+"\"\nchannel = \"#r\"\n\n[bad.prod]\nbase_url = \"https://b.example.com\"\n\n[bad.announce]\nwebhook = \"https://evil.example.com/x\"\nchannel = \"#r\"\n")
+	if st := s.State(); st.Plaintext != 1 {
+		t.Fatalf("plaintext = %d, want 1 (the valid webhook)", st.Plaintext)
+	}
+	mr, err := s.Migrate("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(mr.Moved, ",") != "pay.announce" || len(mr.Skipped) != 1 || !strings.HasPrefix(mr.Skipped[0], "bad.announce") {
+		t.Fatalf("moved %v skipped %v", mr.Moved, mr.Skipped)
+	}
+	if strings.Contains(read(t, s), "fakeSecretPart123") {
+		t.Fatal("webhook still in the file")
+	}
+	if hook, ok := announceItem(t, kc, "pay"); !ok || hook != testHook {
+		t.Fatalf("keychain item = %q, %v", hook, ok)
+	}
+	if strings.Contains(fmt.Sprintf("%v", mr.Skipped), "evil.example.com") {
+		t.Fatal("skip reason echoes the webhook")
 	}
 }

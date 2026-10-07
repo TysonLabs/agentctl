@@ -15,11 +15,12 @@ import (
 
 const keychainTimeout = 15 * time.Second
 
-// keychainSet stores token for account and reads it back. The token goes to
+// keychainSet stores secret under Keychain service and account and reads it
+// back. The token goes to
 // `security -i` on stdin, hex-encoded (-X), so it never appears in a process
 // argument list and needs no quoting. `security -i` exits 0 even when a
 // command inside it fails, so the read-back is the only proof of success.
-func keychainSet(account, token string) error {
+func keychainSet(service, account, token string) error {
 	if !keychain.Supported {
 		return keychain.ErrUnsupported
 	}
@@ -27,7 +28,7 @@ func keychainSet(account, token string) error {
 		return fmt.Errorf("invalid keychain account %q", account)
 	}
 	line := fmt.Sprintf("add-generic-password -U -s %s -a %s -l %s:%s -X %s",
-		keychain.Service, account, keychain.Service, account, hex.EncodeToString([]byte(token)))
+		service, account, service, account, hex.EncodeToString([]byte(token)))
 	if p := keychain.Path(); p != "" {
 		if strings.ContainsAny(p, "\"\\\n") {
 			return fmt.Errorf("AGENTCTL_KEYCHAIN path has characters agentcfg cannot pass to security")
@@ -43,25 +44,25 @@ func keychainSet(account, token string) error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("keychain write failed: %v", err)
 	}
-	got, err := keychain.Get(account)
+	got, err := keychain.GetFrom(service, account)
 	if err != nil {
 		return fmt.Errorf("keychain write not confirmed: %v", err)
 	}
 	if got != token {
-		return fmt.Errorf("keychain write not confirmed: item %s/%s holds a different value", keychain.Service, account)
+		return fmt.Errorf("keychain write not confirmed: item %s/%s holds a different value", service, account)
 	}
 	return nil
 }
 
-// keychainDelete removes the item for account. A missing item is success.
-func keychainDelete(account string) error {
+// keychainDelete removes the item. A missing item is success.
+func keychainDelete(service, account string) error {
 	if !keychain.Supported {
 		return keychain.ErrUnsupported
 	}
 	if !keychain.ValidAccount(account) {
 		return fmt.Errorf("invalid keychain account %q", account)
 	}
-	args := []string{"delete-generic-password", "-s", keychain.Service, "-a", account}
+	args := []string{"delete-generic-password", "-s", service, "-a", account}
 	if p := keychain.Path(); p != "" {
 		args = append(args, p)
 	}
@@ -75,5 +76,5 @@ func keychainDelete(account string) error {
 	if err == nil || (errors.As(err, &ee) && ee.ExitCode() == 44) {
 		return nil
 	}
-	return fmt.Errorf("keychain delete of %s/%s failed: %s", keychain.Service, account, strings.TrimSpace(stderr.String()))
+	return fmt.Errorf("keychain delete of %s/%s failed: %s", service, account, strings.TrimSpace(stderr.String()))
 }

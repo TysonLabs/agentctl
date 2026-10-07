@@ -32,7 +32,11 @@ Usage:
   agentcfg meta <name> repo=PATH unit=UNIT   set [name.meta] keys (key= clears one)
   agentcfg token <name.env>                  store a token in the Keychain (read from
                                              stdin; typed without echo on a terminal)
-  agentcfg migrate                           move every plaintext token into the Keychain
+  agentcfg announce <name> [--channel C] [--envs prod,dev] [--webhook] [--remove]
+                                             agentflow's Slack settings; --webhook reads
+                                             the webhook URL from stdin into the Keychain
+  agentcfg migrate                           move every plaintext token and webhook into
+                                             the Keychain
   agentcfg rm <name.env>                     remove an env and its Keychain item
   agentcfg test <name.env>                   GET /agent/version with the stored token
   agentcfg version                           print agentcfg's version
@@ -65,8 +69,8 @@ type app struct {
 }
 
 // valueFlags take an argument; boolFlags do not.
-var valueFlags = map[string]bool{"config": true, "base-url": true, "idle": true}
-var boolFlags = map[string]bool{"help": true, "no-open": true}
+var valueFlags = map[string]bool{"config": true, "base-url": true, "idle": true, "channel": true, "envs": true}
+var boolFlags = map[string]bool{"help": true, "no-open": true, "webhook": true, "remove": true}
 
 func parseArgs(args []string) (map[string]string, []string, error) {
 	flags := map[string]string{}
@@ -144,6 +148,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			cmdErr = a.cmdRm(rest)
 		case "test":
 			cmdErr = a.cmdTest(rest)
+		case "announce":
+			cmdErr = a.cmdAnnounce(rest)
 		case "ui":
 			cmdErr = a.cmdUI(rest)
 		case "version":
@@ -178,6 +184,8 @@ func commandFlags(cmd string, flags map[string]string) error {
 		allowed["base-url"] = true
 	case "ui":
 		allowed["idle"], allowed["no-open"] = true, true
+	case "announce":
+		allowed["channel"], allowed["envs"], allowed["webhook"], allowed["remove"] = true, true, true, true
 	case "ls", "meta", "token", "migrate", "rm", "test", "version":
 	default:
 		return nil // the unknown-command diagnostic is more useful
@@ -233,9 +241,80 @@ func (a *app) cmdLs(args []string) error {
 		fmt.Fprintf(tw, "%s.%s\t%s\t%s\t%s\n", s.Name, s.Env, s.BaseURL, tok, status)
 	}
 	tw.Flush()
-	if st.Plaintext > 0 {
-		fmt.Fprintf(a.stdout, "\n%d token(s) are still in plaintext in %s — run: agentcfg migrate\n", st.Plaintext, st.Path)
+	if len(st.Announces) > 0 {
+		fmt.Fprintln(a.stdout)
+		tw = tabwriter.NewWriter(a.stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "SLACK\tCHANNEL\tENVS\tWEBHOOK\tSTATUS")
+		for _, an := range st.Announces {
+			hook := an.Webhook.Source
+			if an.Webhook.Fingerprint != "" {
+				hook += " " + an.Webhook.Fingerprint
+			}
+			status := "ready"
+			if !an.Webhook.Wired {
+				status = "not ready: " + an.Webhook.Reason
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", an.Name, an.Channel, strings.Join(an.Envs, ","), hook, status)
+		}
+		tw.Flush()
 	}
+	if st.Plaintext > 0 {
+		fmt.Fprintf(a.stdout, "\n%d secret(s) are still in plaintext in %s — run: agentcfg migrate\n", st.Plaintext, st.Path)
+	}
+	return nil
+}
+
+func (a *app) cmdAnnounce(args []string) error {
+	if err := a.only("announce", args, 1, "<name> [--channel C] [--envs prod,dev] [--webhook] [--remove]"); err != nil {
+		return err
+	}
+	name := args[0]
+	if _, _, err := cfg.SplitFull(name + ".x"); err != nil {
+		return usageError(err.Error())
+	}
+	if a.flags["remove"] != "" {
+		for _, f := range []string{"channel", "envs", "webhook"} {
+			if _, ok := a.flags[f]; ok {
+				return usageError("--remove cannot be combined with --" + f)
+			}
+		}
+		res, err := a.store.RemoveAnnounce("", name)
+		if err != nil {
+			return err
+		}
+		a.done(res, "removed "+name+".announce and its Keychain webhook")
+		return nil
+	}
+	var e cfg.AnnounceEdit
+	if c, ok := a.flags["channel"]; ok {
+		e.Channel = &c
+	}
+	if v, ok := a.flags["envs"]; ok {
+		e.Envs = []string{}
+		for _, env := range strings.Split(v, ",") {
+			if env = strings.TrimSpace(env); env != "" {
+				e.Envs = append(e.Envs, env)
+			}
+		}
+	}
+	if e.Channel == nil && e.Envs == nil && a.flags["webhook"] == "" {
+		return usageError("nothing to change: give --channel, --envs, --webhook or --remove")
+	}
+	if a.flags["webhook"] != "" {
+		hook, err := a.readSecret("Slack webhook for " + name)
+		if err != nil {
+			return err
+		}
+		if hook == "" {
+			return usageError("--webhook read an empty value from stdin")
+		}
+		e.Webhook = hook
+	}
+	res, err := a.store.SetAnnounce("", name, e)
+	if err != nil {
+		return err
+	}
+	a.done(res, "saved "+name+".announce — agentflow ship announce "+name+".<env> uses it")
 	return nil
 }
 
@@ -312,11 +391,14 @@ const maxTokenBytes = 8192
 
 // readToken reads a token from stdin. A pipe must contain only the token and
 // one optional line ending. On a terminal it reads one line with echo off.
-func (a *app) readToken(full string) (string, error) {
+func (a *app) readToken(full string) (string, error) { return a.readSecret("Token for " + full) }
+
+// readSecret reads one secret (see readToken), prompting with label.
+func (a *app) readSecret(label string) (string, error) {
 	f, isFile := a.stdin.(*os.File)
 	tty := isFile && a.isTerminal(f)
 	if tty {
-		fmt.Fprintf(a.stderr, "Token for %s (not shown): ", full)
+		fmt.Fprintf(a.stderr, "%s (not shown): ", label)
 		if err := a.setEcho(f, "-echo"); err != nil {
 			fmt.Fprintln(a.stderr)
 			return "", fmt.Errorf("cannot disable terminal echo; refusing to read the token: %v", err)

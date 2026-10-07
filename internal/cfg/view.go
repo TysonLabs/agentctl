@@ -9,20 +9,34 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BurntSushi/toml"
+
 	"github.com/TysonLabs/agentctl/internal/client"
+	"github.com/TysonLabs/agentctl/internal/keychain"
 	"github.com/TysonLabs/agentctl/internal/registry"
 	"github.com/TysonLabs/agentctl/internal/render"
+	"github.com/TysonLabs/agentctl/internal/slackhook"
 )
 
 // State is what `agentcfg ls` and the UI show. It never holds a token, only
 // its fingerprint.
 type State struct {
-	Path      string        `json:"path"`
-	Version   string        `json:"version"`
-	Error     string        `json:"error,omitempty"` // the file exists but agentctl cannot use it
-	Warnings  []string      `json:"warnings"`
-	Services  []ServiceView `json:"services"`
-	Plaintext int           `json:"plaintext"` // envs whose real token is still in the file
+	Path      string         `json:"path"`
+	Version   string         `json:"version"`
+	Error     string         `json:"error,omitempty"` // the file exists but agentctl cannot use it
+	Warnings  []string       `json:"warnings"`
+	Services  []ServiceView  `json:"services"`
+	Announces []AnnounceView `json:"announces"`
+	Plaintext int            `json:"plaintext"` // real tokens and webhooks still in the file
+}
+
+// AnnounceView is one [name.announce] table (agentflow's Slack settings).
+// It never holds the webhook, only its fingerprint.
+type AnnounceView struct {
+	Name    string    `json:"name"`
+	Channel string    `json:"channel"`
+	Envs    []string  `json:"envs"`
+	Webhook TokenView `json:"webhook"`
 }
 
 // ServiceView is one name.env.
@@ -44,7 +58,7 @@ type TokenView struct {
 
 // State reads the file once, so Version always matches what is shown.
 func (s *Store) State() *State {
-	st := &State{Path: s.Path, Warnings: []string{}, Services: []ServiceView{}}
+	st := &State{Path: s.Path, Warnings: []string{}, Services: []ServiceView{}, Announces: []AnnounceView{}}
 	data, err := os.ReadFile(s.Path)
 	if errors.Is(err, os.ErrNotExist) {
 		st.Version = VersionOf(nil)
@@ -87,7 +101,78 @@ func (s *Store) State() *State {
 		v.Token.Wired, v.Token.Reason = svc.Wired, svc.NotWiredReason
 		st.Services = append(st.Services, v)
 	}
+	st.Announces = announceViews(data)
+	for _, a := range st.Announces {
+		if a.Webhook.Source == "file" && a.Webhook.Wired {
+			st.Plaintext++
+		}
+	}
 	return st
+}
+
+// announceViews reads every [name.announce] table. Wired means agentflow
+// would accept it: a channel and a Slack webhook it can read.
+func announceViews(data []byte) []AnnounceView {
+	out := []AnnounceView{}
+	tree := map[string]any{}
+	if _, err := toml.Decode(string(data), &tree); err != nil {
+		return out
+	}
+	for _, name := range sortedKeys(tree) {
+		svc, _ := tree[name].(map[string]any)
+		tbl, ok := svc["announce"].(map[string]any)
+		if !ok {
+			continue
+		}
+		v := AnnounceView{Name: name, Envs: []string{"prod"}}
+		v.Channel, _ = tbl["channel"].(string)
+		if envs, ok := tbl["envs"].([]any); ok {
+			v.Envs = v.Envs[:0]
+			for _, e := range envs {
+				if s, ok := e.(string); ok {
+					v.Envs = append(v.Envs, s)
+				}
+			}
+		}
+		hook, hasHook := tbl["webhook"].(string)
+		ref, hasRef := tbl["webhook_ref"].(string)
+		switch {
+		case hasHook && hasRef:
+			v.Webhook = TokenView{Source: "file", Reason: "sets both webhook and webhook_ref"}
+		case hasRef:
+			v.Webhook.Source = "keychain"
+			acct, err := keychain.ParseRef(ref)
+			if err != nil {
+				v.Webhook.Reason = "webhook_ref is malformed"
+				break
+			}
+			got, err := keychain.GetFrom(keychain.AgentflowService, acct)
+			switch {
+			case errors.Is(err, keychain.ErrNotFound):
+				v.Webhook.Reason = fmt.Sprintf("no keychain item %s/%s", keychain.AgentflowService, acct)
+			case err != nil:
+				v.Webhook.Reason = err.Error()
+			default:
+				hook = got
+			}
+		case hasHook:
+			v.Webhook.Source = "file"
+		default:
+			v.Webhook = TokenView{Source: "none", Reason: "no webhook"}
+		}
+		if hook != "" {
+			v.Webhook.Fingerprint = registry.NewSecret(hook).Fingerprint()
+			if !slackhook.Valid(hook) {
+				v.Webhook.Reason = "not a Slack incoming webhook"
+			}
+		}
+		if v.Webhook.Reason == "" && strings.TrimSpace(v.Channel) == "" {
+			v.Webhook.Reason = "no channel label"
+		}
+		v.Webhook.Wired = hook != "" && v.Webhook.Reason == ""
+		out = append(out, v)
+	}
+	return out
 }
 
 // TestResult is one GET /agent/version with the stored token.

@@ -333,3 +333,28 @@ func TestServeRejectsNonPositiveIdle(t *testing.T) {
 		t.Fatal("Serve accepted a zero idle timeout")
 	}
 }
+
+func TestAnnounceOverAPI(t *testing.T) {
+	keychaintest.Temp(t)
+	const hook = "https://hooks.slack.com/services/T0FAKE1/B0FAKE1/fakeSecretPart123"
+	s, ts := newServer(t)
+	code, body := do(t, s, ts, call{path: "/api/announce", body: `{"version":"","name":"pay","channel":"#pay","envs":null,"webhook":"` + hook + `"}`})
+	if code != 200 || strings.Contains(body, "fakeSecretPart123") || !strings.Contains(body, `"channel":"#pay"`) || !strings.Contains(body, `"source":"keychain"`) {
+		t.Fatalf("announce: %d %s", code, body)
+	}
+	// An edit without a webhook keeps the stored one.
+	code, body = do(t, s, ts, call{path: "/api/announce", body: `{"version":"","name":"pay","channel":"#pay2","envs":["prod"],"webhook":""}`})
+	if code != 200 || !strings.Contains(body, `"channel":"#pay2"`) || !strings.Contains(body, `"wired":true`) {
+		t.Fatalf("edit: %d %s", code, body)
+	}
+	code, body = do(t, s, ts, call{path: "/api/announce", body: `{"version":"","name":"pay","channel":"#x","envs":null,"webhook":"https://evil.example.com/fakeSecretPart123"}`})
+	if code != 400 || strings.Contains(body, "fakeSecretPart123") {
+		t.Fatalf("bad webhook: %d %s", code, body)
+	}
+	if code, body = do(t, s, ts, call{path: "/api/announce/remove", body: `{"version":"","name":"pay"}`}); code != 200 || strings.Contains(body, `"name":"pay","channel"`) {
+		t.Fatalf("remove: %d %s", code, body)
+	}
+	if code, _ := do(t, s, ts, call{path: "/api/announce/remove", body: `{"name":"pay"}`, origin: "https://evil.example.com"}); code != 403 {
+		t.Fatalf("cross-origin remove: %d", code)
+	}
+}

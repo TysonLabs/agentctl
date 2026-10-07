@@ -1,8 +1,9 @@
 // Package flow holds agentflow's commands. This test keeps the three binaries
 // apart: agentctl must stay a read-only HTTP client, so none of its packages
 // may import agentflow or agentcfg code (agentcfg writes the registry and the
-// Keychain); agentflow must not reach into agentctl's HTTP client, registry
-// or Keychain reader (and with them, its tokens), nor into agentcfg.
+// Keychain); agentflow must not reach into agentctl's HTTP client or
+// registry (and with them, its tokens), nor into agentcfg. agentflow reads
+// the Keychain only under its own service (TestAgentflowReadsOnlyItsKeychainService).
 package flow
 
 import (
@@ -23,7 +24,7 @@ func TestImportBoundary(t *testing.T) {
 	for _, violation := range boundaryViolations(t, root, ".", []string{"internal/flow", "internal/cfg", "cmd"}) {
 		t.Errorf("agentctl %s", violation)
 	}
-	flowBanned := []string{"internal/client", "internal/registry", "internal/cli", "internal/keychain", "internal/cfg"}
+	flowBanned := []string{"internal/client", "internal/registry", "internal/cli", "internal/cfg"}
 	entries := []string{"cmd/agentflow"}
 	err := filepath.WalkDir(filepath.Join(root, "internal", "flow"), func(path string, de os.DirEntry, err error) error {
 		if err != nil || !de.IsDir() {
@@ -131,4 +132,29 @@ func imports(t *testing.T, dir string) []string {
 		}
 	}
 	return out
+}
+
+// agentflow may read the Keychain only for its own credentials: it must
+// never name agentctl's token service or call the token reader. (It imports
+// internal/keychain for GetFrom(keychain.AgentflowService, ...).)
+func TestAgentflowReadsOnlyItsKeychainService(t *testing.T) {
+	root := filepath.Join("..", "..")
+	err := filepath.WalkDir(filepath.Join(root, "internal", "flow"), func(path string, de os.DirEntry, err error) error {
+		if err != nil || de.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return err
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, banned := range []string{"keychain.Get(", "keychain.Service"} {
+			if strings.Contains(string(b), banned) {
+				t.Errorf("%s uses %s: agentflow must read only keychain.AgentflowService", path, banned)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
