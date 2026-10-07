@@ -143,6 +143,8 @@ func TestAnnounceRefusals(t *testing.T) {
 		{"future verify", func(o *AnnounceOptions) { o.Proof.CheckedAt = testNow.Add(time.Hour).Format(time.RFC3339) }, "more than"},
 		{"verify from an old agentflow", func(o *AnnounceOptions) { o.Proof.CheckedAt = "" }, "no checked_at"},
 		{"verify without a match", func(o *AnnounceOptions) { o.Proof.Match = "" }, "no expected commit"},
+		{"exact match with another commit", func(o *AnnounceOptions) { o.Proof.Running = "d63a514" }, "does not match"},
+		{"contains match without a running commit", func(o *AnnounceOptions) { o.Proof.Match = "contains"; o.Proof.Running = "not-a-sha <!channel>" }, "running commit"},
 		{"env not enabled", func(o *AnnounceOptions) { o.Service = "rcx.dev"; o.Proof.Service = "rcx.dev" }, `does not include "dev"`},
 		{"no announce table", func(o *AnnounceOptions) { o.Service = "other.prod"; o.Proof.Service = "other.prod" }, "no [other.announce] table"},
 		{"bad service", func(o *AnnounceOptions) { o.Service = "rcx" }, "want service.env"},
@@ -171,13 +173,18 @@ func TestAnnounceRefusals(t *testing.T) {
 
 func TestAnnounceConfigErrorsNeverPrintTheWebhook(t *testing.T) {
 	cases := map[string]string{
-		"http webhook":     `webhook = "http://hooks.slack.com/services/T/B/fakeSecretPart123"` + "\nchannel = \"#x\"",
-		"other host":       `webhook = "https://evil.example.com/services/fakeSecretPart123"` + "\nchannel = \"#x\"",
-		"no channel":       `webhook = "` + testHook + `"`,
-		"unknown key":      `webhook = "` + testHook + `"` + "\nchannel = \"#x\"\nwebook2 = \"x\"",
-		"wrong type":       `webhook = "` + testHook + `"` + "\nchannel = 7",
-		"syntax error":     `webhook = "` + testHook,
-		"userinfo smuggle": `webhook = "https://fakeSecretPart123@hooks.slack.com/services/T/B/x"` + "\nchannel = \"#x\"",
+		"http webhook":       `webhook = "http://hooks.slack.com/services/T/B/fakeSecretPart123"` + "\nchannel = \"#x\"",
+		"other host":         `webhook = "https://evil.example.com/services/fakeSecretPart123"` + "\nchannel = \"#x\"",
+		"no channel":         `webhook = "` + testHook + `"`,
+		"unknown key":        `webhook = "` + testHook + `"` + "\nchannel = \"#x\"\nwebook2 = \"x\"",
+		"wrong type":         `webhook = "` + testHook + `"` + "\nchannel = 7",
+		"syntax error":       `webhook = "` + testHook,
+		"short path segment": `webhook = "https://hooks.slack.com/services/T/B/fakeSecretPart123"` + "\nchannel = \"#x\"",
+		"query string":       `webhook = "` + testHook + `?x=fakeSecretPart123"` + "\nchannel = \"#x\"",
+		"userinfo smuggle":   `webhook = "https://fakeSecretPart123@hooks.slack.com/services/T/B/x"` + "\nchannel = \"#x\"",
+		"secret key name":    `webhook = "` + testHook + `"` + "\nchannel = \"#x\"\n\"fakeSecretPart123\" = \"x\"",
+		"webhook in channel": `webhook = "` + testHook + "\"\nchannel = \"" + testHook + "\"",
+		"nested unknown key": `webhook = "` + testHook + `"` + "\nchannel = \"#x\"\n[rcx.announce.extra]\nvalue = \"x\"",
 	}
 	for name, table := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -190,6 +197,17 @@ func TestAnnounceConfigErrorsNeverPrintTheWebhook(t *testing.T) {
 				t.Errorf("error leaks a secret: %v", err)
 			}
 		})
+	}
+}
+
+func TestAnnounceEnvRefusalDoesNotLeakConfigValues(t *testing.T) {
+	rec := &recorder{}
+	o := baseOpts(t, rec)
+	o.Service, o.Proof.Service = "rcx.dev", "rcx.dev"
+	o.ConfigPath = writeFile(t, "services.toml", strings.Replace(testConfig, "[rcx.announce]", "[rcx.announce]\nenvs = [\"prod\", \""+testToken+"\"]", 1))
+	res := Announce(context.Background(), o)
+	if res.Status != AnnounceRefused || strings.Contains(res.Error, testToken) {
+		t.Fatalf("config value leaked in refusal: %+v", res)
 	}
 }
 
@@ -212,7 +230,7 @@ func TestAnnounceScrubsTheBody(t *testing.T) {
 		"slack token xoxb-1234-5678-abcdefghijkl",
 		"ping <!channel> and <@U123> and <https://evil.example.com|docs>",
 		"commit " + testSHA + " in crates/rcx-console-queue/src/audio_fetch.rs",
-		"bidi \u202ereversed\u202c and zero\u200bwidth",
+		"bidi \u202ereversed\u202c and zero\u200bwidth/non\u200cjoiner/\u200djoiner/word\u2060joiner/soft\u00adhyphen",
 	}, "\n")
 	if res := Announce(context.Background(), o); res.Status != AnnouncePosted {
 		t.Fatalf("got %+v", res)
@@ -225,7 +243,9 @@ func TestAnnounceScrubsTheBody(t *testing.T) {
 	enc.SetEscapeHTML(false)
 	_ = enc.Encode(decoded)
 	text := buf.String()
-	for _, leaked := range []string{"fakeSecretPart123", testToken, "Zm9vYmFyQmF6", "xoxb-", "<!channel>", "<@U123>", "<https://evil", "\u202e", "\u200b"} {
+	// The title's header block is plain_text, where <!channel> is inert and
+	// should remain human-readable. Mrkdwn copies are checked escaped below.
+	for _, leaked := range []string{"fakeSecretPart123", testToken, "Zm9vYmFyQmF6", "xoxb-", "<@U123>", "<https://evil", "\u202e", "\u200b", "\u200c", "\u200d", "\u2060", "\u00ad"} {
 		if strings.Contains(text, leaked) || strings.Contains(p, leaked) {
 			t.Errorf("payload still contains %q:\n%s", leaked, p)
 		}
@@ -257,12 +277,61 @@ func TestAnnounceTruncatesToSlackLimits(t *testing.T) {
 	}
 }
 
+func TestAnnounceUsesPlainTextForHeaderAndLimitsEscapedBody(t *testing.T) {
+	rec := &recorder{}
+	o := baseOpts(t, rec)
+	o.Title = "R&D <release>"
+	o.Body = strings.Repeat("<", maxBodyRunes)
+	if res := Announce(context.Background(), o); res.Status != AnnouncePosted {
+		t.Fatalf("got %+v", res)
+	}
+	var msg struct {
+		Text   string
+		Blocks []struct{ Text struct{ Text string } } `json:"blocks"`
+	}
+	if err := json.Unmarshal(rec.payloads[0], &msg); err != nil {
+		t.Fatal(err)
+	}
+	if got := msg.Blocks[0].Text.Text; got != o.Title {
+		t.Errorf("plain-text header = %q, want %q", got, o.Title)
+	}
+	if strings.Contains(msg.Text, "<release>") || !strings.Contains(msg.Text, "&lt;release&gt;") {
+		t.Errorf("mrkdwn fallback did not escape the title: %q", msg.Text)
+	}
+	if got := len([]rune(msg.Blocks[2].Text.Text)); got > maxBodyRunes {
+		t.Errorf("escaped body is %d runes, Slack limit budget is %d", got, maxBodyRunes)
+	}
+}
+
+func TestBuildPayloadCleansContextIdentifiers(t *testing.T) {
+	o := AnnounceOptions{Proof: proof(), Title: "title", Body: "body"}
+	payload, err := buildPayload("rcx\u202e", "prod\u200b", o, testNow, testHook)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(string(payload), "\u202e\u200b") {
+		t.Fatalf("context identifiers retain invisible/bidi characters: %s", payload)
+	}
+}
+
+func TestBuildPayloadRefusesOversizeContext(t *testing.T) {
+	o := AnnounceOptions{Proof: proof(), Title: "title", Body: "body"}
+	if _, err := buildPayload(strings.Repeat("&", 3000), "prod", o, testNow, testHook); err == nil {
+		t.Fatal("want an error for a context block over Slack's limit")
+	}
+}
+
 func TestAnnounceSlackErrorIsRedactedAndNotRecorded(t *testing.T) {
-	rec := &recorder{err: errors.New(`Post "` + testHook + `": dial tcp: refused`)}
+	rec := &recorder{err: errors.New(`Post "` + testHook + `": T0FAKE B0FAKE fakeSecretPart123 refused`)}
 	o := baseOpts(t, rec)
 	res := Announce(context.Background(), o)
-	if res.Status != AnnounceSlackError || strings.Contains(res.Error, "fakeSecretPart123") {
+	if res.Status != AnnounceSlackError {
 		t.Fatalf("got %+v", res)
+	}
+	for _, secretPart := range []string{"T0FAKE", "B0FAKE", "fakeSecretPart123"} {
+		if strings.Contains(res.Error, secretPart) {
+			t.Fatalf("Slack error leaked webhook segment %q: %+v", secretPart, res)
+		}
 	}
 	rec.err = nil
 	if retry := Announce(context.Background(), o); retry.Status != AnnouncePosted {
@@ -303,6 +372,81 @@ func TestAnnounceConcurrentRunsPostOnce(t *testing.T) {
 	wg.Wait()
 	if posted.Load() != 1 || rec.count() != 1 {
 		t.Fatalf("%d runs posted, %d posts; want exactly 1", posted.Load(), rec.count())
+	}
+}
+
+func TestAnnounceTreatsEquivalentShortAndFullSHAsAsOneCommit(t *testing.T) {
+	rec := &recorder{}
+	o := baseOpts(t, rec)
+	o.Proof.Expected = testSHA[:8]
+	if first := Announce(context.Background(), o); first.Status != AnnouncePosted {
+		t.Fatalf("short proof: %+v", first)
+	}
+	o.Proof.Expected = testSHA
+	if second := Announce(context.Background(), o); second.Status != AnnounceAlready || rec.count() != 1 {
+		t.Fatalf("full proof after short proof: %+v after %d posts", second, rec.count())
+	}
+}
+
+func TestAnnounceRefusesNullStateBeforePosting(t *testing.T) {
+	rec := &recorder{}
+	o := baseOpts(t, rec)
+	if err := os.MkdirAll(filepath.Dir(o.StatePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(o.StatePath, []byte("null\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res := Announce(context.Background(), o)
+	if res.Status != AnnounceRefused || rec.count() != 0 {
+		t.Fatalf("got %+v after %d posts", res, rec.count())
+	}
+}
+
+func TestAnnounceStateFileIsPrivateDespiteAStaleTempFile(t *testing.T) {
+	rec := &recorder{}
+	o := baseOpts(t, rec)
+	if err := os.MkdirAll(filepath.Dir(o.StatePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(o.StatePath+".tmp", []byte("stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(o.StatePath+".tmp", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if res := Announce(context.Background(), o); res.Status != AnnouncePosted {
+		t.Fatalf("got %+v", res)
+	}
+	info, err := os.Stat(o.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("state mode = %o, want 600", got)
+	}
+}
+
+func TestAnnounceRefusesBeforePostingWhenStateCannotBeRecorded(t *testing.T) {
+	rec := &recorder{}
+	o := baseOpts(t, rec)
+	dir := filepath.Dir(o.StatePath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(o.StatePath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(o.StatePath+".lock", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	res := Announce(context.Background(), o)
+	if res.Status != AnnounceRefused || rec.count() != 0 {
+		t.Fatalf("got %+v after %d posts", res, rec.count())
 	}
 }
 

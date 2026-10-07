@@ -77,8 +77,9 @@ type AnnounceResult struct {
 }
 
 const (
-	maxTitleRunes = 150  // Slack header block limit
-	maxBodyRunes  = 2900 // under the 3000-char section limit, room for the marker
+	maxTitleRunes   = 150  // Slack header block limit
+	maxBodyRunes    = 2900 // under the 3000-char section limit, room for the marker
+	maxContextRunes = 2900 // under the 3000-char text-object limit
 )
 
 var (
@@ -93,6 +94,9 @@ var (
 		regexp.MustCompile(`\b[0-9A-Fa-f]{48,}\b`), // hex tokens; a 40-char commit SHA stays
 	}
 	base64Re = regexp.MustCompile(`[A-Za-z0-9+/]{32,}={0,2}`)
+	// Slack's shape: /services/<team>/<bot>/<secret>. Requiring 6+ chars per
+	// segment also keeps redactSecret from blanking short words in a body.
+	webhookPathRe = regexp.MustCompile(`^/services/[A-Za-z0-9]{6,}/[A-Za-z0-9]{6,}/[A-Za-z0-9]{6,}$`)
 )
 
 // Announce checks every guard, then posts once per service.env and commit.
@@ -116,7 +120,7 @@ func Announce(ctx context.Context, o AnnounceOptions) AnnounceResult {
 	}
 	res.Channel = cfg.Channel
 	if !slices.Contains(cfg.Envs, env) {
-		return refuse("[%s.announce] envs %v does not include %q", name, cfg.Envs, env)
+		return refuse("[%s.announce] envs does not include %q", name, env)
 	}
 	checkedAt, err := checkProof(o.Proof, o.Service, o.Now(), o.MaxAge)
 	if err != nil {
@@ -132,12 +136,12 @@ func Announce(ctx context.Context, o AnnounceOptions) AnnounceResult {
 	if err != nil {
 		return refuse("building the message: %v", err)
 	}
-	key := o.Service + "@" + o.Proof.Expected
+	key := stateKey(o.Service, o.Proof.Expected)
 
 	if o.DryRun {
 		res.Status, res.Payload = AnnounceDryRun, payload
 		if st, err := readState(o.StatePath); err == nil {
-			if prev, ok := st[key]; ok && !o.Force {
+			if prev, ok := announcedEntry(st, o.Service, o.Proof.Expected); ok && !o.Force {
 				res.PostedAt = prev.PostedAt
 				res.Error = "already announced: a real run would exit already_announced (use --force to post again)"
 			}
@@ -154,20 +158,36 @@ func Announce(ctx context.Context, o AnnounceOptions) AnnounceResult {
 	if err != nil {
 		return refuse("reading %s: %v", o.StatePath, err)
 	}
-	if prev, ok := st[key]; ok && !o.Force {
+	if prev, ok := announcedEntry(st, o.Service, o.Proof.Expected); ok && !o.Force {
 		res.Status, res.PostedAt = AnnounceAlready, prev.PostedAt
 		res.Error = "this commit was already announced for " + o.Service + " (use --force to post again)"
 		return res
 	}
-	if err := o.Post(ctx, cfg.Webhook, payload); err != nil {
-		res.Status, res.Error = AnnounceSlackError, redactSecret(err.Error(), cfg.Webhook)
-		return res
-	}
-	res.Status, res.PostedAt = AnnouncePosted, o.Now().UTC().Format(time.RFC3339)
+	// Persist a reservation before the irreversible Slack call. If state
+	// cannot be made durable, refusing here preserves the at-most-once
+	// contract. A confirmed failed post rolls the reservation back.
+	previous, hadPrevious := st[key]
+	res.PostedAt = o.Now().UTC().Format(time.RFC3339)
 	st[key] = stateEntry{PostedAt: res.PostedAt, Channel: cfg.Channel}
 	if err := writeState(o.StatePath, st); err != nil {
-		res.Error = fmt.Sprintf("posted, but recording it in %s failed (a rerun would post again): %v", o.StatePath, err)
+		res.PostedAt = ""
+		return refuse("recording announcement state in %s: %v", o.StatePath, err)
 	}
+	if err := o.Post(ctx, cfg.Webhook, payload); err != nil {
+		if hadPrevious {
+			st[key] = previous
+		} else {
+			delete(st, key)
+		}
+		rollbackErr := writeState(o.StatePath, st)
+		res.Status, res.PostedAt = AnnounceSlackError, ""
+		res.Error = redactSecret(err.Error(), cfg.Webhook)
+		if rollbackErr != nil {
+			res.Error += fmt.Sprintf("; clearing the state reservation failed: %v", rollbackErr)
+		}
+		return res
+	}
+	res.Status = AnnouncePosted
 	return res
 }
 
@@ -208,16 +228,22 @@ func LoadAnnounceConfig(path, name string) (AnnounceConfig, error) {
 		return AnnounceConfig{}, fmt.Errorf("[%s.announce] in %s: webhook and channel must be strings, envs a list of strings", name, path)
 	}
 	for _, k := range md.Undecoded() {
-		if len(k) == 3 && k[0] == name && k[1] == "announce" {
-			return AnnounceConfig{}, fmt.Errorf("[%s.announce] in %s: unknown key %q", name, path, k[2])
+		if len(k) >= 3 && k[0] == name && k[1] == "announce" {
+			// A TOML key is user-controlled too; do not echo one that happens
+			// to contain the webhook credential or another secret.
+			return AnnounceConfig{}, fmt.Errorf("[%s.announce] in %s: unknown key (name redacted)", name, path)
 		}
 	}
 	u, err := url.Parse(t.Webhook)
-	if t.Webhook == "" || err != nil || u.Scheme != "https" || u.Host != "hooks.slack.com" || !strings.HasPrefix(u.Path, "/services/") || u.User != nil {
+	if t.Webhook == "" || err != nil || u.Scheme != "https" || u.Host != "hooks.slack.com" || !webhookPathRe.MatchString(u.Path) ||
+		u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return AnnounceConfig{}, fmt.Errorf("[%s.announce] in %s: webhook must be a Slack incoming webhook (https://hooks.slack.com/services/...)", name, path)
 	}
 	if strings.TrimSpace(t.Channel) == "" {
 		return AnnounceConfig{}, fmt.Errorf("[%s.announce] in %s: channel is required (a label such as \"#releases\")", name, path)
+	}
+	if cleanText(t.Channel, t.Webhook) != t.Channel {
+		return AnnounceConfig{}, fmt.Errorf("[%s.announce] in %s: channel contains unsafe content (content redacted)", name, path)
 	}
 	if t.Envs == nil {
 		t.Envs = []string{"prod"}
@@ -233,8 +259,11 @@ func checkProof(p Result, service string, now time.Time, maxAge time.Duration) (
 	if p.Service != service {
 		return time.Time{}, fmt.Errorf("verify was for %q, not %q", p.Service, service)
 	}
-	if !IsHexSHA(p.Expected) || p.Running == "" || (p.Match != "exact" && p.Match != "contains") {
+	if !IsHexSHA(p.Expected) || !IsHexSHA(p.Running) || (p.Match != "exact" && p.Match != "contains") {
 		return time.Time{}, errors.New("verify result has no expected commit, running commit or match")
+	}
+	if p.Match == "exact" && !Matches(p.Expected, p.Running) {
+		return time.Time{}, errors.New("verify result's running commit does not match the expected commit")
 	}
 	at, err := time.Parse(time.RFC3339, p.CheckedAt)
 	if err != nil {
@@ -248,12 +277,17 @@ func checkProof(p Result, service string, now time.Time, maxAge time.Duration) (
 
 func buildPayload(name, env string, o AnnounceOptions, checkedAt time.Time, webhook string) ([]byte, error) {
 	// Slack parses <!channel> and links in the notification text too, so the
-	// title is escaped everywhere it appears.
-	title := escapeMrkdwn(truncateRunes(strings.Join(strings.Fields(cleanText(o.Title, webhook)), " "), maxTitleRunes))
-	body := escapeMrkdwn(truncateRunes(strings.TrimSpace(cleanText(o.Body, webhook)), maxBodyRunes))
+	// title is escaped in mrkdwn, but the header itself is plain_text.
+	title := truncateRunes(strings.Join(strings.Fields(cleanText(o.Title, webhook)), " "), maxTitleRunes)
+	titleMrkdwn := escapeMrkdwn(title)
+	// Escaping expands characters such as '<' to '&lt;'. Apply Slack's size
+	// budget after that expansion so the serialized text still fits.
+	body := truncateRunes(escapeMrkdwn(strings.TrimSpace(cleanText(o.Body, webhook))), maxBodyRunes)
 	sha := o.Proof.Expected[:min(8, len(o.Proof.Expected))]
+	cleanName := escapeMrkdwn(cleanText(name, webhook))
+	cleanEnv := escapeMrkdwn(cleanText(env, webhook))
 
-	ctxLine := fmt.Sprintf("*%s* deployed to *%s* · `%s`", escapeMrkdwn(name), escapeMrkdwn(env), sha)
+	ctxLine := fmt.Sprintf("*%s* deployed to *%s* · `%s`", cleanName, cleanEnv, sha)
 	if o.Proof.Match == "contains" {
 		ctxLine += fmt.Sprintf(" (running `%s`, which includes it)", o.Proof.Running[:min(8, len(o.Proof.Running))])
 	}
@@ -261,9 +295,12 @@ func buildPayload(name, env string, o AnnounceOptions, checkedAt time.Time, webh
 		ctxLine += fmt.Sprintf(" · <%s|PR #%s>", o.PRURL, m[1])
 	}
 	ctxLine += " · verified " + checkedAt.UTC().Format("2006-01-02 15:04 UTC")
+	if utf8.RuneCountInString(ctxLine) > maxContextRunes {
+		return nil, errors.New("service, environment and PR context exceeds Slack's size limit")
+	}
 
 	msg := map[string]any{
-		"text": fmt.Sprintf("%s %s: %s", escapeMrkdwn(name), escapeMrkdwn(env), title), // notification fallback
+		"text": fmt.Sprintf("%s %s: %s", cleanName, cleanEnv, titleMrkdwn), // notification fallback
 		"blocks": []any{
 			map[string]any{"type": "header", "text": map[string]any{"type": "plain_text", "text": title}},
 			map[string]any{"type": "context", "elements": []any{map[string]any{"type": "mrkdwn", "text": ctxLine}}},
@@ -292,7 +329,7 @@ func cleanText(s, webhook string) string {
 		switch {
 		case r == '\n' || r == '\t':
 			return r
-		case unicode.IsControl(r), unicode.Is(unicode.Bidi_Control, r), r == '\u200b', r == '\ufeff':
+		case unicode.IsControl(r), unicode.Is(unicode.Cf, r):
 			return -1
 		}
 		return r
@@ -307,9 +344,12 @@ func redactSecret(s, secret string) string {
 	if u, err := url.Parse(secret); err == nil && len(u.Path) > len("/services/") {
 		tail := strings.TrimPrefix(u.Path, "/services/")
 		s = strings.ReplaceAll(s, tail, "[redacted]")
-		// The last segment is the secret part; it must not leak on its own.
-		if last := tail[strings.LastIndex(tail, "/")+1:]; len(last) >= 8 {
-			s = strings.ReplaceAll(s, last, "[redacted]")
+		// Any path component can identify the incoming webhook. Errors from
+		// proxies and transports sometimes print components separately.
+		for _, part := range strings.Split(tail, "/") {
+			if part != "" {
+				s = strings.ReplaceAll(s, part, "[redacted]")
+			}
 		}
 	}
 	return s
@@ -391,6 +431,21 @@ type stateEntry struct {
 	Channel  string `json:"channel"`
 }
 
+func stateKey(service, sha string) string { return service + "@" + strings.ToLower(sha) }
+
+// announcedEntry uses verify's commit identity rules rather than literal
+// strings. The same commit may be reported as a short SHA in one run and a
+// full SHA in another; those must share one once-only record.
+func announcedEntry(st map[string]stateEntry, service, sha string) (stateEntry, bool) {
+	prefix := service + "@"
+	for key, entry := range st {
+		if previous, ok := strings.CutPrefix(key, prefix); ok && Matches(previous, sha) {
+			return entry, true
+		}
+	}
+	return stateEntry{}, false
+}
+
 // lockState serialises announces across processes, so two sessions shipping
 // the same commit can't both post.
 func lockState(path string) (func(), error) {
@@ -420,6 +475,9 @@ func readState(path string) (map[string]stateEntry, error) {
 	if err := json.Unmarshal(b, &st); err != nil {
 		return nil, fmt.Errorf("corrupt state file (fix or remove it): %v", err)
 	}
+	if st == nil {
+		return nil, errors.New("corrupt state file (fix or remove it): want a JSON object")
+	}
 	return st, nil
 }
 
@@ -428,8 +486,21 @@ func writeState(path string, st map[string]stateEntry) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), ".announce-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
