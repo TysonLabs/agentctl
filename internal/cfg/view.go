@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/TysonLabs/agentctl/internal/client"
@@ -130,6 +131,27 @@ func (s *Store) Test(full, ua string, timeout time.Duration) TestResult {
 		}
 		return r
 	}
-	r.OK, r.Version = true, render.VersionFromBody(resp.Body)
+	r.OK, r.Version = true, safeVersion(render.VersionFromBody(resp.Body), reg.Secrets())
 	return r
+}
+
+// hiddenVersion replaces a version string that overlaps a token.
+const hiddenVersion = "(hidden: it matches a token)"
+
+// safeVersion keeps a service-controlled version string out of agentcfg's
+// output when it could be token material. A service can reflect the bearer
+// token, and VersionFromBody truncates to 40 characters, so an exact-match
+// scrub would miss a token prefix: hide any version that contains a token
+// or is a fragment (6+ characters) of one.
+func safeVersion(v string, secrets []registry.Secret) string {
+	for _, s := range secrets {
+		tok := s.Reveal()
+		if tok == "" {
+			continue
+		}
+		if strings.Contains(v, tok) || (len(v) >= 6 && strings.Contains(tok, v)) {
+			return hiddenVersion
+		}
+	}
+	return v
 }

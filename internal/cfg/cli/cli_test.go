@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -40,6 +42,107 @@ func TestUsageAndExitCodes(t *testing.T) {
 	}
 	if code, out, _ := run(t, "", "ls", "--config", cfgPath); code != 0 || !strings.Contains(out, "no services") {
 		t.Errorf("empty ls: exit %d %s", code, out)
+	}
+	for _, args := range [][]string{
+		{"ls", "--base-url", "https://x", "--config", cfgPath},
+		{"set", "a.prod", "--base-url", "https://x", "--idle", "1m", "--config", cfgPath},
+		{"ui", "--base-url", "https://x", "--config", cfgPath},
+		{"version", "extra"},
+		{"set", "not-a-full-name", "--base-url", "https://x", "--config", cfgPath},
+		{"meta", "bad.name", "repo=x", "--config", cfgPath},
+		{"rm", "not-a-full-name", "--config", cfgPath},
+		{"test", "not-a-full-name", "--config", cfgPath},
+	} {
+		if code, _, _ := run(t, "", args...); code != 2 {
+			t.Errorf("%q exit %d, want usage exit 2", args, code)
+		}
+	}
+}
+
+func TestPipedTokenInputPreservesWhitespaceForValidation(t *testing.T) {
+	for _, in := range []string{
+		"valid_token_123 ",
+		" valid_token_123\n",
+		"valid_token_123\nsecond-line\n",
+	} {
+		code, _, errs := run(t, in, "token", "svc.prod")
+		if code != 1 || !strings.Contains(errs, "spaces or control characters") {
+			t.Errorf("input %q: exit %d, stderr %q", in, code, errs)
+		}
+	}
+
+	for _, in := range []string{"valid_token_123", "valid_token_123\n", "valid_token_123\r\n", "valid_token_123\r"} {
+		got, err := readTokenValue(strings.NewReader(in), false)
+		if err != nil || got != "valid_token_123" {
+			t.Errorf("input %q: got %q, %v", in, got, err)
+		}
+	}
+}
+
+func TestPipedTokenInputRejectsTruncation(t *testing.T) {
+	_, err := readTokenValue(strings.NewReader(strings.Repeat("a", maxTokenBytes+1)), false)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("overlong token error = %v", err)
+	}
+}
+
+func TestTerminalEchoFailureRefusesToken(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := io.WriteString(f, "valid_token_123\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	a := &app{
+		stdin: f, stderr: &stderr,
+		isTerminal: func(*os.File) bool { return true },
+		setEcho: func(*os.File, string) error {
+			return errors.New("stty failed")
+		},
+	}
+	if tok, err := a.readToken("svc.prod"); err == nil || tok != "" {
+		t.Fatalf("readToken = %q, %v; want refusal", tok, err)
+	}
+	pos, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pos != 0 {
+		t.Fatalf("read %d bytes after echo disable failed", pos)
+	}
+}
+
+func TestTerminalEchoRestoreFailureWarns(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := io.WriteString(f, "valid_token_123\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	a := &app{
+		stdin: f, stderr: &stderr,
+		isTerminal: func(*os.File) bool { return true },
+		setEcho: func(_ *os.File, arg string) error {
+			if arg == "echo" {
+				return errors.New("stty failed")
+			}
+			return nil
+		},
+	}
+	if tok, err := a.readToken("svc.prod"); err != nil || tok != "valid_token_123" || !strings.Contains(stderr.String(), "stty echo") {
+		t.Fatalf("readToken = %q, %v, stderr %q; want the token and a stty echo warning", tok, err, stderr.String())
 	}
 }
 

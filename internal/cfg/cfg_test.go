@@ -93,6 +93,45 @@ webhook = "https://hooks.example.com/x"
 	}
 }
 
+func TestRenderPreservesTOMLScalarTypes(t *testing.T) {
+	content := `[a.prod]
+base_url = "https://a.example.com"
+"key with spaces" = "quote: \"; newline:\n; unicode: 雪"
+integer = 7
+float = 7.0
+not_a_number = nan
+date = 2026-10-07
+offset_datetime = 2026-10-07T12:34:56+05:30
+empty_array = []
+
+[a.announce.empty]
+
+[unused]
+`
+	s := newStore(t, content)
+	if _, err := s.SetBaseURL("", "a.prod", "https://b.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	doc, _, err := readDoc(s.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prod := doc.Tree["a"].(map[string]any)["prod"].(map[string]any)
+	if _, ok := prod["integer"].(int64); !ok {
+		t.Fatalf("integer changed type: %T", prod["integer"])
+	}
+	if _, ok := prod["float"].(float64); !ok {
+		t.Fatalf("float changed type: %T", prod["float"])
+	}
+	announce := doc.Tree["a"].(map[string]any)["announce"].(map[string]any)
+	if _, ok := announce["empty"]; !ok {
+		t.Fatal("nested empty table was lost")
+	}
+	if _, ok := doc.Tree["unused"]; !ok {
+		t.Fatal("top-level empty table was lost")
+	}
+}
+
 func TestEditConflictAndValidation(t *testing.T) {
 	s := newStore(t, sample)
 	before := read(t, s)
@@ -154,6 +193,44 @@ func TestSymlinkIsKept(t *testing.T) {
 	}
 	if !strings.Contains(read(t, real), "https://b.example.com") {
 		t.Fatal("the link target was not updated")
+	}
+}
+
+func TestBrokenSymlinkIsNotReplaced(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "services.toml")
+	if err := os.Symlink(filepath.Join(dir, "missing.toml"), link); err != nil {
+		t.Fatal(err)
+	}
+	s := &Store{Path: link}
+	if _, err := s.SetBaseURL("", "a.prod", "https://a.example.com"); err == nil {
+		t.Fatal("edit through a broken symlink succeeded")
+	}
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("broken symlink disappeared: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("broken symlink was replaced: mode=%v", fi.Mode())
+	}
+}
+
+func TestSymlinkAndTargetUseSameLock(t *testing.T) {
+	real := newStore(t, "[a.prod]\nbase_url = \"https://a.example.com\"\n")
+	link := filepath.Join(t.TempDir(), "services.toml")
+	if err := os.Symlink(real.Path, link); err != nil {
+		t.Fatal(err)
+	}
+	realTarget, err := resolveStorePath(real.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkTarget, err := resolveStorePath(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if realTarget != linkTarget {
+		t.Fatalf("lock identities differ: target=%q symlink=%q", realTarget, linkTarget)
 	}
 }
 
@@ -305,6 +382,52 @@ func TestKeychainFailureLeavesFileUnchanged(t *testing.T) {
 	}
 }
 
+func TestMigrateRenderFailureDoesNotTouchKeychain(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "called")
+	fake := filepath.Join(t.TempDir(), "security")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nprintf called >>\"$AGENTCFG_KEYCHAIN_MARKER\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENTCFG_KEYCHAIN_MARKER", marker)
+	old, oldSup := keychain.Bin, keychain.Supported
+	keychain.Bin, keychain.Supported = fake, true
+	t.Cleanup(func() { keychain.Bin, keychain.Supported = old, oldSup })
+	s := newStore(t, `[a.prod]
+base_url = "https://a.example.com"
+token = "plain_token_value_1"
+
+["z z".prod]
+base_url = "https://z.example.com"
+`)
+	before := read(t, s)
+	if _, err := s.Migrate(""); err == nil {
+		t.Fatal("Migrate succeeded for a tree agentcfg cannot render")
+	}
+	if got := read(t, s); got != before {
+		t.Fatal("failed migration changed the file")
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed migration invoked security: %v", err)
+	}
+}
+
+func TestInvalidSourceIsNotRepairedByRemove(t *testing.T) {
+	for _, ref := range []string{"", "keychain:a.prod"} {
+		content := `[a.prod]
+base_url = "https://a.example.com"
+token = "plain_token_value_1"
+token_ref = "` + ref + `"
+`
+		s := newStore(t, content)
+		if _, err := s.Remove("", "a.prod"); err == nil {
+			t.Errorf("Remove accepted ambiguous token source with token_ref %q", ref)
+		}
+		if got := read(t, s); got != content {
+			t.Errorf("refused removal changed registry with token_ref %q", ref)
+		}
+	}
+}
+
 func TestRemove(t *testing.T) {
 	kc := keychaintest.Temp(t)
 	s := newStore(t, sample)
@@ -341,5 +464,20 @@ func TestStateNeverHoldsTokens(t *testing.T) {
 	missing := (&Store{Path: filepath.Join(t.TempDir(), "none.toml")}).State()
 	if missing.Error != "" || missing.Version != "none" || len(missing.Services) != 0 {
 		t.Fatalf("missing file state %+v", missing)
+	}
+}
+
+func TestSafeVersionHidesTokenMaterial(t *testing.T) {
+	tok := strings.Repeat("ab12", 16) // 64 chars, longer than VersionFromBody's 40-char cut
+	secrets := []registry.Secret{registry.NewSecret(tok)}
+	for _, v := range []string{tok, tok[:40], "v=" + tok, tok[10:20]} {
+		if got := safeVersion(v, secrets); got != hiddenVersion {
+			t.Errorf("safeVersion(%q) = %q, want hidden", v, got)
+		}
+	}
+	for _, v := range []string{"1f45ae32", "v1.2.3", "ab12"} {
+		if got := safeVersion(v, secrets); got != v {
+			t.Errorf("safeVersion(%q) = %q, want it kept", v, got)
+		}
 	}
 }

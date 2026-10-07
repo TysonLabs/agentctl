@@ -308,15 +308,29 @@ func TestParseLeavesRefUnresolved(t *testing.T) {
 
 func TestTokenRefRejects(t *testing.T) {
 	cases := map[string]string{
-		"both":      "[a.b]\nbase_url = \"https://a\"\ntoken = \"abcdefgh12\"\ntoken_ref = \"keychain:a.b\"\n",
-		"empty+tok": "[a.b]\nbase_url = \"https://a\"\ntoken = \"\"\ntoken_ref = \"keychain:a.b\"\n",
-		"scheme":    "[a.b]\nbase_url = \"https://a\"\ntoken_ref = \"vault:a.b\"\n",
-		"account":   "[a.b]\nbase_url = \"https://a\"\ntoken_ref = \"keychain:a b\"\n",
-		"type":      "[a.b]\nbase_url = \"https://a\"\ntoken_ref = 3\n",
+		"both":            "[a.b]\nbase_url = \"https://a\"\ntoken = \"abcdefgh12\"\ntoken_ref = \"keychain:a.b\"\n",
+		"empty-token+ref": "[a.b]\nbase_url = \"https://a\"\ntoken = \"\"\ntoken_ref = \"keychain:a.b\"\n",
+		"token+empty-ref": "[a.b]\nbase_url = \"https://a\"\ntoken = \"abcdefgh12\"\ntoken_ref = \"\"\n",
+		"empty-ref":       "[a.b]\nbase_url = \"https://a\"\ntoken_ref = \"\"\n",
+		"scheme":          "[a.b]\nbase_url = \"https://a\"\ntoken_ref = \"vault:a.b\"\n",
+		"account":         "[a.b]\nbase_url = \"https://a\"\ntoken_ref = \"keychain:a b\"\n",
+		"type":            "[a.b]\nbase_url = \"https://a\"\ntoken_ref = 3\n",
 	}
 	for name, content := range cases {
 		if _, err := Parse("x.toml", []byte(content)); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+func TestTokenRefErrorNeverEchoesValue(t *testing.T) {
+	const secret = "bearer_token_accidentally_pasted_here"
+	content := "[a.b]\nbase_url = \"https://a\"\ntoken_ref = \"" + secret + "\"\n"
+	_, err := Parse("x.toml", []byte(content))
+	if err == nil {
+		t.Fatal("accepted malformed token_ref")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("token_ref error leaked its value: %q", err)
 	}
 }

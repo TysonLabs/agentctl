@@ -3,6 +3,7 @@ package ui
 import (
 	"encoding/json"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -60,8 +61,12 @@ func do(t *testing.T, s *server, ts *httptest.Server, c call) (int, string) {
 		}
 		req.Header.Set("Content-Type", ct)
 	}
-	if c.origin != "" {
-		req.Header.Set("Origin", c.origin)
+	if c.origin != "-" && c.method != http.MethodGet && c.method != http.MethodHead {
+		o := c.origin
+		if o == "" {
+			o = "http://" + s.host
+		}
+		req.Header.Set("Origin", o)
 	}
 	if c.host != "" {
 		req.Host = c.host
@@ -86,11 +91,14 @@ func TestGuards(t *testing.T) {
 		{"wrong key", call{method: "GET", path: "/api/state", key: strings.Repeat("cd", 32)}, 401},
 		{"rebound host", call{method: "GET", path: "/api/state", host: "evil.example.com:" + strings.Split(s.host, ":")[1]}, 421},
 		{"localhost alias", call{method: "GET", path: "/", host: "localhost:" + strings.Split(s.host, ":")[1]}, 421},
+		{"missing origin", call{path: "/api/env", body: `{}`, origin: "-"}, 403},
 		{"cross origin", call{path: "/api/env", body: `{}`, origin: "https://evil.example.com"}, 403},
 		{"form post", call{path: "/api/env", body: `a=b`, ctype: "application/x-www-form-urlencoded"}, 415},
 		{"no content type", call{path: "/api/env", body: `{}`, ctype: "-"}, 415},
 		{"unknown field", call{path: "/api/env", body: `{"service":"pay.prod","base_url":"https://x","admin":true}`}, 400},
-		{"trailing data", call{path: "/api/quit", body: `{} {}`}, 400},
+		{"trailing value", call{path: "/api/quit", body: `{} {}`}, 400},
+		{"trailing brace", call{path: "/api/quit", body: `{}}`}, 400},
+		{"trailing bracket", call{path: "/api/quit", body: `{}]`}, 400},
 		{"get on write route", call{method: "GET", path: "/api/env"}, 405},
 		{"ok", call{method: "GET", path: "/api/state"}, 200},
 		{"page needs no key", call{method: "GET", path: "/", key: "-"}, 200},
@@ -99,6 +107,56 @@ func TestGuards(t *testing.T) {
 		if got, body := do(t, s, ts, tc.c); got != tc.want {
 			t.Errorf("%s: status %d, want %d (%s)", tc.name, got, tc.want, body)
 		}
+	}
+}
+
+func TestWriteRequiresExactOriginWithoutNetwork(t *testing.T) {
+	s := &server{
+		store: &cfg.Store{Path: filepath.Join(t.TempDir(), "services.toml")},
+		key:   strings.Repeat("ab", 32),
+		host:  "127.0.0.1:43210",
+		last:  time.Now(),
+		quit:  make(chan struct{}),
+	}
+	for _, tc := range []struct {
+		name, origin string
+		want         int
+	}{
+		{"missing", "", http.StatusForbidden},
+		{"cross origin", "https://evil.example.com", http.StatusForbidden},
+		{"exact", "http://" + s.host, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "http://"+s.host+"/api/env", strings.NewReader(`{}`))
+			req.Host = s.host
+			req.Header.Set("X-Agentcfg-Key", s.key)
+			req.Header.Set("Content-Type", "application/json")
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			rr := httptest.NewRecorder()
+			s.routes().ServeHTTP(rr, req)
+			if rr.Code != tc.want {
+				t.Fatalf("status %d, want %d: %s", rr.Code, tc.want, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestDecodeRejectsEveryTrailingJSONValue(t *testing.T) {
+	for _, body := range []string{`{} {}`, `{}}`, `{}]`, `{} null`} {
+		t.Run(body, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+			var dst struct{}
+			if err := decode(req, &dst); err == nil {
+				t.Fatalf("decode accepted %q", body)
+			}
+		})
+	}
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("{} \n\t"))
+	var dst struct{}
+	if err := decode(req, &dst); err != nil {
+		t.Fatalf("decode rejected trailing whitespace: %v", err)
 	}
 }
 
@@ -171,7 +229,9 @@ func TestTestEndpointUsesStoredToken(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		w.Write([]byte(`{"version":"abc123"}`))
+		// A compromised or buggy service can reflect the bearer token, whole
+		// or as a fragment, in a field that normally looks harmless.
+		w.Write([]byte(`{"version":"` + plainTok + `"}`))
 	}))
 	defer svc.Close()
 	s, ts := newServer(t)
@@ -179,7 +239,7 @@ func TestTestEndpointUsesStoredToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, body := do(t, s, ts, call{path: "/api/test", body: `{"service":"pay.prod"}`})
-	if code != 200 || !strings.Contains(body, `"ok":true`) || !strings.Contains(body, "abc123") {
+	if code != 200 || !strings.Contains(body, `"ok":true`) {
 		t.Fatalf("test: %d %s", code, body)
 	}
 	if gotAuth != "Bearer "+plainTok {
@@ -187,6 +247,45 @@ func TestTestEndpointUsesStoredToken(t *testing.T) {
 	}
 	if strings.Contains(body, plainTok) {
 		t.Fatal("test result leaks the token")
+	}
+	if !strings.Contains(body, "hidden") {
+		t.Fatalf("a reflected token should be reported as hidden: %s", body)
+	}
+}
+
+func TestBrowserCodeKeepsSecretsAndAddFormStable(t *testing.T) {
+	js, err := fs.ReadFile(assets, "assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(js)
+	if strings.Contains(source, `f-token").value.trim()`) {
+		t.Fatal("browser code trims a token instead of letting cfg.CheckToken reject whitespace")
+	}
+	start := strings.Index(source, "function openAdd(")
+	end := strings.Index(source, "function openURL(")
+	if start < 0 || end <= start {
+		t.Fatal("could not find add flow")
+	}
+	add := source[start:end]
+	firstWrite := strings.Index(add, `await write("/api/env"`)
+	if !strings.Contains(add, "const form = {") || firstWrite < 0 {
+		t.Fatal("add flow does not snapshot the form before writing")
+	}
+	for _, liveRead := range []string{`val("f-`, `$("f-token").value`} {
+		if strings.Contains(add[firstWrite:], liveRead) {
+			t.Fatalf("add flow reads live form state after its first write: %s", liveRead)
+		}
+	}
+	doneStart := strings.Index(source, `$("done").addEventListener`)
+	if doneStart < 0 {
+		t.Fatal("could not find quit flow")
+	}
+	done := source[doneStart:]
+	reject := strings.Index(done, "if (e.status)")
+	stopped := strings.Index(done, `$("stopped").hidden = false`)
+	if reject < 0 || stopped < 0 || reject > stopped {
+		t.Fatal("quit flow reports stopped before handling an HTTP rejection")
 	}
 }
 

@@ -180,9 +180,7 @@ func (s *Store) SetToken(expect, full, tok string) (*Result, error) {
 			return fmt.Errorf("%v — add it first with a base URL", err)
 		}
 		acct := account(name, env)
-		if err := keychainSet(acct, tok); err != nil {
-			return err
-		}
+		d.BeforeSave(func() error { return keychainSet(acct, tok) })
 		delete(tbl, "token")
 		tbl["token_ref"] = keychain.RefPrefix + acct
 		return nil
@@ -262,6 +260,9 @@ func (s *Store) Migrate(expect string) (*MigrateResult, error) {
 					continue
 				}
 				full := name + "." + env
+				if _, hasRef := tbl["token_ref"]; hasRef {
+					return fmt.Errorf("%s sets both token and token_ref; refusing to choose one", full)
+				}
 				if !nameRe.MatchString(name) || !nameRe.MatchString(env) {
 					mr.Skipped = append(mr.Skipped, full+": name has characters a keychain account cannot hold")
 					continue
@@ -271,9 +272,12 @@ func (s *Store) Migrate(expect string) (*MigrateResult, error) {
 					continue
 				}
 				acct := account(name, env)
-				if err := keychainSet(acct, tok); err != nil {
-					return fmt.Errorf("%s: %v (file unchanged)", full, err)
-				}
+				d.BeforeSave(func() error {
+					if err := keychainSet(acct, tok); err != nil {
+						return fmt.Errorf("%s: %v (file unchanged)", full, err)
+					}
+					return nil
+				})
 				delete(tbl, "token")
 				tbl["token_ref"] = keychain.RefPrefix + acct
 				mr.Moved = append(mr.Moved, full)

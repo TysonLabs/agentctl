@@ -274,21 +274,34 @@
       ].filter(Boolean),
       "Add",
       async () => {
-        const full = val("f-name") + "." + val("f-env");
+        // Snapshot the form before the first request. The add operation needs
+        // several writes, and rendering/canceling/editing must not change
+        // which values later writes use.
+        const form = {
+          name: val("f-name"), env: val("f-env"), baseURL: val("f-url"),
+          token: $("f-token").value,
+          repo: val("f-repo"), unit: val("f-unit"),
+        };
+        const full = form.name + "." + form.env;
         if (state.services.some((s) => s.name + "." + s.env === full)) {
           throw new Error(full + " already exists. Use Edit to change it.");
         }
-        await write("/api/env", { service: full, base_url: val("f-url") });
-        if (!fixed && (val("f-repo") || val("f-unit"))) {
-          await write("/api/meta", { name: val("f-name"), meta: { repo: val("f-repo"), unit: val("f-unit") } });
-        }
-        const tok = $("f-token").value.trim();
-        if (tok) {
-          try {
-            await write("/api/token", { service: full, token: tok });
-          } catch (e) {
-            throw new Error("Added " + full + ", but the token was not stored: " + e.message);
+        await write("/api/env", { service: full, base_url: form.baseURL });
+        try {
+          // Do not trim secrets. cfg.CheckToken deliberately rejects any
+          // whitespace as a paste error rather than guessing a different key.
+          if (form.token) {
+            await write("/api/token", { service: full, token: form.token });
           }
+          if (!fixed && (form.repo || form.unit)) {
+            await write("/api/meta", { name: form.name, meta: { repo: form.repo, unit: form.unit } });
+          }
+        } catch (e) {
+          // The env write already committed. Resolve this submit so its common
+          // path closes the dialog; retrying Add would only collide with that
+          // env. Its ordinary token/details controls can finish the setup.
+          toast("Added " + full + ", but setup is incomplete: " + e.message, true);
+          return;
         }
         toast("Added " + full);
       });
@@ -311,7 +324,7 @@
         (s.token.source === "file" ? "The plaintext copy in services.toml is removed." : ""),
       [field("f-token", "Token", { type: "password", mono: true, required: true })], "Store in Keychain",
       async () => {
-        await write("/api/token", { service: full, token: $("f-token").value.trim() });
+        await write("/api/token", { service: full, token: $("f-token").value });
         delete tests[full];
         toast("Stored the " + full + " token in the Keychain");
       });
@@ -338,22 +351,36 @@
         return;
       }
     }
-    $("dlg-ok").disabled = true;
+    const controls = [...$("dlg-form").elements];
+    controls.forEach((control) => { control.disabled = true; });
     try {
       await onSubmit();
       $("dlg").close();
     } catch (e) {
       $("dlg-error").textContent = e.message;
     } finally {
-      $("dlg-ok").disabled = false;
+      controls.forEach((control) => { control.disabled = false; });
     }
   });
   $("dlg-cancel").addEventListener("click", () => $("dlg").close());
+  $("dlg").addEventListener("cancel", (ev) => {
+    if ($("dlg-ok").disabled) ev.preventDefault();
+  });
   $("dlg").addEventListener("close", () => { $("dlg-fields").replaceChildren(); onSubmit = null; });
 
   $("add").addEventListener("click", () => openAdd());
   $("done").addEventListener("click", async () => {
-    try { await api("POST", "/api/quit", {}); } catch (_) { /* already stopped */ }
+    try {
+      await api("POST", "/api/quit", {});
+    } catch (e) {
+      // A network failure means the idle timer probably stopped the server.
+      // An HTTP rejection means it is still running and must not be reported
+      // as stopped.
+      if (e.status) {
+        toast(e.message, true);
+        return;
+      }
+    }
     try { sessionStorage.removeItem(KEY_STORE); } catch (_) { /* ignore */ }
     $("stopped").hidden = false;
   });

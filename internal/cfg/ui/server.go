@@ -220,8 +220,8 @@ func (s *server) api(fn func(r *http.Request) (any, error)) http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or wrong session key — reopen the URL agentcfg printed"})
 			return
 		}
-		if r.Method != http.MethodGet {
-			if o := r.Header.Get("Origin"); o != "" && o != "http://"+s.host {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if o := r.Header.Get("Origin"); o != "http://"+s.host {
 				writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross-origin request refused"})
 				return
 			}
@@ -262,7 +262,8 @@ func decode(r *http.Request, v any) error {
 	if err := dec.Decode(v); err != nil {
 		return badRequest(fmt.Errorf("bad request body: %v", err))
 	}
-	if dec.More() {
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
 		return badRequest(errors.New("bad request body: trailing data"))
 	}
 	return nil
@@ -376,6 +377,8 @@ func (s *server) handleTest(r *http.Request) (any, error) {
 	if _, _, err := cfg.SplitFull(req.Service); err != nil {
 		return nil, badRequest(err)
 	}
+	// Store.Test hides a version that overlaps a token (a service can
+	// reflect the Authorization header).
 	return s.store.Test(req.Service, "agentcfg/"+s.version, 10*time.Second), nil
 }
 

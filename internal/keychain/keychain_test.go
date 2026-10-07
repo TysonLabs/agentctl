@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/TysonLabs/agentctl/internal/keychain"
@@ -21,6 +22,19 @@ func TestParseRef(t *testing.T) {
 	for _, in := range []string{"", "svc.prod", "keychain:", "keychain:svc", "keychain:svc.prod.x", "keychain:svc prod.x", "keychain:-a\";x.y", "file:svc.prod"} {
 		if _, err := keychain.ParseRef(in); err == nil {
 			t.Errorf("ParseRef(%q) accepted", in)
+		}
+	}
+}
+
+func TestParseRefErrorDoesNotEchoValue(t *testing.T) {
+	const secret = "bearer_token_accidentally_pasted_here"
+	for _, ref := range []string{secret, "keychain:" + secret} {
+		_, err := keychain.ParseRef(ref)
+		if err == nil {
+			t.Fatalf("ParseRef(%q) accepted", ref)
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("ParseRef error leaked token_ref value: %q", err)
 		}
 	}
 }

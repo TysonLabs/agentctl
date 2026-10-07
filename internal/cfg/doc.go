@@ -15,11 +15,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"reflect"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -35,8 +37,14 @@ type Doc struct {
 	Tree    map[string]any
 
 	hadComments bool
+	beforeSave  []func() error
 	onSaved     []func() error
 }
+
+// BeforeSave registers a step that runs after the prospective file has
+// rendered and validated, but before it is installed. Keychain writes use
+// this hook so an unrenderable tree cannot cause an external side effect.
+func (d *Doc) BeforeSave(f func() error) { d.beforeSave = append(d.beforeSave, f) }
 
 // OnSaved registers a step that runs after the file is written, still under
 // the lock (deleting a Keychain item the file no longer references).
@@ -95,6 +103,10 @@ func renderTree(tree map[string]any) ([]byte, error) {
 		if !bareKey.MatchString(name) {
 			return nil, fmt.Errorf("service name %q needs quoting; agentcfg only writes plain names", name)
 		}
+		if len(svc) == 0 {
+			b.WriteString("\n[" + name + "]\n")
+			continue
+		}
 		for _, sub := range tableOrder(svc) {
 			tbl, ok := svc[sub].(map[string]any)
 			if !ok {
@@ -110,10 +122,57 @@ func renderTree(tree map[string]any) ([]byte, error) {
 	if _, err := toml.Decode(string(out), &back); err != nil {
 		return nil, fmt.Errorf("internal error: rendered registry does not parse")
 	}
-	if !reflect.DeepEqual(back, tree) {
+	if !sameTree(back, tree) {
 		return nil, fmt.Errorf("internal error: rendered registry does not round-trip; nothing written")
 	}
 	return out, nil
+}
+
+// sameTree is reflect.DeepEqual with TOML's value semantics for the two
+// scalar cases where Go representation details are not stable across an
+// encode/decode: NaN is unequal to itself, and parsing an offset datetime
+// creates a fresh *time.Location.
+func sameTree(a, b any) bool {
+	if reflect.TypeOf(a) != reflect.TypeOf(b) {
+		return false
+	}
+	switch av := a.(type) {
+	case map[string]any:
+		bv := b.(map[string]any)
+		if len(av) != len(bv) {
+			return false
+		}
+		for k, v := range av {
+			other, ok := bv[k]
+			if !ok || !sameTree(v, other) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		bv := b.([]any)
+		if len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !sameTree(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
+	case float64:
+		bv := b.(float64)
+		if math.IsNaN(av) && math.IsNaN(bv) {
+			return math.Signbit(av) == math.Signbit(bv)
+		}
+		return av == bv
+	case time.Time:
+		bv := b.(time.Time)
+		const layout = "2006-01-02T15:04:05.999999999Z07:00"
+		return av.Equal(bv) && av.Format(layout) == bv.Format(layout) && av.Location().String() == bv.Location().String()
+	default:
+		return reflect.DeepEqual(a, b)
+	}
 }
 
 func renderTable(b *bytes.Buffer, path []string, tbl map[string]any) error {

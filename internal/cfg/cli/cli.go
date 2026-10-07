@@ -60,6 +60,8 @@ type app struct {
 	stdout, stderr io.Writer
 	store          *cfg.Store
 	flags          map[string]string
+	isTerminal     func(*os.File) bool
+	setEcho        func(*os.File, string) error
 }
 
 // valueFlags take an argument; boolFlags do not.
@@ -118,31 +120,39 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	a := &app{
 		stdin: stdin, stdout: stdout, stderr: stderr, flags: flags,
-		store: &cfg.Store{Path: registry.ResolvePath(flags["config"])},
+		store:      &cfg.Store{Path: registry.ResolvePath(flags["config"])},
+		isTerminal: isTerminal,
+		setEcho:    stty,
 	}
 	cmd, rest := pos[0], pos[1:]
 	var cmdErr error
-	switch cmd {
-	case "ls":
-		cmdErr = a.cmdLs(rest)
-	case "set":
-		cmdErr = a.cmdSet(rest)
-	case "meta":
-		cmdErr = a.cmdMeta(rest)
-	case "token":
-		cmdErr = a.cmdToken(rest)
-	case "migrate":
-		cmdErr = a.cmdMigrate(rest)
-	case "rm":
-		cmdErr = a.cmdRm(rest)
-	case "test":
-		cmdErr = a.cmdTest(rest)
-	case "ui":
-		cmdErr = a.cmdUI(rest)
-	case "version":
-		fmt.Fprintln(stdout, "agentcfg "+Version)
-	default:
-		cmdErr = usageError(fmt.Sprintf("unknown command %q — run: agentcfg --help", cmd))
+	if err := commandFlags(cmd, flags); err != nil {
+		cmdErr = err
+	} else {
+		switch cmd {
+		case "ls":
+			cmdErr = a.cmdLs(rest)
+		case "set":
+			cmdErr = a.cmdSet(rest)
+		case "meta":
+			cmdErr = a.cmdMeta(rest)
+		case "token":
+			cmdErr = a.cmdToken(rest)
+		case "migrate":
+			cmdErr = a.cmdMigrate(rest)
+		case "rm":
+			cmdErr = a.cmdRm(rest)
+		case "test":
+			cmdErr = a.cmdTest(rest)
+		case "ui":
+			cmdErr = a.cmdUI(rest)
+		case "version":
+			if cmdErr = a.only("version", rest, 0, ""); cmdErr == nil {
+				fmt.Fprintln(stdout, "agentcfg "+Version)
+			}
+		default:
+			cmdErr = usageError(fmt.Sprintf("unknown command %q — run: agentcfg --help", cmd))
+		}
 	}
 	var ue usageError
 	var tf testFailed
@@ -159,6 +169,25 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agentcfg: "+cmdErr.Error())
 		return 1
 	}
+}
+
+func commandFlags(cmd string, flags map[string]string) error {
+	allowed := map[string]bool{"config": true}
+	switch cmd {
+	case "set":
+		allowed["base-url"] = true
+	case "ui":
+		allowed["idle"], allowed["no-open"] = true, true
+	case "ls", "meta", "token", "migrate", "rm", "test", "version":
+	default:
+		return nil // the unknown-command diagnostic is more useful
+	}
+	for name := range flags {
+		if !allowed[name] {
+			return usageError(fmt.Sprintf("--%s does not apply to agentcfg %s", name, cmd))
+		}
+	}
+	return nil
 }
 
 func (a *app) only(cmd string, args []string, n int, want string) error {
@@ -214,6 +243,9 @@ func (a *app) cmdSet(args []string) error {
 	if err := a.only("set", args, 1, "<name.env> --base-url URL"); err != nil {
 		return err
 	}
+	if _, _, err := cfg.SplitFull(args[0]); err != nil {
+		return usageError(err.Error())
+	}
 	u, ok := a.flags["base-url"]
 	if !ok {
 		return usageError("usage: agentcfg set <name.env> --base-url URL")
@@ -229,6 +261,9 @@ func (a *app) cmdSet(args []string) error {
 func (a *app) cmdMeta(args []string) error {
 	if len(args) < 2 {
 		return usageError("usage: agentcfg meta <name> repo=PATH unit=UNIT (key= clears)")
+	}
+	if _, _, err := cfg.SplitFull(args[0] + ".x"); err != nil {
+		return usageError(err.Error())
 	}
 	kv := map[string]string{}
 	for _, p := range args[1:] {
@@ -270,30 +305,60 @@ func (a *app) cmdToken(args []string) error {
 	return nil
 }
 
-// readToken reads one line from stdin. On a terminal it prompts on stderr and
-// turns echo off while the token is typed.
+const maxTokenBytes = 8192
+
+// readToken reads a token from stdin. A pipe must contain only the token and
+// one optional line ending. On a terminal it reads one line with echo off.
 func (a *app) readToken(full string) (string, error) {
 	f, isFile := a.stdin.(*os.File)
-	tty := false
-	if isFile {
-		if fi, err := f.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
-			tty = true
-		}
-	}
+	tty := isFile && a.isTerminal(f)
 	if tty {
 		fmt.Fprintf(a.stderr, "Token for %s (not shown): ", full)
-		if err := stty(f, "-echo"); err == nil {
-			defer func() {
-				_ = stty(f, "echo")
-				fmt.Fprintln(a.stderr)
-			}()
+		if err := a.setEcho(f, "-echo"); err != nil {
+			fmt.Fprintln(a.stderr)
+			return "", fmt.Errorf("cannot disable terminal echo; refusing to read the token: %v", err)
+		}
+		defer func() {
+			restoreErr := a.setEcho(f, "echo")
+			fmt.Fprintln(a.stderr)
+			if restoreErr != nil {
+				// The token was typed without echo, so it is still safe to use.
+				fmt.Fprintf(a.stderr, "agentcfg: warning: could not turn terminal echo back on (%v); run: stty echo\n", restoreErr)
+			}
+		}()
+	}
+	return readTokenValue(a.stdin, tty)
+}
+
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+func readTokenValue(r io.Reader, terminal bool) (string, error) {
+	var raw []byte
+	if terminal {
+		line, err := bufio.NewReader(io.LimitReader(r, maxTokenBytes+3)).ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", fmt.Errorf("reading token: %v", err)
+		}
+		raw = []byte(line)
+	} else {
+		var err error
+		raw, err = io.ReadAll(io.LimitReader(r, maxTokenBytes+3))
+		if err != nil {
+			return "", fmt.Errorf("reading token: %v", err)
 		}
 	}
-	line, err := bufio.NewReader(io.LimitReader(a.stdin, 8192)).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return "", fmt.Errorf("reading token: %v", err)
+	if len(raw) > maxTokenBytes+2 {
+		return "", fmt.Errorf("token exceeds %d bytes", maxTokenBytes)
 	}
-	return strings.TrimSpace(line), nil
+	value := strings.TrimSuffix(string(raw), "\n")
+	value = strings.TrimSuffix(value, "\r")
+	if len(value) > maxTokenBytes {
+		return "", fmt.Errorf("token exceeds %d bytes", maxTokenBytes)
+	}
+	return value, nil
 }
 
 func stty(f *os.File, arg string) error {
@@ -325,6 +390,9 @@ func (a *app) cmdRm(args []string) error {
 	if err := a.only("rm", args, 1, "<name.env>"); err != nil {
 		return err
 	}
+	if _, _, err := cfg.SplitFull(args[0]); err != nil {
+		return usageError(err.Error())
+	}
 	res, err := a.store.Remove("", args[0])
 	if err != nil {
 		return err
@@ -336,6 +404,9 @@ func (a *app) cmdRm(args []string) error {
 func (a *app) cmdTest(args []string) error {
 	if err := a.only("test", args, 1, "<name.env>"); err != nil {
 		return err
+	}
+	if _, _, err := cfg.SplitFull(args[0]); err != nil {
+		return usageError(err.Error())
 	}
 	r := a.store.Test(args[0], "agentcfg/"+Version, 10*time.Second)
 	if !r.OK {

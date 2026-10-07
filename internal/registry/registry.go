@@ -163,7 +163,9 @@ func Parse(path string, data []byte) (*Registry, error) {
 			if err != nil {
 				return nil, fmt.Errorf("[%s.%s] in %s: %v", name, env, path, err)
 			}
-			if _, hasToken := loose["token"]; hasToken && et.TokenRef != "" {
+			_, hasToken := loose["token"]
+			_, hasTokenRef := loose["token_ref"]
+			if hasToken && hasTokenRef {
 				return nil, fmt.Errorf("[%s.%s] in %s: set token or token_ref, not both", name, env, path)
 			}
 			svc := Service{
@@ -174,7 +176,7 @@ func Parse(path string, data []byte) (*Registry, error) {
 				TokenRef: et.TokenRef,
 				Meta:     metas[name],
 			}
-			if et.TokenRef != "" {
+			if hasTokenRef {
 				if _, err := keychain.ParseRef(et.TokenRef); err != nil {
 					return nil, fmt.Errorf("[%s.%s] in %s: %v", name, env, path, err)
 				}

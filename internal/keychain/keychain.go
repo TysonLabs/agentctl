@@ -53,10 +53,12 @@ func ValidAccount(a string) bool { return accountRe.MatchString(a) }
 func ParseRef(ref string) (string, error) {
 	acct, ok := strings.CutPrefix(ref, RefPrefix)
 	if !ok {
-		return "", fmt.Errorf("token_ref must look like %q, got %q", RefPrefix+"<name>.<env>", ref)
+		// Do not quote ref: a user can accidentally paste the bearer token in
+		// token_ref, and registry parse errors are safe to print.
+		return "", fmt.Errorf("token_ref must look like %q", RefPrefix+"<name>.<env>")
 	}
 	if !ValidAccount(acct) {
-		return "", fmt.Errorf("token_ref account %q must be <name>.<env> (letters, digits, _ and -)", acct)
+		return "", errors.New("token_ref account must be <name>.<env> (letters, digits, _ and -)")
 	}
 	return acct, nil
 }
