@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/TysonLabs/agentctl/internal/configpath"
 	"github.com/TysonLabs/agentctl/internal/keychain"
 )
 
@@ -46,19 +46,7 @@ token    = "REPLACE_ME"
 `
 
 // ResolvePath picks the config path: --config flag > AGENTCTL_CONFIG > default.
-func ResolvePath(flagVal string) string {
-	if flagVal != "" {
-		return flagVal
-	}
-	if p := os.Getenv("AGENTCTL_CONFIG"); p != "" {
-		return p
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = "."
-	}
-	return filepath.Join(home, ".config", "agentctl", "services.toml")
-}
+func ResolvePath(flagVal string) string { return configpath.Resolve(flagVal) }
 
 // reservedTables are per-service tables that are not environments. agentctl
 // reads [name.meta]; [name.announce] belongs to agentflow (it holds a Slack

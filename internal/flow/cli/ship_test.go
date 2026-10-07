@@ -129,3 +129,71 @@ func TestShipVerifyUsageErrors(t *testing.T) {
 		t.Errorf("-- terminator: exit %d stderr %q", code, errOut)
 	}
 }
+
+func TestShipAnnounceChainsFromVerify(t *testing.T) {
+	fakeAgentctl(t)
+	dir := t.TempDir()
+	t.Chdir(dir)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(dir, "state"))
+	cfg := filepath.Join(dir, "services.toml")
+	if err := os.WriteFile(cfg, []byte("[rcx.prod]\nbase_url = \"https://rcx.example.com\"\ntoken = \"REPLACE_ME\"\n\n"+
+		"[rcx.announce]\nwebhook = \"https://hooks.slack.com/services/T0FAKE1/B0FAKE1/fakeSecretPart123\"\nchannel = \"#rcx-releases\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENTCTL_CONFIG", cfg)
+
+	code, out, _ := run(t, "ship", "verify", "rcx.prod", "--sha", "f316cb0f", "--once")
+	var v struct {
+		Status    string
+		CheckedAt string `json:"checked_at"`
+	}
+	if err := json.Unmarshal([]byte(out), &v); code != 0 || err != nil || v.CheckedAt == "" {
+		t.Fatalf("verify: exit %d, %q (%v)", code, out, err)
+	}
+	proof := filepath.Join(dir, "verify.json")
+	body := filepath.Join(dir, "note.md")
+	_ = os.WriteFile(proof, []byte(out), 0o600)
+	_ = os.WriteFile(body, []byte("What changed: x.\nHow to test: y."), 0o600)
+
+	code, out, errOut := run(t, "ship", "announce", "rcx.prod", "--verified", proof, "--title", "T", "--body-file", body, "--dry-run")
+	var a struct {
+		Status, Channel string
+		Payload         json.RawMessage
+	}
+	if err := json.Unmarshal([]byte(out), &a); code != 0 || err != nil || a.Status != "dry_run" || a.Channel != "#rcx-releases" || len(a.Payload) == 0 {
+		t.Fatalf("dry run: exit %d stdout %q stderr %q", code, out, errOut)
+	}
+	if strings.Contains(out+errOut, "fakeSecretPart123") {
+		t.Errorf("output leaks the webhook")
+	}
+
+	// A not-deployed verify is no proof.
+	_, notYet, _ := run(t, "ship", "verify", "rcx.prod", "--sha", "1111111", "--once")
+	_ = os.WriteFile(proof, []byte(notYet), 0o600)
+	if code, _, errOut := run(t, "ship", "announce", "rcx.prod", "--verified", proof, "--title", "T", "--body-file", body, "--dry-run"); code != 2 || !strings.Contains(errOut, "no proof") {
+		t.Errorf("unverified: exit %d stderr %q, want 2", code, errOut)
+	}
+}
+
+func TestShipAnnounceUsageErrors(t *testing.T) {
+	dir := t.TempDir()
+	body := filepath.Join(dir, "note.md")
+	_ = os.WriteFile(body, []byte("x"), 0o600)
+	cases := []struct {
+		args    []string
+		wantErr string
+	}{
+		{[]string{"ship", "announce", "--verified", body, "--title", "T", "--body-file", body}, "exactly one service"},
+		{[]string{"ship", "announce", "rcx.prod", "--title", "T", "--body-file", body}, "are required"},
+		{[]string{"ship", "announce", "rcx.prod", "--verified", body, "--title", "T", "--body-file", body}, "not ship verify JSON"},
+		{[]string{"ship", "announce", "rcx.prod", "--verified", "/no/such", "--title", "T", "--body-file", body}, "reading --verified"},
+		{[]string{"ship", "announce", "rcx.prod", "--verified", body, "--title", "T", "--body-file", body, "--max-age", "0s"}, "must be positive"},
+	}
+	for _, c := range cases {
+		t.Run(strings.Join(c.args[2:], " "), func(t *testing.T) {
+			if code, _, errOut := run(t, c.args...); code != 1 || !strings.Contains(errOut, c.wantErr) {
+				t.Errorf("exit %d stderr %q, want 1 and %q", code, errOut, c.wantErr)
+			}
+		})
+	}
+}

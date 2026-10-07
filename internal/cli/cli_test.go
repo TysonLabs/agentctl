@@ -427,17 +427,24 @@ func TestBadFlag(t *testing.T) {
 	}
 }
 
-// TestSourceGuardGetOnly greps all non-test Go sources for mutating HTTP
-// verbs — the codebase must contain GET only.
+// TestSourceGuardGetOnly greps agentctl's non-test Go sources for mutating
+// HTTP verbs — agentctl must contain GET only. The other binaries' code
+// (agentflow posts to Slack; agentcfg serves its settings page) is skipped:
+// internal/flow/boundary_test.go proves agentctl never imports it.
 func TestSourceGuardGetOnly(t *testing.T) {
 	root := "../.."
+	otherBinaries := map[string]bool{
+		filepath.Join(root, "cmd"):              true,
+		filepath.Join(root, "internal", "flow"): true,
+		filepath.Join(root, "internal", "cfg"):  true,
+	}
 	bad := regexp.MustCompile(`MethodPost|MethodPut|MethodDelete|MethodPatch|"POST"|"PUT"|"DELETE"|"PATCH"`)
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() {
-			if info.Name() == ".git" || info.Name() == "bin" {
+			if info.Name() == ".git" || info.Name() == "bin" || info.Name() == ".claude" || otherBinaries[path] {
 				return filepath.SkipDir
 			}
 			return nil

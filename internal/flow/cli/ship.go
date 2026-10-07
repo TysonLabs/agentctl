@@ -13,10 +13,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/TysonLabs/agentctl/internal/configpath"
 	"github.com/TysonLabs/agentctl/internal/flow/ship"
 )
 
 const shipUsage = `agentflow ship verify <service.env> --sha REV [flags]
+agentflow ship announce <service.env> --verified FILE --title TEXT --body-file FILE [flags]
+
+verify:
 
 Wait until a deployed service runs REV, read through agentctl's /agent/version.
 
@@ -36,7 +40,38 @@ restarts are retried; a version with no recognizable commit fails at once.
 Output: a JSON result on stdout. Exit codes: 0 deployed · 1 usage/agentctl
 error · 2 not deployed (--once) · 3 version unreadable · 124 timeout
 · 130 interrupted.
+
+announce: post a verified deploy to the service's Slack channel, once per
+service.env and commit. The channel is an incoming webhook in services.toml:
+
+  [myservice.announce]
+  webhook = "https://hooks.slack.com/services/..."   # a secret, never printed
+  channel = "#myservice-releases"                     # label for output
+  envs    = ["prod"]                                  # default ["prod"]
+
+  --verified FILE    the JSON from ship verify for this deploy (required);
+                     it must say deployed, for this service, within --max-age
+  --title TEXT       one line, plain text
+  --body-file FILE   plain language: what changed and how to test it
+  --pr-url URL       optional https://github.com/<owner>/<repo>/pull/<n>
+  --max-age DUR      how old the verify may be (default 1h)
+  --dry-run          print the Slack payload, post nothing
+  --force            post again although this commit was announced
+  --config PATH      services.toml (default: $AGENTCTL_CONFIG, then
+                     ~/.config/agentctl/services.toml)
+
+The body is scrubbed of secrets and Slack mentions. Exit codes: 0 posted
+(or dry run) · 1 usage error · 2 refused (no proof, env not enabled, bad
+config) · 3 already announced · 4 Slack error · 130 interrupted.
 `
+
+var announceExitCodes = map[ship.AnnounceStatus]int{
+	ship.AnnouncePosted:     0,
+	ship.AnnounceDryRun:     0,
+	ship.AnnounceRefused:    2,
+	ship.AnnounceAlready:    3,
+	ship.AnnounceSlackError: 4,
+}
 
 var shipExitCodes = map[ship.Status]int{
 	ship.StatusDeployed:    0,
@@ -51,6 +86,9 @@ func runShip(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
 		fmt.Fprint(stdout, shipUsage)
 		return 0
+	}
+	if args[0] == "announce" {
+		return runAnnounce(ctx, args[1:], stdout, stderr)
 	}
 	if args[0] != "verify" {
 		fmt.Fprintf(stderr, "agentflow ship: unknown subcommand %q\n\n%s", args[0], shipUsage)
@@ -142,6 +180,79 @@ func runShip(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	if code != 0 {
 		fmt.Fprintf(stderr, "agentflow ship verify: %s: %s\n", res.Status, res.Error)
+	}
+	return code
+}
+
+func runAnnounce(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fail := func(format string, a ...any) int {
+		fmt.Fprintf(stderr, "agentflow ship announce: "+format+"\n", a...)
+		return 1
+	}
+	fs := flag.NewFlagSet("agentflow ship announce", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var (
+		verified, bodyFile, config string
+		o                          ship.AnnounceOptions
+	)
+	fs.StringVar(&verified, "verified", "", "")
+	fs.StringVar(&o.Title, "title", "", "")
+	fs.StringVar(&bodyFile, "body-file", "", "")
+	fs.StringVar(&o.PRURL, "pr-url", "", "")
+	fs.DurationVar(&o.MaxAge, "max-age", time.Hour, "")
+	fs.BoolVar(&o.DryRun, "dry-run", false, "")
+	fs.BoolVar(&o.Force, "force", false, "")
+	fs.StringVar(&config, "config", "", "")
+	pos, err := parseInterleaved(fs, args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(stdout, shipUsage)
+			return 0
+		}
+		return fail("%v (see: agentflow ship --help)", err)
+	}
+	if len(pos) != 1 {
+		return fail("want exactly one service.env (e.g. recursivecx.prod), got %d", len(pos))
+	}
+	o.Service = pos[0]
+	if verified == "" || o.Title == "" || bodyFile == "" {
+		return fail("--verified, --title and --body-file are required")
+	}
+	if o.MaxAge <= 0 {
+		return fail("--max-age must be positive")
+	}
+	pb, err := os.ReadFile(verified)
+	if err != nil {
+		return fail("reading --verified: %v", err)
+	}
+	if err := json.Unmarshal(pb, &o.Proof); err != nil {
+		return fail("--verified %s is not ship verify JSON: %v", verified, err)
+	}
+	body, err := os.ReadFile(bodyFile)
+	if err != nil {
+		return fail("reading --body-file: %v", err)
+	}
+	o.Body = string(body)
+	o.ConfigPath = configpath.Resolve(config)
+	o.StatePath = ship.DefaultStatePath()
+	o.Post = ship.SlackPost(15 * time.Second)
+
+	res := ship.Announce(ctx, o)
+	if ctx.Err() != nil && res.Status == ship.AnnounceSlackError {
+		res.Error = "interrupted"
+	}
+	out, _ := json.MarshalIndent(res, "", "  ")
+	_, _ = stdout.Write(append(out, '\n'))
+	if ctx.Err() != nil && res.Status == ship.AnnounceSlackError {
+		return 130
+	}
+	code, ok := announceExitCodes[res.Status]
+	if !ok {
+		fmt.Fprintf(stderr, "agentflow ship announce: unknown result status %q\n", res.Status)
+		return 1
+	}
+	if res.Error != "" {
+		fmt.Fprintf(stderr, "agentflow ship announce: %s: %s\n", res.Status, res.Error)
 	}
 	return code
 }
