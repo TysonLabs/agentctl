@@ -326,3 +326,10 @@ func TestServeLoopbackAndIdle(t *testing.T) {
 		t.Fatal("server did not stop when idle")
 	}
 }
+
+func TestServeRejectsNonPositiveIdle(t *testing.T) {
+	err := Serve(Options{Store: &cfg.Store{Path: filepath.Join(t.TempDir(), "s.toml")}, Idle: 0, Stdout: io.Discard})
+	if err == nil {
+		t.Fatal("Serve accepted a zero idle timeout")
+	}
+}

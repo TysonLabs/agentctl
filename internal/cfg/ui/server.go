@@ -70,6 +70,9 @@ type server struct {
 // Serve runs the settings page until it is idle for opts.Idle or the page
 // asks it to quit.
 func Serve(opts Options) error {
+	if opts.Idle <= 0 {
+		return errors.New("idle timeout must be positive")
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return fmt.Errorf("listening on 127.0.0.1: %v", err)
