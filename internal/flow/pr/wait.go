@@ -175,7 +175,10 @@ func verdict(snap snapshot, res *Result) (Status, string, bool) {
 		}
 		return StatusClean, "", true
 	}
-	if inProgress && snap.state == "OPEN" {
+	if snap.state != "OPEN" {
+		return StatusClosed, "nothing to wait for: the PR is " + strings.ToLower(snap.state) + " and CodeRabbit never reviewed its head", true
+	}
+	if inProgress {
 		return "", "", false // a round is running: older skip/limit text is stale
 	}
 	if rateRe.MatchString(snap.summary) {
@@ -183,9 +186,6 @@ func verdict(snap snapshot, res *Result) (Status, string, bool) {
 	}
 	if snap.draft || skippedRe.MatchString(snap.summary) {
 		return StatusSkipped, reReview + " (or mark the PR ready for review)", true
-	}
-	if snap.state != "OPEN" {
-		return StatusClosed, "nothing to wait for: the PR is " + strings.ToLower(snap.state) + " and CodeRabbit never reviewed its head", true
 	}
 	return "", "", false
 }
@@ -223,7 +223,7 @@ func read(ctx context.Context, o Options) (snapshot, error) {
 	for _, page := range pages {
 		for _, c := range page {
 			// The bot keeps one summary comment and edits it; take the last match.
-			if strings.Contains(strings.ToLower(c.User.Login), "coderabbit") && summaryRe.MatchString(c.Body) {
+			if strings.EqualFold(c.User.Login, "coderabbitai[bot]") && summaryRe.MatchString(c.Body) {
 				snap.summary = c.Body
 			}
 		}
@@ -245,10 +245,10 @@ const threadsQuery = `query($o:String!,$n:String!,$p:Int!){repository(owner:$o,n
 func parseThreads(out []byte) ([]Thread, bool, error) {
 	var doc struct {
 		Data struct {
-			Repository struct {
-				PullRequest struct {
-					ReviewThreads struct {
-						PageInfo struct {
+			Repository *struct {
+				PullRequest *struct {
+					ReviewThreads *struct {
+						PageInfo *struct {
 							HasNextPage bool `json:"hasNextPage"`
 						} `json:"pageInfo"`
 						Nodes []struct {
@@ -281,14 +281,20 @@ func parseThreads(out []byte) ([]Thread, bool, error) {
 	if len(doc.Errors) > 0 {
 		return nil, false, fmt.Errorf("gh api graphql: %s", doc.Errors[0].Message)
 	}
+	if doc.Data.Repository == nil || doc.Data.Repository.PullRequest == nil || doc.Data.Repository.PullRequest.ReviewThreads == nil {
+		return nil, false, fmt.Errorf("gh api graphql: response has no reviewThreads")
+	}
 	rt := doc.Data.Repository.PullRequest.ReviewThreads
+	if rt.PageInfo == nil || rt.Nodes == nil {
+		return nil, false, fmt.Errorf("gh api graphql: incomplete reviewThreads response")
+	}
 	threads := []Thread{}
 	for _, n := range rt.Nodes {
 		if n.IsResolved || len(n.Comments.Nodes) == 0 {
 			continue
 		}
 		c := n.Comments.Nodes[0]
-		if !strings.Contains(strings.ToLower(c.Author.Login), "coderabbit") {
+		if !strings.EqualFold(c.Author.Login, "coderabbitai") {
 			continue
 		}
 		t := Thread{ID: n.ID, Path: c.Path, URL: c.URL, Excerpt: excerpt(c.Body)}

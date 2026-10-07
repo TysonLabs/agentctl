@@ -123,6 +123,13 @@ func TestInProgressWaits(t *testing.T) {
 	}
 }
 
+func TestReviewedHeadOverridesStaleLimitAndSkipText(t *testing.T) {
+	summary := "Rate limit exceeded\nReview skipped earlier\n" + covered(head)
+	if r := run(&fake{summary: summary}, true); r.Status != StatusClean {
+		t.Fatalf("got %+v", r)
+	}
+}
+
 func TestSkippedRateLimitedClosed(t *testing.T) {
 	cases := []struct {
 		f    *fake
@@ -132,6 +139,8 @@ func TestSkippedRateLimitedClosed(t *testing.T) {
 		{&fake{draft: true}, StatusSkipped},
 		{&fake{summary: "> [!WARNING]\n> ## Rate limit exceeded\n> wait 12 minutes"}, StatusRateLimited},
 		{&fake{state: "MERGED"}, StatusClosed},
+		{&fake{state: "MERGED", summary: "Rate limit exceeded"}, StatusClosed},
+		{&fake{state: "CLOSED", summary: "Review skipped", draft: true}, StatusClosed},
 		{&fake{state: "MERGED", summary: covered(head), threads: threeThreads}, StatusOpenThreads}, // merged, still reviewed
 	}
 	for i, c := range cases {
@@ -148,7 +157,39 @@ func TestSummaryOnALaterPage(t *testing.T) {
 	}
 	page1[3] = bot(covered(older)) // an older summary early on
 	f := &fake{pages: [][]map[string]any{page1, {bot(covered(head))}}}
-	if r := run(f, true); r.Status != StatusClean {
+	var sawPaginatedComments, sawBoundedThreads bool
+	gh := func(ctx context.Context, args ...string) ([]byte, error) {
+		joined := strings.Join(args, " ")
+		if strings.Contains(joined, "/issues/7/comments?per_page=100") {
+			sawPaginatedComments = strings.Contains(joined, "--paginate") && strings.Contains(joined, "--slurp")
+		}
+		if len(args) > 1 && args[0] == "api" && args[1] == "graphql" {
+			sawBoundedThreads = strings.Contains(joined, "reviewThreads(first:100)") && strings.Contains(joined, "pageInfo{hasNextPage}")
+		}
+		return f.gh(ctx, args...)
+	}
+	r := Wait(context.Background(), Options{Repo: "o/r", PR: 7, Once: true, GH: gh})
+	if r.Status != StatusClean || !sawPaginatedComments || !sawBoundedThreads {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+func TestOnlyCodeRabbitBotCommentCanBeTheSummary(t *testing.T) {
+	f := &fake{pages: [][]map[string]any{{
+		{"user": map[string]any{"login": "coderabbit-helper"}, "body": covered(head)},
+		bot(covered(older)),
+	}}}
+	if r := run(f, true); r.Status != StatusWaiting || r.Reviewed != older {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+func TestOnlyCodeRabbitCanOpenACodeRabbitThread(t *testing.T) {
+	threads := `{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":[
+ {"id":"PRRT_impostor","isResolved":false,"comments":{"nodes":[{"author":{"login":"coderabbit-helper"},"path":"a.go","line":12,"url":"https://x/1","body":"not the bot"}]}}
+]}}}}}`
+	r := run(&fake{summary: covered(head), threads: threads}, true)
+	if r.Status != StatusClean || len(r.OpenThreads) != 0 {
 		t.Fatalf("got %+v", r)
 	}
 }
@@ -185,12 +226,50 @@ func TestTimeout(t *testing.T) {
 	}
 }
 
-func TestInterrupted(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	r := Wait(ctx, Options{Repo: "o/r", PR: 7, Timeout: time.Second, Interval: time.Millisecond, GH: (&fake{}).gh})
-	if r.Status != StatusInterrupted {
+func TestTimeoutCancelsInflightGH(t *testing.T) {
+	gh := func(ctx context.Context, _ ...string) ([]byte, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	start := time.Now()
+	r := Wait(context.Background(), Options{Repo: "o/r", PR: 7, Timeout: 30 * time.Millisecond, Interval: time.Millisecond, GH: gh})
+	if r.Status != StatusTimeout || time.Since(start) > 250*time.Millisecond {
+		t.Fatalf("got %+v after %s", r, time.Since(start))
+	}
+}
+
+func TestLateCleanDoesNotBeatDeadline(t *testing.T) {
+	f := &fake{summary: covered(head)}
+	gh := func(ctx context.Context, args ...string) ([]byte, error) {
+		if args[0] == "pr" {
+			time.Sleep(50 * time.Millisecond) // deliberately ignores cancellation
+		}
+		return f.gh(ctx, args...)
+	}
+	r := Wait(context.Background(), Options{Repo: "o/r", PR: 7, Timeout: 20 * time.Millisecond, Interval: time.Millisecond, GH: gh})
+	if r.Status != StatusTimeout {
 		t.Fatalf("got %+v", r)
+	}
+}
+
+func TestInterrupted(t *testing.T) {
+	for _, duringCall := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(context.Background())
+		gh := (&fake{}).gh
+		if duringCall {
+			gh = func(callCtx context.Context, _ ...string) ([]byte, error) {
+				<-callCtx.Done()
+				return nil, callCtx.Err()
+			}
+			time.AfterFunc(20*time.Millisecond, cancel)
+		} else {
+			cancel()
+		}
+		r := Wait(ctx, Options{Repo: "o/r", PR: 7, Timeout: time.Second, Interval: time.Millisecond, GH: gh})
+		if r.Status != StatusInterrupted {
+			t.Errorf("duringCall=%v: got %+v", duringCall, r)
+		}
+		cancel()
 	}
 }
 
@@ -198,5 +277,19 @@ func TestGraphQLErrorsAreErrors(t *testing.T) {
 	r := run(&fake{summary: covered(head), threads: `{"errors":[{"message":"Could not resolve to a PullRequest"}]}`}, true)
 	if r.Status != StatusGHError || !strings.Contains(r.Error, "Could not resolve") {
 		t.Fatalf("got %+v", r)
+	}
+}
+
+func TestMissingGraphQLThreadDataIsAnError(t *testing.T) {
+	for _, response := range []string{
+		`{}`,
+		`{"data":{"repository":null}}`,
+		`{"data":{"repository":{"pullRequest":null}}}`,
+		`{"data":{"repository":{"pullRequest":{"reviewThreads":{}}}}}`,
+	} {
+		r := run(&fake{summary: covered(head), threads: response}, true)
+		if r.Status != StatusGHError || !strings.Contains(r.Error, "reviewThreads") {
+			t.Errorf("response %s: got %+v", response, r)
+		}
 	}
 }
