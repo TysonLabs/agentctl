@@ -59,6 +59,40 @@ posted the reply but failed to resolve can simply be repeated.
 Exit codes: 0 replied and resolved (or already done) · 1 usage or gh error,
 nothing posted · 2 refused, nothing posted · 3 replied but not resolved
 (run it again) · 130 interrupted, nothing posted.
+
+agentflow pr merge <number> [flags]
+
+Merge a pull request only when it is ready, pinned to the head commit it
+just read, and report the merge commit. Readiness is read immediately before
+the merge: the PR is open, not a draft, mergeable (an UNKNOWN state is
+re-read for up to 30s, then refused), has a known base branch that does not
+use a merge queue (gh would queue the PR or enable auto-merge instead of
+merging), and has no unresolved review thread from any author (every page
+read).
+
+  --repo OWNER/NAME     GitHub repository (default: the current directory's,
+                        from gh; never guessed)
+  --method M            merge, squash or rebase (default merge)
+  --head SHA            refuse unless the PR head is this full commit sha
+  --admin               pass --admin to gh pr merge (bypass branch rules)
+  --sync-branch BRANCH  after the merge, fast-forward BRANCH to the base
+                        branch's head on GitHub; never forced
+
+It never deletes branches (gh's --delete-branch also switches and deletes
+local ones; use agentflow worktree done) and never enables auto-merge.
+
+Output: a JSON result on stdout with "merge_sha" (for agentflow ship verify
+--sha), "reasons" when refused, "sync" when --sync-branch is given, and
+"auto_merge" when GitHub holds an auto-merge request for the PR.
+
+After the merge call, the PR is read back for up to 20s. Only a MERGED PR
+whose head is the pinned commit counts as merged; anything else, including
+a failed merge call, is "unconfirmed" (exit 4), never "nothing merged".
+
+Exit codes: 0 merged (and synced) · 1 usage or gh error before the merge
+call, nothing merged · 2 refused, nothing changed · 3 merged, sync refused
+or failed · 4 the merge call ran but its outcome was not confirmed · 130
+interrupted before the merge.
 `
 
 var prExitCodes = map[pr.Status]int{
@@ -84,6 +118,8 @@ func runPR(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	case "wait":
 	case "reply":
 		return runPRReply(ctx, args[1:], stdout, stderr)
+	case "merge":
+		return runPRMerge(ctx, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "agentflow pr: unknown subcommand %q\n\n%s", args[0], prUsage)
 		return 1

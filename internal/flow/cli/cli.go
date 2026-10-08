@@ -1,7 +1,7 @@
 // Package cli implements the agentflow command dispatch. Exit codes are
 // assigned in this package and nowhere else, one table per command
 // (exitCodes for codex, shipExitCodes for ship verify, prExitCodes for pr
-// wait, replyExitCodes for pr reply). 0 is success, 1 a
+// wait, replyExitCodes for pr reply, prMergeExitCodes for pr merge). 0 is success, 1 a
 // usage or precondition error, 124 a timeout and 130 an interruption for
 // every command.
 package cli
@@ -40,6 +40,8 @@ Usage:
                                                list open threads (see: agentflow pr --help)
   agentflow pr reply <thread-id> --fixed SHA --note TEXT | --keep REASON
                                                reply to a review thread, then resolve it
+  agentflow pr merge <number> [--sync-branch B] merge a ready PR pinned to its head;
+                                               report the merge sha
   agentflow worktree done <branch|path>        remove a merged, clean, unused worktree
   agentflow worktree sweep [--yes]             list (or remove) every such worktree
                                                (see: agentflow worktree --help)
