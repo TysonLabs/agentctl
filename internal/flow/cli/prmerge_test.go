@@ -21,6 +21,7 @@ func TestPRMergeUsageErrors(t *testing.T) {
 		{[]string{"pr", "merge", "7", "--head", "abc123"}, "full 40-character"},
 		{[]string{"pr", "merge", "7", "--sync-branch", "-x"}, "plain branch name"},
 		{[]string{"pr", "merge", "7", "--sync-branch", "a/../b"}, "plain branch name"},
+		{[]string{"pr", "merge", "7", "--sync-branch", "a..b"}, "plain branch name"},
 		{[]string{"pr", "merge", "7", "--sync-branch", "a b"}, "plain branch name"},
 		{[]string{"pr", "merge", "7", "--repo", "nope"}, "not OWNER/NAME"},
 		{[]string{"pr", "merge", "7", "--repo", "./repo"}, "not OWNER/NAME"},

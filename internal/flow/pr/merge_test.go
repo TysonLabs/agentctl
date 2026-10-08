@@ -446,3 +446,16 @@ func TestMergeRefusesMissingBase(t *testing.T) {
 		t.Fatalf("got %s %v", r.Status, r.Reasons)
 	}
 }
+
+func TestValidBranch(t *testing.T) {
+	for _, ok := range []string{"development", "release/1.2", "a_b-c.d"} {
+		if !ValidBranch(ok) {
+			t.Errorf("%q refused", ok)
+		}
+	}
+	for _, bad := range []string{"", "a..b", "a/../b", "-x", ".x", "a//b", "a b", "a/"} {
+		if ValidBranch(bad) {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}

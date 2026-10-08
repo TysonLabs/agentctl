@@ -69,10 +69,16 @@ type MergeResult struct {
 	Error     string      `json:"error,omitempty"`
 }
 
-// BranchRe is the branch-name grammar accepted for --sync-branch: it goes
-// into a REST path, so every segment starts with a letter, digit or "_"
-// (no leading "-" or "."), and no "..", no empty segment, no spaces.
-var BranchRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$`)
+// branchRe is the character grammar for --sync-branch: it goes into a REST
+// path, so every segment starts with a letter, digit or "_" (no leading "-"
+// or "."), with no empty segment and no spaces. ValidBranch adds the rest.
+var branchRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$`)
+
+// ValidBranch reports whether name is a branch name --sync-branch accepts:
+// branchRe's grammar and no "..", which git refuses in a ref name.
+func ValidBranch(name string) bool {
+	return branchRe.MatchString(name) && !strings.Contains(name, "..")
+}
 
 var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 

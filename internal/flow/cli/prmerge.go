@@ -68,7 +68,7 @@ func runPRMerge(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	if o.Head != "" && !fullSHARe.MatchString(o.Head) {
 		return fail("--head %q is not a full 40-character commit sha", o.Head)
 	}
-	if o.SyncBranch != "" && (!pr.BranchRe.MatchString(o.SyncBranch) || strings.Contains(o.SyncBranch, "..")) {
+	if o.SyncBranch != "" && !pr.ValidBranch(o.SyncBranch) {
 		return fail("--sync-branch %q is not a plain branch name", o.SyncBranch)
 	}
 	bin := os.Getenv("AGENTFLOW_GH")
