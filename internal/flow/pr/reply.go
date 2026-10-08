@@ -3,6 +3,7 @@ package pr
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -15,7 +16,7 @@ type ReplyStatus string
 const (
 	ReplyDone        ReplyStatus = "done"         // the thread carries the reply and is resolved
 	ReplyRefused     ReplyStatus = "refused"      // a check failed; nothing was posted
-	ReplyNotResolved ReplyStatus = "not_resolved" // the reply is posted, the resolve failed: run it again
+	ReplyNotResolved ReplyStatus = "not_resolved" // the reply may be posted, but resolution is not verified: run it again
 	ReplyGHError     ReplyStatus = "gh_error"     // gh failed before anything was posted
 	ReplyInterrupted ReplyStatus = "interrupted"  // cancelled before anything was posted
 )
@@ -81,7 +82,7 @@ func ValidateReply(o ReplyOptions) error {
 
 const threadQuery = `query($t:ID!){node(id:$t){__typename ... on PullRequestReviewThread{` +
 	`isResolved viewerCanReply pullRequest{number repository{nameWithOwner}} ` +
-	`comments(last:100){pageInfo{hasPreviousPage} nodes{viewerDidAuthor body}}}}}`
+	`comments(last:100){pageInfo{hasPreviousPage} nodes{viewerDidAuthor body url}}}}}`
 
 const replyMutation = `mutation($t:ID!,$b:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$t,body:$b}){comment{id url}}}`
 
@@ -94,8 +95,11 @@ type threadState struct {
 	resolved    bool
 	canReply    bool
 	hasOurReply bool // the viewer already posted exactly this body
+	ourReplyURL string
 	complete    bool // every comment was read (no earlier page)
 }
+
+var errNotReviewThread = errors.New("not a pull request review thread")
 
 // Reply posts the reply to a review thread, then resolves it. A thread that
 // already carries the viewer's identical reply is not replied to again, so a
@@ -115,14 +119,48 @@ func Reply(ctx context.Context, o ReplyOptions) ReplyResult {
 		return finish(ReplyInterrupted, "", "interrupted")
 	}
 	if err != nil {
+		if errors.Is(err, errNotReviewThread) {
+			return finish(ReplyRefused, "", err.Error())
+		}
 		return finish(ReplyGHError, "", err.Error())
 	}
 	res.Repo, res.PR = st.repo, st.pr
 	if o.Repo != "" && !strings.EqualFold(o.Repo, st.repo) {
 		return finish(ReplyRefused, "", fmt.Sprintf("thread belongs to %s, not --repo %s", st.repo, o.Repo))
 	}
-	if st.resolved && st.hasOurReply {
-		return finish(ReplyDone, "", "") // a repeated run: nothing left to do
+
+	resolve := func(rctx context.Context) ReplyResult {
+		out, callErr := o.GH(rctx, "api", "graphql", "-F", "t="+o.Thread, "-f", "query="+resolveMutation)
+		if resolveErr := parseResolve(out, callErr); resolveErr != nil {
+			// The mutation can land even when gh loses the response. Read the
+			// thread back before claiming that it remains unresolved.
+			verified, verifyErr := readThread(rctx, o.GH, o.Thread, res.Body)
+			if verifyErr == nil && verified.resolved {
+				res.Resolved = true
+				return finish(ReplyDone, "", "")
+			}
+			msg := resolveErr.Error()
+			if verifyErr != nil {
+				msg += "; could not verify the thread state: " + verifyErr.Error()
+			}
+			return finish(ReplyNotResolved, "run the same command again: it resolves without replying twice", msg)
+		}
+		res.Resolved = true
+		return finish(ReplyDone, "", "")
+	}
+	resolveDetached := func() ReplyResult {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+		defer cancel()
+		return resolve(rctx)
+	}
+
+	if st.hasOurReply {
+		if st.resolved {
+			return finish(ReplyDone, "", "") // a repeated run: nothing left to do
+		}
+		// The original run checked the commit before it posted. Do not let a
+		// later force-push or transient commit lookup strand a replied thread.
+		return resolveDetached()
 	}
 	if o.Fixed != "" {
 		// Fail closed on a sha GitHub can't see: an unpushed or mistyped fix
@@ -131,41 +169,58 @@ func Reply(ctx context.Context, o ReplyOptions) ReplyResult {
 			if ctx.Err() != nil {
 				return finish(ReplyInterrupted, "", "interrupted")
 			}
-			return finish(ReplyRefused, "push the fix commit first", fmt.Sprintf("commit %s is not in %s: %v", o.Fixed, st.repo, err))
+			if missingCommit(err) {
+				return finish(ReplyRefused, "push the fix commit first", fmt.Sprintf("commit %s is not in %s: %v", o.Fixed, st.repo, err))
+			}
+			return finish(ReplyGHError, "", fmt.Sprintf("checking commit %s in %s: %v", o.Fixed, st.repo, err))
 		}
 	}
-	if !st.hasOurReply {
-		if !st.complete {
-			// An earlier page could hold our reply; posting again would duplicate it.
-			return finish(ReplyRefused, "reply and resolve this thread by hand", "the thread has more than 100 comments; cannot rule out an existing reply")
-		}
-		if !st.canReply {
-			return finish(ReplyRefused, "", "GitHub says you cannot reply to this thread (locked, or no write access)")
-		}
-		if ctx.Err() != nil {
-			return finish(ReplyInterrupted, "", "interrupted")
-		}
-		out, err := o.GH(ctx, "api", "graphql", "-F", "t="+o.Thread, "-f", "b="+res.Body, "-f", "query="+replyMutation)
-		url, perr := parseReply(out, err)
-		if perr != nil {
-			// The mutation may have landed before the error; a rerun checks.
-			return finish(ReplyGHError, "run the same command again: it will not post a second reply", perr.Error())
-		}
-		res.Replied, res.ReplyURL = true, url
+	if !st.complete {
+		// An earlier page could hold our reply; posting again would duplicate it.
+		return finish(ReplyRefused, "reply and resolve this thread by hand", "the thread has more than 100 comments; cannot rule out an existing reply")
 	}
+	if !st.canReply {
+		return finish(ReplyRefused, "", "GitHub says you cannot reply to this thread (locked, or no write access)")
+	}
+	if ctx.Err() != nil {
+		return finish(ReplyInterrupted, "", "interrupted")
+	}
+	out, callErr := o.GH(ctx, "api", "graphql", "-F", "t="+o.Thread, "-f", "b="+res.Body, "-f", "query="+replyMutation)
+	url, replyErr := parseReply(out, callErr)
+	if replyErr != nil {
+		// A timeout, interrupt, or lost response does not prove that the
+		// mutation failed. Re-read with a live context so a landed reply can
+		// still be resolved and an absent reply can be reported truthfully.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+		defer cancel()
+		verified, verifyErr := readThread(rctx, o.GH, o.Thread, res.Body)
+		if verifyErr != nil {
+			return finish(ReplyNotResolved, "run the same command again: it will not post a second reply", replyErr.Error()+"; could not verify whether the reply landed: "+verifyErr.Error())
+		}
+		if !verified.hasOurReply {
+			if ctx.Err() != nil {
+				return finish(ReplyInterrupted, "", "interrupted")
+			}
+			return finish(ReplyGHError, "run the same command again: it will not post a second reply", replyErr.Error())
+		}
+		res.Replied, res.ReplyURL = true, verified.ourReplyURL
+		if verified.resolved {
+			return finish(ReplyDone, "", "")
+		}
+		return resolve(rctx)
+	}
+	res.Replied, res.ReplyURL = true, url
 	if st.resolved {
 		return finish(ReplyDone, "", "")
 	}
 	// The reply is posted: from here an interrupt must not strand the thread
 	// half-handled, so the resolve gets its own deadline.
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
-	defer cancel()
-	out, err := o.GH(rctx, "api", "graphql", "-F", "t="+o.Thread, "-f", "query="+resolveMutation)
-	if err := parseResolve(out, err); err != nil {
-		return finish(ReplyNotResolved, "run the same command again: it resolves without replying twice", err.Error())
-	}
-	res.Resolved = true
-	return finish(ReplyDone, "", "")
+	return resolveDetached()
+}
+
+func missingCommit(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "http 404") || strings.Contains(s, "http 422") || strings.Contains(s, "no commit found for sha")
 }
 
 func readThread(ctx context.Context, gh GH, id, body string) (threadState, error) {
@@ -193,6 +248,7 @@ func readThread(ctx context.Context, gh GH, id, body string) (threadState, error
 					Nodes []struct {
 						ViewerDidAuthor bool   `json:"viewerDidAuthor"`
 						Body            string `json:"body"`
+						URL             string `json:"url"`
 					} `json:"nodes"`
 				} `json:"comments"`
 			} `json:"node"`
@@ -212,7 +268,7 @@ func readThread(ctx context.Context, gh GH, id, body string) (threadState, error
 		return st, fmt.Errorf("no node with id %s", id)
 	}
 	if n.Typename != "PullRequestReviewThread" {
-		return st, fmt.Errorf("%s is a %s, not a pull request review thread", id, n.Typename)
+		return st, fmt.Errorf("%w: %s is a %s", errNotReviewThread, id, n.Typename)
 	}
 	if n.PullRequest == nil || n.Comments == nil || n.Comments.PageInfo == nil || n.PullRequest.Repository.NameWithOwner == "" {
 		return st, fmt.Errorf("gh api graphql: incomplete review thread response")
@@ -221,8 +277,9 @@ func readThread(ctx context.Context, gh GH, id, body string) (threadState, error
 	st.resolved, st.canReply = n.IsResolved, n.ViewerCanReply
 	st.complete = !n.Comments.PageInfo.HasPreviousPage
 	for _, c := range n.Comments.Nodes {
-		if c.ViewerDidAuthor && strings.TrimSpace(c.Body) == strings.TrimSpace(body) {
+		if c.ViewerDidAuthor && sameBody(c.Body, body) {
 			st.hasOurReply = true
+			st.ourReplyURL = c.URL
 		}
 	}
 	return st, nil
@@ -283,4 +340,12 @@ func parseResolve(out []byte, err error) error {
 		return fmt.Errorf("gh api graphql: the thread is still unresolved")
 	}
 	return nil
+}
+
+// sameBody reports whether a stored comment is our reply. GitHub may store a
+// body with CRLF line ends or trimmed edges; a byte compare would then miss
+// our own reply and a rerun would post it a second time.
+func sameBody(stored, ours string) bool {
+	norm := func(s string) string { return strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n")) }
+	return norm(stored) == norm(ours)
 }

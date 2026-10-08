@@ -16,8 +16,11 @@ type replyFake struct {
 	comments     []map[string]any
 	repo         string // default o/r
 	missingSHA   bool
+	commitErr    error
 	replyErr     error
 	resolveErr   error
+	replyLands   bool     // the reply lands even though replyErr is returned
+	resolveLands bool     // the resolve lands even though resolveErr is returned
 	stillOpen    bool     // resolve returns isResolved:false
 	onReply      func()   // runs inside the reply mutation
 	calls        []string // "read", "commit", "reply", "resolve"
@@ -30,6 +33,9 @@ func (f *replyFake) gh(ctx context.Context, args ...string) ([]byte, error) {
 	switch {
 	case args[0] == "api" && strings.HasPrefix(args[1], "repos/") && strings.Contains(args[1], "/commits/"):
 		f.calls = append(f.calls, "commit")
+		if f.commitErr != nil {
+			return nil, f.commitErr
+		}
 		if f.missingSHA {
 			return nil, errors.New("gh api: HTTP 422: No commit found for SHA")
 		}
@@ -45,6 +51,9 @@ func (f *replyFake) gh(ctx context.Context, args ...string) ([]byte, error) {
 			f.onReply()
 		}
 		if f.replyErr != nil {
+			if f.replyLands {
+				f.comments = append(f.comments, map[string]any{"viewerDidAuthor": true, "body": f.replyBody, "url": "https://x/c1"})
+			}
 			return nil, f.replyErr
 		}
 		return []byte(`{"data":{"addPullRequestReviewThreadReply":{"comment":{"id":"PRRC_1","url":"https://x/c1"}}}}`), nil
@@ -52,6 +61,9 @@ func (f *replyFake) gh(ctx context.Context, args ...string) ([]byte, error) {
 		f.calls = append(f.calls, "resolve")
 		f.resolveCtxOK = ctx.Err() == nil
 		if f.resolveErr != nil {
+			if f.resolveLands {
+				f.resolved = true
+			}
 			return nil, f.resolveErr
 		}
 		return json.Marshal(map[string]any{"data": map[string]any{"resolveReviewThread": map[string]any{"thread": map[string]any{"isResolved": !f.stillOpen}}}})
@@ -112,13 +124,39 @@ func TestReplyKeepSkipsCommitCheck(t *testing.T) {
 }
 
 func TestReplyRerunDoesNotReplyTwice(t *testing.T) {
-	ours := map[string]any{"viewerDidAuthor": true, "body": "Fixed in 0123abc: guard the nil map\n"}
+	ours := map[string]any{"viewerDidAuthor": true, "body": "Fixed in 0123abc: guard the nil map"}
 	f := &replyFake{comments: []map[string]any{{"viewerDidAuthor": false, "body": "finding"}, ours}}
 	r := Reply(context.Background(), fixed(f))
 	if r.Status != ReplyDone || r.Replied || !r.Resolved {
 		t.Fatalf("got %+v", r)
 	}
-	callsAre(t, f, "read", "commit", "resolve")
+	callsAre(t, f, "read", "resolve")
+}
+
+func TestReplyStoredBodyNormalizationStillCountsAsOurs(t *testing.T) {
+	cases := []struct{ note, stored string }{
+		{"guard the nil map", "Fixed in 0123abc: guard the nil map\n"},             // trailing newline
+		{"first line\nsecond line", "Fixed in 0123abc: first line\r\nsecond line"}, // CRLF
+	}
+	for _, c := range cases {
+		f := &replyFake{comments: []map[string]any{{"viewerDidAuthor": true, "body": c.stored}}}
+		o := fixed(f)
+		o.Note = c.note
+		r := Reply(context.Background(), o)
+		if r.Status != ReplyDone || r.Replied || !r.Resolved {
+			t.Fatalf("stored %q: got %+v", c.stored, r)
+		}
+		callsAre(t, f, "read", "resolve")
+	}
+}
+func TestReplyRerunDoesNotRecheckCommit(t *testing.T) {
+	ours := map[string]any{"viewerDidAuthor": true, "body": "Fixed in 0123abc: guard the nil map"}
+	f := &replyFake{comments: []map[string]any{ours}, missingSHA: true}
+	r := Reply(context.Background(), fixed(f))
+	if r.Status != ReplyDone || r.Replied || !r.Resolved {
+		t.Fatalf("got %+v", r)
+	}
+	callsAre(t, f, "read", "resolve")
 }
 
 func TestReplyAlreadyDoneIsANoOp(t *testing.T) {
@@ -189,10 +227,19 @@ func TestReplyRepoMatchIsCaseInsensitive(t *testing.T) {
 func TestReplyNotAThread(t *testing.T) {
 	f := &replyFake{typename: "IssueComment"}
 	r := Reply(context.Background(), fixed(f))
-	if r.Status != ReplyGHError || !strings.Contains(r.Error, "not a pull request review thread") {
+	if r.Status != ReplyRefused || !strings.Contains(r.Error, "not a pull request review thread") {
 		t.Fatalf("got %+v", r)
 	}
 	callsAre(t, f, "read")
+}
+
+func TestReplyCommitLookupGHErrorIsNotMissingCommit(t *testing.T) {
+	f := &replyFake{commitErr: errors.New("gh api: HTTP 502: upstream failure")}
+	r := Reply(context.Background(), fixed(f))
+	if r.Status != ReplyGHError || r.Replied || r.Resolved {
+		t.Fatalf("got %+v", r)
+	}
+	callsAre(t, f, "read", "commit")
 }
 
 func TestReplyMutationErrorDoesNotResolve(t *testing.T) {
@@ -201,7 +248,16 @@ func TestReplyMutationErrorDoesNotResolve(t *testing.T) {
 	if r.Status != ReplyGHError || r.Replied || !strings.Contains(r.Next, "again") {
 		t.Fatalf("got %+v", r)
 	}
-	callsAre(t, f, "read", "commit", "reply")
+	callsAre(t, f, "read", "commit", "reply", "read")
+}
+
+func TestReplyMutationErrorThatLandedIsReconciled(t *testing.T) {
+	f := &replyFake{replyErr: errors.New("gh api: HTTP 502"), replyLands: true}
+	r := Reply(context.Background(), fixed(f))
+	if r.Status != ReplyDone || !r.Replied || !r.Resolved || r.ReplyURL != "https://x/c1" {
+		t.Fatalf("got %+v", r)
+	}
+	callsAre(t, f, "read", "commit", "reply", "read", "resolve")
 }
 
 func TestReplyResolveFailureIsNotResolved(t *testing.T) {
@@ -211,6 +267,26 @@ func TestReplyResolveFailureIsNotResolved(t *testing.T) {
 			t.Fatalf("got %+v", r)
 		}
 	}
+}
+
+func TestReplyResolveErrorThatLandedIsReconciled(t *testing.T) {
+	f := &replyFake{resolveErr: errors.New("gh api: HTTP 502"), resolveLands: true}
+	r := Reply(context.Background(), fixed(f))
+	if r.Status != ReplyDone || !r.Replied || !r.Resolved {
+		t.Fatalf("got %+v", r)
+	}
+	callsAre(t, f, "read", "commit", "reply", "resolve", "read")
+}
+
+func TestReplyInterruptAfterUnacknowledgedPostStillResolves(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := &replyFake{replyErr: context.Canceled, replyLands: true, onReply: cancel}
+	r := Reply(ctx, fixed(f))
+	if r.Status != ReplyDone || !r.Replied || !r.Resolved || !f.resolveCtxOK {
+		t.Fatalf("got %+v, resolve ctx live %v", r, f.resolveCtxOK)
+	}
+	callsAre(t, f, "read", "commit", "reply", "read", "resolve")
 }
 
 func TestReplyInterruptAfterPostingStillResolves(t *testing.T) {

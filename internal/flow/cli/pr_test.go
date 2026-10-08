@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"flag"
+	"io"
 	"strings"
 	"testing"
 
@@ -87,6 +89,17 @@ func TestPRReplyHelp(t *testing.T) {
 	var out, errb bytes.Buffer
 	if code := Run([]string{"pr", "reply", "--help"}, &out, &errb); code != 0 || !strings.Contains(out.String(), "agentflow pr reply") {
 		t.Errorf("exit %d, stdout %q", code, out.String())
+	}
+}
+
+func TestParseInterleavedAllowsDoubleDashAsAFlagValue(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var keep string
+	fs.StringVar(&keep, "keep", "", "")
+	pos, err := parseInterleaved(fs, []string{"PRRT_kwDOabc", "--keep", "--"})
+	if err != nil || keep != "--" || len(pos) != 1 || pos[0] != "PRRT_kwDOabc" {
+		t.Fatalf("pos=%q keep=%q err=%v", pos, keep, err)
 	}
 }
 
