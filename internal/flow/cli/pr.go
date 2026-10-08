@@ -42,6 +42,57 @@ Exit codes: 0 reviewed, no open threads · 1 usage or gh error · 2 not
 reviewed yet (--once) · 3 review skipped (draft, base, paused) · 4 rate-limited
 · 5 PR closed before its head was reviewed · 10 reviewed, open threads
 · 124 timeout · 130 interrupted.
+
+agentflow pr reply <thread-id> (--fixed SHA --note TEXT | --keep REASON) [flags]
+
+Reply to one review thread, then resolve it. The reply reads "Fixed in <sha>:
+<note>" or "Keeping as-is: <reason>". Take the thread id from pr wait's
+"open_threads". A thread never gets a second identical reply, so a run that
+posted the reply but failed to resolve can simply be repeated.
+
+  --fixed SHA        the commit that fixes the finding; it must already be
+                     pushed (GitHub must know it), or nothing is posted
+  --note TEXT        what the fix changed (required with --fixed)
+  --keep REASON      why the code stays as it is
+  --repo OWNER/NAME  refuse unless the thread belongs to this repository
+
+Exit codes: 0 replied and resolved (or already done) · 1 usage or gh error,
+nothing posted · 2 refused, nothing posted · 3 replied but not resolved
+(run it again) · 130 interrupted, nothing posted.
+
+agentflow pr merge <number> [flags]
+
+Merge a pull request only when it is ready, pinned to the head commit it
+just read, and report the merge commit. Readiness is read immediately before
+the merge: the PR is open, not a draft, mergeable (an UNKNOWN state is
+re-read for up to 30s, then refused), has a known base branch that does not
+use a merge queue (gh would queue the PR or enable auto-merge instead of
+merging), and has no unresolved review thread from any author (every page
+read).
+
+  --repo OWNER/NAME     GitHub repository (default: the current directory's,
+                        from gh; never guessed)
+  --method M            merge, squash or rebase (default merge)
+  --head SHA            refuse unless the PR head is this full commit sha
+  --admin               pass --admin to gh pr merge (bypass branch rules)
+  --sync-branch BRANCH  after the merge, fast-forward BRANCH to the base
+                        branch's head on GitHub; never forced
+
+It never deletes branches (gh's --delete-branch also switches and deletes
+local ones; use agentflow worktree done) and never enables auto-merge.
+
+Output: a JSON result on stdout with "merge_sha" (for agentflow ship verify
+--sha), "reasons" when refused, "sync" when --sync-branch is given, and
+"auto_merge" when GitHub holds an auto-merge request for the PR.
+
+After the merge call, the PR is read back for up to 20s. Only a MERGED PR
+whose head is the pinned commit counts as merged; anything else, including
+a failed merge call, is "unconfirmed" (exit 4), never "nothing merged".
+
+Exit codes: 0 merged (and synced) · 1 usage or gh error before the merge
+call, nothing merged · 2 refused, nothing changed · 3 merged, sync refused
+or failed · 4 the merge call ran but its outcome was not confirmed · 130
+interrupted before the merge.
 `
 
 var prExitCodes = map[pr.Status]int{
@@ -63,7 +114,13 @@ func runPR(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stdout, prUsage)
 		return 0
 	}
-	if args[0] != "wait" {
+	switch args[0] {
+	case "wait":
+	case "reply":
+		return runPRReply(ctx, args[1:], stdout, stderr)
+	case "merge":
+		return runPRMerge(ctx, args[1:], stdout, stderr)
+	default:
 		fmt.Fprintf(stderr, "agentflow pr: unknown subcommand %q\n\n%s", args[0], prUsage)
 		return 1
 	}

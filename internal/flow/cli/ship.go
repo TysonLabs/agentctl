@@ -261,11 +261,28 @@ func runAnnounce(ctx context.Context, args []string, stdout, stderr io.Writer) i
 // (`ship verify svc.env --sha X` and `ship verify --sha X svc.env`).
 func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
 	var afterDash []string
+	wantValue := false
 	for i, arg := range args {
+		if wantValue {
+			wantValue = false
+			continue
+		}
 		if arg == "--" {
 			afterDash = args[i+1:]
 			args = args[:i]
 			break
+		}
+		name := strings.TrimPrefix(arg, "-")
+		name = strings.TrimPrefix(name, "-")
+		if name == arg || name == "" || strings.Contains(name, "=") {
+			continue
+		}
+		f := fs.Lookup(name)
+		if f == nil {
+			continue // fs.Parse will report the unknown flag
+		}
+		if b, ok := f.Value.(interface{ IsBoolFlag() bool }); !ok || !b.IsBoolFlag() {
+			wantValue = true
 		}
 	}
 	var pos []string
