@@ -1,10 +1,12 @@
-// Package keychain reads service tokens from the macOS Keychain through
-// /usr/bin/security. It only reads: agentctl imports it, and agentctl must
-// stay read-only. Writes live in agentcfg (internal/cfg), which the import
-// boundary test keeps out of agentctl and agentflow.
+// Package keychain reads secrets from the macOS Keychain through
+// /usr/bin/security. It only reads: agentctl and agentflow import it, and
+// both stay read-only toward the Keychain. Writes live in agentcfg
+// (internal/cfg), which the import boundary test keeps out of both.
 //
-// Every item is a generic password with service name Service and an account
-// named by the registry's token_ref (by convention "<name>.<env>").
+// Every item is a generic password. agentctl's /agent tokens use Keychain
+// service Service, account "<name>.<env>" (a registry token_ref). agentflow's
+// Slack webhooks use AgentflowService, account "<name>.announce" (a
+// webhook_ref); agentflow reads only that service (see the boundary test).
 package keychain
 
 import (
@@ -22,6 +24,10 @@ import (
 
 // Service is the Keychain service name of every agentctl token item.
 const Service = "agentctl"
+
+// AgentflowService is the Keychain service name of agentflow's credentials
+// (the [name.announce] Slack webhook), kept apart from agentctl's tokens.
+const AgentflowService = "agentflow"
 
 // RefPrefix starts a token_ref value: token_ref = "keychain:<account>".
 const RefPrefix = "keychain:"
@@ -67,15 +73,21 @@ func ParseRef(ref string) (string, error) {
 // user's default keychain search list.
 func Path() string { return os.Getenv("AGENTCTL_KEYCHAIN") }
 
-// Get returns the token stored for account.
-func Get(account string) (string, error) {
+// Get returns the agentctl token stored for account.
+func Get(account string) (string, error) { return GetFrom(Service, account) }
+
+// GetFrom returns the secret stored under Keychain service and account.
+func GetFrom(service, account string) (string, error) {
 	if !Supported {
 		return "", ErrUnsupported
 	}
 	if !ValidAccount(account) {
 		return "", fmt.Errorf("invalid keychain account %q", account)
 	}
-	args := []string{"find-generic-password", "-s", Service, "-a", account, "-w"}
+	if service != Service && service != AgentflowService {
+		return "", fmt.Errorf("unknown keychain service %q", service)
+	}
+	args := []string{"find-generic-password", "-s", service, "-a", account, "-w"}
 	if p := Path(); p != "" {
 		args = append(args, p)
 	}

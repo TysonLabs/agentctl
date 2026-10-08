@@ -287,6 +287,22 @@ func TestBrowserCodeKeepsSecretsAndAddFormStable(t *testing.T) {
 	if reject < 0 || stopped < 0 || reject > stopped {
 		t.Fatal("quit flow reports stopped before handling an HTTP rejection")
 	}
+	slackStart := strings.Index(source, "function openSlack(")
+	slackEnd := strings.Index(source, "function openMeta(")
+	if slackStart < 0 || slackEnd <= slackStart {
+		t.Fatal("could not find Slack flow")
+	}
+	if !strings.Contains(source[slackStart:slackEnd], `: ["prod"]`) {
+		t.Fatal("clearing the Slack env list does not restore agentflow's prod default")
+	}
+	groupsStart := strings.Index(source, "function groups(")
+	renderStart := strings.Index(source, "function render(")
+	if groupsStart < 0 || renderStart <= groupsStart || !strings.Contains(source[groupsStart:renderStart], "state.announces") {
+		t.Fatal("service cards omit announce-only services")
+	}
+	if !strings.Contains(source[renderStart:slackStart], "!gs.length") {
+		t.Fatal("announce-only services are replaced by the empty state")
+	}
 }
 
 func TestQuit(t *testing.T) {
@@ -331,5 +347,30 @@ func TestServeRejectsNonPositiveIdle(t *testing.T) {
 	err := Serve(Options{Store: &cfg.Store{Path: filepath.Join(t.TempDir(), "s.toml")}, Idle: 0, Stdout: io.Discard})
 	if err == nil {
 		t.Fatal("Serve accepted a zero idle timeout")
+	}
+}
+
+func TestAnnounceOverAPI(t *testing.T) {
+	keychaintest.Temp(t)
+	const hook = "https://hooks.slack.com/services/T0FAKE1/B0FAKE1/fakeSecretPart123"
+	s, ts := newServer(t)
+	code, body := do(t, s, ts, call{path: "/api/announce", body: `{"version":"","name":"pay","channel":"#pay","envs":null,"webhook":"` + hook + `"}`})
+	if code != 200 || strings.Contains(body, "fakeSecretPart123") || !strings.Contains(body, `"channel":"#pay"`) || !strings.Contains(body, `"source":"keychain"`) {
+		t.Fatalf("announce: %d %s", code, body)
+	}
+	// An edit without a webhook keeps the stored one.
+	code, body = do(t, s, ts, call{path: "/api/announce", body: `{"version":"","name":"pay","channel":"#pay2","envs":["prod"],"webhook":""}`})
+	if code != 200 || !strings.Contains(body, `"channel":"#pay2"`) || !strings.Contains(body, `"wired":true`) {
+		t.Fatalf("edit: %d %s", code, body)
+	}
+	code, body = do(t, s, ts, call{path: "/api/announce", body: `{"version":"","name":"pay","channel":"#x","envs":null,"webhook":"https://evil.example.com/fakeSecretPart123"}`})
+	if code != 400 || strings.Contains(body, "fakeSecretPart123") {
+		t.Fatalf("bad webhook: %d %s", code, body)
+	}
+	if code, body = do(t, s, ts, call{path: "/api/announce/remove", body: `{"version":"","name":"pay"}`}); code != 200 || strings.Contains(body, `"name":"pay","channel"`) {
+		t.Fatalf("remove: %d %s", code, body)
+	}
+	if code, _ := do(t, s, ts, call{path: "/api/announce/remove", body: `{"name":"pay"}`, origin: "https://evil.example.com"}); code != 403 {
+		t.Fatalf("cross-origin remove: %d", code)
 	}
 }

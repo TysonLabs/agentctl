@@ -198,3 +198,50 @@ func TestSetTokenLsMigrateTest(t *testing.T) {
 		t.Fatalf("ls after rm: %s", out)
 	}
 }
+
+func TestAnnounceCommand(t *testing.T) {
+	keychaintest.Temp(t)
+	const hook = "https://hooks.slack.com/services/T0FAKE1/B0FAKE1/fakeSecretPart123"
+	cfgPath := filepath.Join(t.TempDir(), "services.toml")
+	os.WriteFile(cfgPath, []byte("[pay.prod]\nbase_url = \"https://pay.example.com\"\n"), 0o600)
+	c := func(stdin string, args ...string) (int, string, string) {
+		return run(t, stdin, append(args, "--config", cfgPath)...)
+	}
+	if code, _, _ := c("", "announce", "pay"); code != 2 {
+		t.Fatalf("announce with nothing to change: exit %d", code)
+	}
+	if code, _, _ := c("", "announce", "pay", "--remove", "--channel", "#x"); code != 2 {
+		t.Fatalf("--remove with --channel: exit %d", code)
+	}
+	if code, _, _ := c("", "set", "pay.prod", "--channel", "#x"); code != 2 {
+		t.Fatalf("--channel on set: exit %d", code)
+	}
+	if code, out, errs := c(hook+"\n", "announce", "pay", "--channel", "#pay", "--envs", "prod, dev", "--webhook"); code != 0 || strings.Contains(out+errs, "fakeSecretPart123") {
+		t.Fatalf("announce: %d %s %s", code, out, errs)
+	}
+	code, out, _ := c("", "ls")
+	if code != 0 || !strings.Contains(out, "#pay") || !strings.Contains(out, "prod,dev") || !strings.Contains(out, "keychain tok:") || strings.Contains(out, "fakeSecretPart123") {
+		t.Fatalf("ls: %d\n%s", code, out)
+	}
+	if b, _ := os.ReadFile(cfgPath); strings.Contains(string(b), "fakeSecretPart123") {
+		t.Fatal("webhook written to the file")
+	}
+	if code, _, errs := c("", "announce", "pay", "--remove"); code != 0 {
+		t.Fatalf("remove: %d %s", code, errs)
+	}
+	if _, out, _ := c("", "ls"); strings.Contains(out, "SLACK") {
+		t.Fatalf("ls after remove:\n%s", out)
+	}
+}
+
+func TestLsShowsAnnounceWithoutAnEnvironment(t *testing.T) {
+	const hook = "https://hooks.slack.com/services/T0FAKE1/B0FAKE1/fakeSecretPart123"
+	cfgPath := filepath.Join(t.TempDir(), "services.toml")
+	if err := os.WriteFile(cfgPath, []byte("[pay.announce]\nwebhook = \""+hook+"\"\nchannel = \"#pay\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errs := run(t, "", "ls", "--config", cfgPath)
+	if code != 0 || !strings.Contains(out, "SLACK") || !strings.Contains(out, "pay") || !strings.Contains(out, "1 secret(s)") || strings.Contains(out+errs, "fakeSecretPart123") {
+		t.Fatalf("ls: %d\nstdout: %s\nstderr: %s", code, out, errs)
+	}
+}

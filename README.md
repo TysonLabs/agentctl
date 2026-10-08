@@ -386,14 +386,22 @@ agentflow ship announce myservice.prod --verified verify.json \
   --pr-url https://github.com/acme/myservice/pull/42
 ```
 
-The channel is configured once per service, next to its environments in `services.toml`:
+The channel is configured once per service, next to its environments in `services.toml`.
+Set it with agentcfg, which keeps the webhook (a secret) in the Keychain:
+
+```sh
+pbpaste | agentcfg announce myservice --channel "#myservice-releases" --envs prod --webhook
+```
 
 ```toml
 [myservice.announce]
-webhook = "https://hooks.slack.com/services/..."   # a Slack incoming webhook: a secret
-channel = "#myservice-releases"                     # label for output; the webhook picks the channel
-envs    = ["prod"]                                  # envs that announce (default ["prod"])
+webhook_ref = "keychain:myservice.announce"  # Keychain service "agentflow", account "<service>.announce"
+channel     = "#myservice-releases"          # label for output; the webhook picks the channel
+envs        = ["prod"]                       # envs that announce (default ["prod"])
 ```
+
+A plaintext `webhook = "https://hooks.slack.com/services/..."` still works in place of
+`webhook_ref` (set one, not both); `agentcfg migrate` moves it into the Keychain.
 
 The agent writes the title and a plain-language body (what changed, how to test it);
 agentflow adds the header line (service, env, short SHA, PR link, verify time) and posts it.
@@ -409,7 +417,8 @@ agentflow adds the header line (service, env, short SHA, PR link, verify time) a
   so a body can't ping `@channel` or forge a link. Title and body are cut to Slack's limits.
 - The webhook is only ever sent to `https://hooks.slack.com/services/...`. Redirects are
   not followed, and errors never include the URL. agentflow reads only the
-  `[service.announce]` table of `services.toml`; the `/agent` tokens stay undecoded.
+  `[service.announce]` table of `services.toml` and only the `agentflow` Keychain service;
+  the `/agent` tokens stay undecoded and unread (a test enforces it).
 - `--dry-run` prints the exact Slack payload and posts nothing.
 
 | Exit | Status | Meaning |
@@ -466,11 +475,13 @@ safety refusal.
 ```sh
 go install github.com/TysonLabs/agentctl/cmd/agentcfg@latest
 agentcfg ui                                   # settings page in your browser
-agentcfg migrate                              # move every plaintext token into the Keychain
+agentcfg migrate                              # move every plaintext token and webhook into the Keychain
 agentcfg set payments.prod --base-url https://pay.example.com
 pbpaste | agentcfg token payments.prod        # or type it: no echo on a terminal
 agentcfg test payments.prod                   # GET /agent/version with the stored token
 agentcfg ls · agentcfg meta payments repo=~/src/payments unit=payments.service · agentcfg rm payments.prod
+pbpaste | agentcfg announce payments --channel "#payments-releases" --webhook   # Slack for ship announce
+agentcfg announce payments --envs prod,dev · agentcfg announce payments --remove
 ```
 
 agentcfg is for a person, not for agents: it is a separate binary so agentctl keeps its
@@ -481,9 +492,10 @@ read-only guarantee, and it belongs on no agent allowlist. Exit codes: 0 ok · 1
   was lost (tables it does not know, like `[x.announce]`, come through unchanged), passes the
   same validation agentctl runs, and replaces the file atomically at mode 0600 (a symlinked
   file keeps its link). Comments are not kept: the file is machine-managed once agentcfg writes it.
-- **Tokens never touch argv or the file.** A token goes to `security -i` on stdin, hex-encoded,
-  and is read back before the file points at it. If the Keychain write fails, the file is
-  unchanged. Removing an env deletes its Keychain item.
+- **Secrets never touch argv or the file.** A token or Slack webhook goes to `security -i` on
+  stdin, hex-encoded, and is read back before the file points at it. If the Keychain write
+  fails, the file is unchanged. Removing an env (or `announce --remove`) deletes its item.
+  Tokens live under Keychain service `agentctl`, webhooks under `agentflow`.
 - **The settings page** (`agentcfg ui`) listens on 127.0.0.1 only. Each launch makes a random
   key that reaches the page in the URL fragment (never sent to a server) and must be on every
   API call. The server checks the Host header exactly (DNS rebinding), refuses cross-origin

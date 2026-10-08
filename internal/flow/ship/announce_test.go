@@ -13,6 +13,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/TysonLabs/agentctl/internal/keychain"
+	"github.com/TysonLabs/agentctl/internal/keychain/keychaintest"
 )
 
 const (
@@ -480,5 +483,43 @@ func TestSlackPost(t *testing.T) {
 	srv.Close()
 	if err := post(context.Background(), dead, []byte(`{}`)); err == nil || strings.Contains(err.Error(), dead) {
 		t.Errorf("transport error must not name the URL: %v", err)
+	}
+}
+
+func refConfig(table string) string {
+	return "[rcx.prod]\nbase_url = \"https://x.example.com\"\ntoken = \"" + testToken + "\"\n\n[rcx.announce]\n" + table + "\n"
+}
+
+func TestAnnounceWebhookRefReadsTheAgentflowKeychain(t *testing.T) {
+	keychaintest.Temp(t)
+	keychaintest.PutIn(t, keychain.AgentflowService, "rcx.announce", testHook)
+	cfg, err := LoadAnnounceConfig(writeFile(t, "services.toml", refConfig(`webhook_ref = "keychain:rcx.announce"`+"\nchannel = \"#r\"")), "rcx")
+	if err != nil || cfg.Webhook != testHook || cfg.Channel != "#r" {
+		t.Fatalf("cfg %+v, err %v", cfg, err)
+	}
+}
+
+func TestAnnounceWebhookRefFailsClosed(t *testing.T) {
+	keychaintest.Temp(t)
+	// Filed under agentctl's service: agentflow must not find it there.
+	keychaintest.Put(t, "rcx.announce", testHook)
+	keychaintest.PutIn(t, keychain.AgentflowService, "bad.announce", "https://evil.example.com/fakeSecretPart123")
+	cases := map[string]struct{ table, want string }{
+		"missing item":     {`webhook_ref = "keychain:rcx.announce"` + "\nchannel = \"#r\"", "agentcfg announce rcx --webhook"},
+		"both keys":        {`webhook = "` + testHook + `"` + "\nwebhook_ref = \"keychain:rcx.announce\"\nchannel = \"#r\"", "not both"},
+		"empty ref + hook": {`webhook = "` + testHook + `"` + "\nwebhook_ref = \"\"\nchannel = \"#r\"", "not both"},
+		"bad ref":          {`webhook_ref = "fakeSecretPart123"` + "\nchannel = \"#r\"", "webhook_ref"},
+		"bad stored hook":  {`webhook_ref = "keychain:bad.announce"` + "\nchannel = \"#r\"", "Slack incoming webhook"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := LoadAnnounceConfig(writeFile(t, "services.toml", refConfig(c.table)), "rcx")
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want %q", err, c.want)
+			}
+			if strings.Contains(err.Error(), "fakeSecretPart123") {
+				t.Fatalf("error leaks a secret: %v", err)
+			}
+		})
 	}
 }

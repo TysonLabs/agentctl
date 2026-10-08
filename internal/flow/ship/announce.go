@@ -1,9 +1,10 @@
 package ship
 
 // Announce posts a verified deploy to the service's Slack channel through an
-// incoming webhook. The webhook lives in services.toml as [name.announce];
-// this file decodes only that table, so agentflow never parses the /agent
-// tokens beside it. Every guard fails closed: no fresh `ship verify` proof,
+// incoming webhook. [name.announce] in services.toml names the webhook: in
+// the Keychain (webhook_ref, service "agentflow", written by agentcfg) or,
+// legacy, inline (webhook). This file decodes only that table and reads only
+// the agentflow Keychain service, so agentflow never sees the /agent tokens. Every guard fails closed: no fresh `ship verify` proof,
 // an env not opted in, or a malformed config means nothing is posted.
 
 import (
@@ -22,10 +23,12 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/TysonLabs/agentctl/internal/keychain"
+	"github.com/TysonLabs/agentctl/internal/slackhook"
 )
 
 // AnnounceStatus is the outcome of one announce. Every run ends in exactly one.
@@ -82,22 +85,7 @@ const (
 	maxContextRunes = 2900 // under the 3000-char text-object limit
 )
 
-var (
-	prURLRe   = regexp.MustCompile(`^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/([0-9]+)$`)
-	secretRes = []*regexp.Regexp{
-		regexp.MustCompile(`https?://hooks\.slack\.com/\S*`),
-		regexp.MustCompile(`xox[a-z]-[A-Za-z0-9-]+`),
-		regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
-		regexp.MustCompile(`github_pat_[A-Za-z0-9_]{20,}`),
-		regexp.MustCompile(`sk-[A-Za-z0-9_-]{20,}`),
-		regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
-		regexp.MustCompile(`\b[0-9A-Fa-f]{48,}\b`), // hex tokens; a 40-char commit SHA stays
-	}
-	base64Re = regexp.MustCompile(`[A-Za-z0-9+/]{32,}={0,2}`)
-	// Slack's shape: /services/<team>/<bot>/<secret>. Requiring 6+ chars per
-	// segment also keeps redactSecret from blanking short words in a body.
-	webhookPathRe = regexp.MustCompile(`^/services/[A-Za-z0-9]{6,}/[A-Za-z0-9]{6,}/[A-Za-z0-9]{6,}$`)
-)
+var prURLRe = regexp.MustCompile(`^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/([0-9]+)$`)
 
 // Announce checks every guard, then posts once per service.env and commit.
 func Announce(ctx context.Context, o AnnounceOptions) AnnounceResult {
@@ -220,12 +208,13 @@ func LoadAnnounceConfig(path, name string) (AnnounceConfig, error) {
 		return AnnounceConfig{}, fmt.Errorf("no [%s.announce] table in %s", name, path)
 	}
 	var t struct {
-		Webhook string   `toml:"webhook"`
-		Channel string   `toml:"channel"`
-		Envs    []string `toml:"envs"`
+		Webhook    string   `toml:"webhook"`
+		WebhookRef string   `toml:"webhook_ref"`
+		Channel    string   `toml:"channel"`
+		Envs       []string `toml:"envs"`
 	}
 	if err := md.PrimitiveDecode(prim, &t); err != nil {
-		return AnnounceConfig{}, fmt.Errorf("[%s.announce] in %s: webhook and channel must be strings, envs a list of strings", name, path)
+		return AnnounceConfig{}, fmt.Errorf("[%s.announce] in %s: webhook, webhook_ref and channel must be strings, envs a list of strings", name, path)
 	}
 	for _, k := range md.Undecoded() {
 		if len(k) >= 3 && k[0] == name && k[1] == "announce" {
@@ -234,9 +223,28 @@ func LoadAnnounceConfig(path, name string) (AnnounceConfig, error) {
 			return AnnounceConfig{}, fmt.Errorf("[%s.announce] in %s: unknown key (name redacted)", name, path)
 		}
 	}
-	u, err := url.Parse(t.Webhook)
-	if t.Webhook == "" || err != nil || u.Scheme != "https" || u.Host != "hooks.slack.com" || !webhookPathRe.MatchString(u.Path) ||
-		u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	// Presence, not value, decides the source: an empty webhook_ref beside a
+	// webhook is ambiguous, never a fallback.
+	hasHook := md.IsDefined(name, "announce", "webhook")
+	hasRef := md.IsDefined(name, "announce", "webhook_ref")
+	switch {
+	case hasHook && hasRef:
+		return AnnounceConfig{}, fmt.Errorf("[%s.announce] in %s: set webhook or webhook_ref, not both", name, path)
+	case hasRef:
+		acct, err := keychain.ParseRef(t.WebhookRef)
+		if err != nil {
+			return AnnounceConfig{}, fmt.Errorf("[%s.announce] in %s: webhook_ref: %v", name, path, err)
+		}
+		hook, err := keychain.GetFrom(keychain.AgentflowService, acct)
+		if errors.Is(err, keychain.ErrNotFound) {
+			return AnnounceConfig{}, fmt.Errorf("[%s.announce]: no keychain item %s/%s — run: agentcfg announce %s --webhook", name, keychain.AgentflowService, acct, name)
+		}
+		if err != nil {
+			return AnnounceConfig{}, fmt.Errorf("[%s.announce]: reading the webhook from the Keychain: %v", name, err)
+		}
+		t.Webhook = hook
+	}
+	if !slackhook.Valid(t.Webhook) {
 		return AnnounceConfig{}, fmt.Errorf("[%s.announce] in %s: webhook must be a Slack incoming webhook (https://hooks.slack.com/services/...)", name, path)
 	}
 	if strings.TrimSpace(t.Channel) == "" {
@@ -315,56 +323,11 @@ func buildPayload(name, env string, o AnnounceOptions, checkedAt time.Time, webh
 // cleanText removes secrets and characters that can hide or reorder text.
 // Secrets go first, before any escaping changes their spelling.
 func cleanText(s, webhook string) string {
-	s = redactSecret(s, webhook)
-	for _, re := range secretRes {
-		s = re.ReplaceAllString(s, "[redacted]")
-	}
-	s = base64Re.ReplaceAllStringFunc(s, func(m string) string {
-		if looksLikeBase64Secret(m) {
-			return "[redacted]"
-		}
-		return m
-	})
-	return strings.Map(func(r rune) rune {
-		switch {
-		case r == '\n' || r == '\t':
-			return r
-		case unicode.IsControl(r), unicode.Is(unicode.Cf, r):
-			return -1
-		}
-		return r
-	}, strings.ToValidUTF8(s, ""))
+	return slackhook.CleanText(s, webhook)
 }
 
 func redactSecret(s, secret string) string {
-	if secret == "" {
-		return s
-	}
-	s = strings.ReplaceAll(s, secret, "[redacted]")
-	if u, err := url.Parse(secret); err == nil && len(u.Path) > len("/services/") {
-		tail := strings.TrimPrefix(u.Path, "/services/")
-		s = strings.ReplaceAll(s, tail, "[redacted]")
-		// Any path component can identify the incoming webhook. Errors from
-		// proxies and transports sometimes print components separately.
-		for _, part := range strings.Split(tail, "/") {
-			if part != "" {
-				s = strings.ReplaceAll(s, part, "[redacted]")
-			}
-		}
-	}
-	return s
-}
-
-// looksLikeBase64Secret flags base64 runs with mixed case, a digit and a
-// '+' or '=': random keys have them, file paths and prose almost never do.
-func looksLikeBase64Secret(s string) bool {
-	var upper, lower, digit bool
-	for _, r := range s {
-		upper = upper || unicode.IsUpper(r)
-		lower = lower || unicode.IsLower(r)
-		digit = digit || unicode.IsDigit(r)
-	}
-	return upper && lower && digit && strings.ContainsAny(s, "+=")
+	return slackhook.RedactSecret(s, secret)
 }
 
 // escapeMrkdwn escapes Slack's control characters, so a body can't ping

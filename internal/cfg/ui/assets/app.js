@@ -113,6 +113,9 @@
       if (!by.has(s.name)) by.set(s.name, { name: s.name, meta: s.meta || {}, envs: [] });
       by.get(s.name).envs.push(s);
     }
+    for (const an of state.announces || []) {
+      if (!by.has(an.name)) by.set(an.name, { name: an.name, meta: {}, envs: [] });
+    }
     return [...by.values()];
   }
 
@@ -132,8 +135,8 @@
         await write("/api/migrate", {});
       }));
       alerts.push(h("div", { class: "alert warn" },
-        h("p", {}, h("strong", { text: plural(state.plaintext, "token is", "tokens are") + " stored in plain text " }),
-          "in services.toml. Move them into the Keychain so the file holds no secrets."),
+        h("p", {}, h("strong", { text: plural(state.plaintext, "secret is", "secrets are") + " stored in plain text " }),
+          "in services.toml (tokens or Slack webhooks). Move them into the Keychain so the file holds no secrets."),
         btn));
     }
     for (const w of state.warnings || []) {
@@ -143,11 +146,11 @@
 
     const gs = groups();
     const wired = state.services.filter((s) => s.token.wired).length;
-    $("summary").textContent = state.services.length
+    $("summary").textContent = gs.length
       ? `${plural(gs.length, "service", "services")} · ${plural(state.services.length, "environment", "environments")} · ${wired} wired`
       : "";
 
-    if (!state.services.length && !state.error) {
+    if (!gs.length && !state.error) {
       $("services").replaceChildren(h("div", { class: "card empty" },
         h("h2", { text: "No services yet" }),
         h("p", { class: "muted", text: "Add the first service agentctl should talk to." }),
@@ -164,13 +167,29 @@
     if (g.meta.repo) meta.push(h("span", {}, "repo ", h("b", { class: "mono", text: g.meta.repo })));
     if (g.meta.unit) meta.push(h("span", {}, "unit ", h("b", { class: "mono", text: g.meta.unit })));
     if (!meta.length) meta.push(h("span", { text: "no repo or unit set" }));
+    const an = (state.announces || []).find((a) => a.name === g.name);
+    meta.push(h("span", {}, "Slack ", slackChip(an)));
     return h("section", { class: "card" },
       h("div", { class: "card-head" },
         h("div", {}, h("div", { class: "name", text: g.name }), h("div", { class: "meta" }, meta)),
         h("div", {},
           h("button", { class: "btn ghost", type: "button", text: "Add env", onclick: () => openAdd(g.name) }),
+          h("button", { class: "btn ghost", type: "button", text: "Slack", onclick: () => openSlack(g.name, an) }),
           h("button", { class: "btn ghost", type: "button", text: "Details", onclick: () => openMeta(g) }))),
       g.envs.map(renderEnv));
+  }
+
+  // agentflow's [name.announce]: where `agentflow ship announce` posts.
+  function slackChip(an) {
+    if (!an) return h("span", { class: "muted", text: "off" });
+    const label = (an.channel || "?") + " · " + an.envs.join(", ");
+    if (an.webhook.wired && an.webhook.source === "keychain") {
+      return h("span", { class: "chip ok", title: "Webhook in the Keychain (" + an.webhook.fingerprint + ")" }, label);
+    }
+    if (an.webhook.wired) {
+      return h("span", { class: "chip warn", title: "Webhook stored in plain text in services.toml" }, label + " · in file");
+    }
+    return h("span", { class: "chip bad", title: an.webhook.reason || "" }, label + " · " + (an.webhook.reason || "not ready"));
   }
 
   function tokenChip(t) {
@@ -327,6 +346,46 @@
         await write("/api/token", { service: full, token: $("f-token").value });
         delete tests[full];
         toast("Stored the " + full + " token in the Keychain");
+      });
+  }
+
+  function openSlack(name, an) {
+    const hasHook = !!an && an.webhook.source !== "none";
+    const fields = [
+      field("f-channel", "Channel label", { value: an ? an.channel : "", placeholder: "#releases", required: true,
+        hint: "Shown in agentflow's output; the webhook decides where Slack posts." }),
+      field("f-envs", "Envs that announce", { value: an ? an.envs.join(", ") : "", placeholder: "prod", mono: true,
+        hint: "Comma-separated. Empty means prod." }),
+      field("f-hook", "Incoming webhook", { type: "password", mono: true, required: !hasHook,
+        placeholder: hasHook ? "leave empty to keep the stored webhook" : "https://hooks.slack.com/services/…",
+        hint: "Stored in your login Keychain (service agentflow), never in services.toml." }),
+    ];
+    if (an) {
+      const rm = h("button", { class: "btn danger", type: "button", text: "Turn off Slack announce" });
+      let armed = null;
+      rm.addEventListener("click", () => {
+        if (!armed) {
+          rm.classList.add("armed");
+          rm.textContent = "Confirm: remove settings and webhook";
+          armed = setTimeout(() => { armed = null; rm.classList.remove("armed"); rm.textContent = "Turn off Slack announce"; }, 4000);
+          return;
+        }
+        clearTimeout(armed);
+        busy(rm, async () => {
+          await write("/api/announce/remove", { name });
+          $("dlg").close();
+          toast("Slack announce is off for " + name);
+        });
+      });
+      fields.push(h("div", { class: "field" }, rm));
+    }
+    openDialog("Slack announce for " + name,
+      "agentflow ship announce posts a verified deploy here.", fields, "Save",
+      async () => {
+        const form = { channel: val("f-channel"), envs: val("f-envs"), hook: $("f-hook").value };
+        const envs = form.envs ? form.envs.split(",").map((e) => e.trim()).filter(Boolean) : ["prod"];
+        await write("/api/announce", { name, channel: form.channel, envs, webhook: form.hook });
+        toast("Saved Slack announce for " + name);
       });
   }
 
