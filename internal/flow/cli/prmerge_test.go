@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
@@ -22,6 +23,8 @@ func TestPRMergeUsageErrors(t *testing.T) {
 		{[]string{"pr", "merge", "7", "--sync-branch", "a/../b"}, "plain branch name"},
 		{[]string{"pr", "merge", "7", "--sync-branch", "a b"}, "plain branch name"},
 		{[]string{"pr", "merge", "7", "--repo", "nope"}, "not OWNER/NAME"},
+		{[]string{"pr", "merge", "7", "--repo", "./repo"}, "not OWNER/NAME"},
+		{[]string{"pr", "merge", "7", "--repo", "owner/.."}, "not OWNER/NAME"},
 		{[]string{"pr", "merge", "7", "--delete-branch"}, "flag provided but not defined"},
 	}
 	for _, c := range cases {
@@ -29,6 +32,16 @@ func TestPRMergeUsageErrors(t *testing.T) {
 		if code := Run(c.args, &out, &errb); code != 1 || !strings.Contains(errb.String(), c.want) {
 			t.Errorf("%v: exit %d, stderr %q; want 1 and %q", c.args, code, errb.String(), c.want)
 		}
+	}
+}
+
+func TestPRMergeCancellationDuringRepoDiscovery(t *testing.T) {
+	t.Setenv("AGENTFLOW_GH", "/nonexistent/gh")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var out, errb bytes.Buffer
+	if code := runPRMerge(ctx, []string{"7"}, &out, &errb); code != 130 {
+		t.Fatalf("exit %d, stderr %q; want 130", code, errb.String())
 	}
 }
 

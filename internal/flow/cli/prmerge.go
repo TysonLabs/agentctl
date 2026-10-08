@@ -83,6 +83,10 @@ func runPRMerge(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		// not undoable.
 		out, err := o.GH(ctx, "repo", "view", "--json", "nameWithOwner")
 		if err != nil {
+			if ctx.Err() != nil {
+				fmt.Fprintln(stderr, "agentflow pr merge: interrupted")
+				return prMergeExitCodes[pr.MergeInterrupted]
+			}
 			return fail("no --repo and the current directory has no GitHub repo: %v", err)
 		}
 		var rv struct {
@@ -93,7 +97,8 @@ func runPRMerge(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		}
 		o.Repo = rv.NameWithOwner
 	}
-	if !repoRe.MatchString(o.Repo) {
+	owner, name, _ := strings.Cut(o.Repo, "/")
+	if !repoRe.MatchString(o.Repo) || owner == "." || owner == ".." || name == "." || name == ".." {
 		return fail("--repo %q is not OWNER/NAME", o.Repo)
 	}
 

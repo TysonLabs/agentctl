@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -18,7 +19,7 @@ const (
 	MergeMerged      MergeStatus = "merged"      // merged (and synced, if asked)
 	MergeRefused     MergeStatus = "refused"     // not ready: reasons listed, nothing changed
 	MergeSyncFailed  MergeStatus = "sync_failed" // merged, but the sync branch was not fast-forwarded
-	MergeUnconfirmed MergeStatus = "unconfirmed" // gh accepted the merge but the PR never read back as merged
+	MergeUnconfirmed MergeStatus = "unconfirmed" // the merge call's outcome could not be confirmed
 	MergeGHError     MergeStatus = "gh_error"    // gh failed; nothing was merged
 	MergeInterrupted MergeStatus = "interrupted" // cancelled before the merge started
 )
@@ -77,7 +78,7 @@ var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 // prState is one read of the fields readiness depends on.
 type prState struct {
 	State       string `json:"state"`
-	IsDraft     bool   `json:"isDraft"`
+	IsDraft     *bool  `json:"isDraft"`
 	HeadRefOid  string `json:"headRefOid"`
 	BaseRefName string `json:"baseRefName"`
 	Mergeable   string `json:"mergeable"`
@@ -101,6 +102,26 @@ func Merge(ctx context.Context, o MergeOptions) MergeResult {
 		return finish(MergeGHError, "", "--head must be a full 40-character commit sha")
 	}
 
+	// Read the potentially paginated thread list first, then read the PR
+	// fields immediately before the merge. In particular, do not merge from a
+	// PR snapshot that predates the slower pagination request.
+	open, complete, err := countOpenThreads(ctx, o)
+	if ctx.Err() != nil {
+		return finish(MergeInterrupted, "", "interrupted")
+	}
+	if err != nil {
+		return finish(MergeGHError, "", err.Error())
+	}
+	if !complete {
+		res.Reasons = append(res.Reasons, "review threads could not all be read (GitHub reported an incomplete page set)")
+	}
+	if open > 0 {
+		res.Reasons = append(res.Reasons, fmt.Sprintf("%d unresolved review thread(s)", open))
+	}
+	if len(res.Reasons) > 0 {
+		return finish(MergeRefused, "fix the reasons listed, then run again", "")
+	}
+
 	st, err := readMergeable(ctx, o)
 	if ctx.Err() != nil {
 		return finish(MergeInterrupted, "", "interrupted")
@@ -113,8 +134,13 @@ func Merge(ctx context.Context, o MergeOptions) MergeResult {
 	if st.State != "OPEN" {
 		res.Reasons = append(res.Reasons, "PR is "+strings.ToLower(st.State))
 	}
-	if st.IsDraft {
+	if st.IsDraft == nil {
+		res.Reasons = append(res.Reasons, "PR draft state is unknown")
+	} else if *st.IsDraft {
 		res.Reasons = append(res.Reasons, "PR is a draft")
+	}
+	if !shaRe.MatchString(res.Head) {
+		res.Reasons = append(res.Reasons, "PR head is not a full commit sha")
 	}
 	if o.Head != "" && !strings.EqualFold(o.Head, res.Head) {
 		res.Reasons = append(res.Reasons, fmt.Sprintf("PR head is %s, not the expected %s", res.Head, strings.ToLower(o.Head)))
@@ -128,18 +154,6 @@ func Merge(ctx context.Context, o MergeOptions) MergeResult {
 	}
 	if o.SyncBranch != "" && o.SyncBranch == st.BaseRefName {
 		res.Reasons = append(res.Reasons, "--sync-branch is the PR's base branch")
-	}
-	open, complete, err := countOpenThreads(ctx, o)
-	if ctx.Err() != nil {
-		return finish(MergeInterrupted, "", "interrupted")
-	}
-	switch {
-	case err != nil:
-		return finish(MergeGHError, "", err.Error())
-	case !complete:
-		res.Reasons = append(res.Reasons, "review threads could not all be read (GitHub reported more pages)")
-	case open > 0:
-		res.Reasons = append(res.Reasons, fmt.Sprintf("%d unresolved review thread(s)", open))
 	}
 	if len(res.Reasons) > 0 {
 		return finish(MergeRefused, "fix the reasons listed, then run again", "")
@@ -163,20 +177,35 @@ func Merge(ctx context.Context, o MergeOptions) MergeResult {
 	if mergeErr != nil {
 		wait = 0
 	}
-	merged, err := confirmMerged(dctx, o, wait)
+	merged, mergedBase, err := confirmMerged(dctx, o, wait)
 	switch {
 	case merged != "":
 		res.MergeSHA = merged
+		if mergedBase != "" {
+			res.Base = mergedBase
+		}
+	case err != nil:
+		msg := err.Error()
+		if mergeErr != nil {
+			msg = mergeErr.Error() + "; confirmation failed: " + msg
+		}
+		return finish(MergeUnconfirmed, "check the PR on GitHub before verifying a deploy", msg)
 	case mergeErr != nil:
 		return finish(MergeGHError, "", mergeErr.Error())
-	case err != nil:
-		return finish(MergeUnconfirmed, "check the PR on GitHub before verifying a deploy", err.Error())
 	default:
 		return finish(MergeUnconfirmed, "check the PR on GitHub (a merge queue may hold it) before verifying a deploy", "PR did not read back as merged")
 	}
 
 	if o.SyncBranch == "" {
 		return finish(MergeMerged, "verify the deploy with the merge_sha", "")
+	}
+	if mergedBase == "" {
+		res.Sync = &Sync{Branch: o.SyncBranch, Status: "failed", Error: "merged PR response had no base branch"}
+		return finish(MergeSyncFailed, "the merge landed; sync "+o.SyncBranch+" by hand (never force), then verify the deploy", "")
+	}
+	if o.SyncBranch == mergedBase {
+		res.Sync = &Sync{Branch: o.SyncBranch, Status: "refused", Error: "--sync-branch is the merged PR's base branch"}
+		return finish(MergeSyncFailed, "the merge landed; no branch sync was attempted", "")
 	}
 	res.Sync = syncBranch(dctx, o, res.Base)
 	if res.Sync.Status != "synced" {
@@ -195,31 +224,42 @@ func readMergeable(ctx context.Context, o MergeOptions) (prState, error) {
 		if err != nil || st.Mergeable != "UNKNOWN" || !time.Now().Before(deadline) {
 			return st, err
 		}
+		delay := min(o.MergeableInterval, time.Until(deadline))
 		select {
 		case <-ctx.Done():
 			return st, ctx.Err()
-		case <-time.After(o.MergeableInterval):
+		case <-time.After(delay):
 		}
 	}
 }
 
 // confirmMerged re-reads the PR until it is MERGED with a merge commit, up
-// to wait, and returns that commit's sha ("" if it never was).
-func confirmMerged(ctx context.Context, o MergeOptions, wait time.Duration) (string, error) {
+// to wait, and returns that commit's sha and the base it merged into.
+func confirmMerged(ctx context.Context, o MergeOptions, wait time.Duration) (string, string, error) {
 	deadline := time.Now().Add(wait)
 	var lastErr error
 	for {
-		st, err := readPR(ctx, o, "state,mergeCommit")
+		st, err := readPR(ctx, o, "state,mergeCommit,baseRefName")
 		lastErr = err
-		if err == nil && st.State == "MERGED" && st.MergeCommit != nil {
-			if sha := strings.ToLower(st.MergeCommit.Oid); shaRe.MatchString(sha) {
-				return sha, nil
+		if err == nil {
+			switch st.State {
+			case "MERGED":
+				if st.MergeCommit != nil {
+					if sha := strings.ToLower(st.MergeCommit.Oid); shaRe.MatchString(sha) {
+						return sha, st.BaseRefName, nil
+					}
+				}
+				lastErr = fmt.Errorf("PR read back as merged without a valid merge commit sha")
+			case "OPEN", "CLOSED":
+				lastErr = nil
+			default:
+				lastErr = fmt.Errorf("PR read back with unknown state %q", st.State)
 			}
 		}
 		if !time.Now().Before(deadline) {
-			return "", lastErr
+			return "", "", lastErr
 		}
-		time.Sleep(o.ConfirmInterval)
+		time.Sleep(min(o.ConfirmInterval, time.Until(deadline)))
 	}
 }
 
@@ -243,7 +283,7 @@ const allThreadsQuery = `query($o:String!,$n:String!,$p:Int!,$endCursor:String){
 // page said there are no more.
 func countOpenThreads(ctx context.Context, o MergeOptions) (int, bool, error) {
 	owner, name, _ := strings.Cut(o.Repo, "/")
-	out, err := o.GH(ctx, "api", "graphql", "--paginate", "--slurp", "-F", "o="+owner, "-F", "n="+name, "-F", fmt.Sprintf("p=%d", o.PR), "-f", "query="+allThreadsQuery)
+	out, err := o.GH(ctx, "api", "graphql", "--paginate", "--slurp", "-f", "o="+owner, "-f", "n="+name, "-F", fmt.Sprintf("p=%d", o.PR), "-f", "query="+allThreadsQuery)
 	if err != nil {
 		return 0, false, err
 	}
@@ -253,7 +293,8 @@ func countOpenThreads(ctx context.Context, o MergeOptions) (int, bool, error) {
 				PullRequest *struct {
 					ReviewThreads *struct {
 						PageInfo *struct {
-							HasNextPage bool `json:"hasNextPage"`
+							HasNextPage *bool   `json:"hasNextPage"`
+							EndCursor   *string `json:"endCursor"`
 						} `json:"pageInfo"`
 						Nodes []*struct {
 							IsResolved *bool `json:"isResolved"`
@@ -278,19 +319,19 @@ func countOpenThreads(ctx context.Context, o MergeOptions) (int, bool, error) {
 		return 0, false, fmt.Errorf("gh api graphql: %w", err)
 	}
 	if len(pages) == 0 {
-		return 0, false, fmt.Errorf("gh api graphql: no pages")
+		return 0, false, nil
 	}
 	open, complete := 0, false
-	for _, p := range pages {
+	for i, p := range pages {
 		if len(p.Errors) > 0 {
 			return 0, false, fmt.Errorf("gh api graphql: %s", p.Errors[0].Message)
 		}
-		if p.Data.Repository == nil || p.Data.Repository.PullRequest == nil || p.Data.Repository.PullRequest.ReviewThreads == nil {
+		if p.Data.Repository == nil || p.Data.Repository.PullRequest == nil {
 			return 0, false, fmt.Errorf("gh api graphql: response has no reviewThreads")
 		}
 		rt := p.Data.Repository.PullRequest.ReviewThreads
-		if rt.PageInfo == nil || rt.Nodes == nil {
-			return 0, false, fmt.Errorf("gh api graphql: incomplete reviewThreads response")
+		if rt == nil || rt.PageInfo == nil || rt.PageInfo.HasNextPage == nil || rt.Nodes == nil {
+			return open, false, nil
 		}
 		for _, n := range rt.Nodes {
 			// A thread whose state is missing counts as open: unknown is not resolved.
@@ -298,7 +339,14 @@ func countOpenThreads(ctx context.Context, o MergeOptions) (int, bool, error) {
 				open++
 			}
 		}
-		complete = !rt.PageInfo.HasNextPage
+		hasNext := *rt.PageInfo.HasNextPage
+		if hasNext && (rt.PageInfo.EndCursor == nil || *rt.PageInfo.EndCursor == "") {
+			return open, false, nil
+		}
+		if (!hasNext && i != len(pages)-1) || (hasNext && i == len(pages)-1) {
+			return open, false, nil
+		}
+		complete = !hasNext
 	}
 	return open, complete, nil
 }
@@ -307,7 +355,7 @@ func countOpenThreads(ctx context.Context, o MergeOptions) (int, bool, error) {
 // GitHub. force=false makes GitHub refuse anything but a fast-forward (422).
 func syncBranch(ctx context.Context, o MergeOptions, base string) *Sync {
 	s := &Sync{Branch: o.SyncBranch}
-	out, err := o.GH(ctx, "api", fmt.Sprintf("repos/%s/git/ref/heads/%s", o.Repo, base))
+	out, err := o.GH(ctx, "api", fmt.Sprintf("repos/%s/git/ref/heads/%s", o.Repo, escapeRef(base)))
 	if err != nil {
 		s.Status, s.Error = "failed", err.Error()
 		return s
@@ -322,14 +370,24 @@ func syncBranch(ctx context.Context, o MergeOptions, base string) *Sync {
 		return s
 	}
 	s.SHA = strings.ToLower(ref.Object.SHA)
-	_, err = o.GH(ctx, "api", "-X", "PATCH", fmt.Sprintf("repos/%s/git/refs/heads/%s", o.Repo, o.SyncBranch), "-f", "sha="+s.SHA, "-F", "force=false")
+	_, err = o.GH(ctx, "api", "-X", "PATCH", fmt.Sprintf("repos/%s/git/refs/heads/%s", o.Repo, escapeRef(o.SyncBranch)), "-f", "sha="+s.SHA, "-F", "force=false")
 	switch {
 	case err == nil:
 		s.Status = "synced"
-	case strings.Contains(err.Error(), "422") || strings.Contains(strings.ToLower(err.Error()), "not a fast forward"):
+	case strings.Contains(strings.ToLower(err.Error()), "not a fast forward"):
 		s.Status, s.Error = "refused", "not a fast-forward of "+base+": "+err.Error()
 	default:
 		s.Status, s.Error = "failed", err.Error()
 	}
 	return s
+}
+
+// escapeRef preserves the slash-separated ref hierarchy while preventing a
+// valid Git ref containing URL metacharacters from changing the REST URL.
+func escapeRef(ref string) string {
+	parts := strings.Split(ref, "/")
+	for i := range parts {
+		parts[i] = url.PathEscape(parts[i])
+	}
+	return strings.Join(parts, "/")
 }

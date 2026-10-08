@@ -66,9 +66,9 @@ Output: a JSON result on stdout with "merge_sha" (for agentflow ship verify
 --sha), "reasons" when refused, and "sync" when --sync-branch is given.
 
 Exit codes: 0 merged (and synced) · 1 usage or gh error, nothing merged ·
-2 refused, nothing changed · 3 merged, sync refused or failed · 4 gh
-accepted the merge but the PR never read back as merged · 130 interrupted
-before the merge.
+2 refused, nothing changed · 3 merged, sync refused or failed · 4 the
+merge call's outcome could not be confirmed · 130 interrupted before the
+merge.
 `
 
 var prExitCodes = map[pr.Status]int{
