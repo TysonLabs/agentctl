@@ -33,6 +33,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/TysonLabs/agentctl/internal/flow/proc"
 )
 
 // Status is the outcome of one run. Every run ends in exactly one.
@@ -227,11 +229,11 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	res.DurationS = time.Since(start).Round(10 * time.Millisecond).Seconds()
 	endedAfterResult := killed == statusEndedAfterResult
 	if endedAfterResult {
-		killed = "" // killGroup already reaped the whole group
+		killed = "" // proc.KillGroup already reaped the whole group
 	} else if killed == "" {
 		// cmd.Wait only reaps the direct child. Do not leave helpers from a
 		// normally exiting codex process running in its process group.
-		cleanupGroup(cmd.Process.Pid, o.Grace)
+		proc.CleanupGroup(cmd.Process.Pid, o.Grace)
 	}
 
 	// The pipe closes when every holder of the write end exits. A grandchild
@@ -381,53 +383,11 @@ func watch(ctx context.Context, o Options, pid int, start time.Time, st *streamS
 			return "", err
 		default:
 		}
-		naturalExit, waitErr := killGroup(pid, o.Grace, waitCh)
+		naturalExit, waitErr := proc.KillGroup(pid, o.Grace, waitCh)
 		if naturalExit {
 			return "", waitErr
 		}
 		return reason, waitErr
-	}
-}
-
-// killGroup sends SIGTERM to the whole process group, then SIGKILL after
-// grace if the agent is still alive. It always reaps the process. The bool
-// reports that the direct child had already been reaped before signaling, so
-// its exit was natural even if descendants still needed cleanup.
-func killGroup(pid int, grace time.Duration, waitCh <-chan error) (bool, error) {
-	naturalExit := errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
-	_ = syscall.Kill(-pid, syscall.SIGTERM)
-	select {
-	case err := <-waitCh:
-		_ = syscall.Kill(-pid, syscall.SIGKILL) // stragglers in the group
-		return naturalExit, err
-	case <-time.After(grace):
-	}
-	_ = syscall.Kill(-pid, syscall.SIGKILL)
-	return naturalExit, <-waitCh
-}
-
-// cleanupGroup terminates descendants left in the agent's process group after the
-// direct child exits normally. It is bounded even if a descendant ignores
-// SIGTERM.
-func cleanupGroup(pid int, grace time.Duration) {
-	if err := syscall.Kill(-pid, 0); err != nil {
-		return
-	}
-	_ = syscall.Kill(-pid, syscall.SIGTERM)
-	deadline := time.NewTimer(grace)
-	defer deadline.Stop()
-	tick := time.NewTicker(20 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		select {
-		case <-tick.C:
-			if err := syscall.Kill(-pid, 0); err != nil {
-				return
-			}
-		case <-deadline.C:
-			_ = syscall.Kill(-pid, syscall.SIGKILL)
-			return
-		}
 	}
 }
 

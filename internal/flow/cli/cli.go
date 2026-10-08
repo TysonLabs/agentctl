@@ -1,7 +1,8 @@
 // Package cli implements the agentflow command dispatch. Exit codes are
 // assigned in this package and nowhere else, one table per command
-// (exitCodes for codex, shipExitCodes for ship verify, prExitCodes for pr
-// wait, replyExitCodes for pr reply, prMergeExitCodes for pr merge). 0 is success, 1 a
+// (exitCodes for codex, coderabbitExitCodes for coderabbit, shipExitCodes
+// for ship verify, prExitCodes for pr wait, replyExitCodes for pr reply,
+// prMergeExitCodes for pr merge). 0 is success, 1 a
 // usage or precondition error, 124 a timeout and 130 an interruption for
 // every command.
 package cli
@@ -32,6 +33,8 @@ const usage = `agentflow — small, single-purpose workflow commands for coding 
 Usage:
   agentflow codex [flags]                      run Codex (codex exec) safely; JSON result
   agentflow claude [flags]                     run Claude Code (claude -p) safely; JSON result
+  agentflow coderabbit [flags]                 run the CodeRabbit CLI's local review safely;
+                                               JSON findings (see: agentflow coderabbit --help)
   agentflow ship verify <svc.env> --sha REV    wait until a deployed service runs REV
   agentflow ship announce <svc.env> --verified FILE ...
                                                post a verified deploy to Slack
@@ -108,6 +111,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 			b = agent.Claude
 		}
 		return runAgent(ctx, args[0], b, args[1:], stdout, stderr)
+	case "coderabbit":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runCodeRabbit(ctx, args[1:], stdout, stderr)
 	case "ship":
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
