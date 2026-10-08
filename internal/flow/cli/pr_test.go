@@ -58,3 +58,52 @@ func TestPRExitCodesCoverEveryStatus(t *testing.T) {
 		t.Errorf("prExitCodes has %d entries, want %d", len(prExitCodes), len(all))
 	}
 }
+
+func TestPRReplyUsageErrors(t *testing.T) {
+	t.Setenv("AGENTFLOW_GH", "/nonexistent/gh") // never run: each case fails first
+	const id = "PRRT_kwDOabc"
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"pr", "reply"}, "exactly one thread id"},
+		{[]string{"pr", "reply", id, "PRRT_two", "--keep", "r"}, "exactly one thread id"},
+		{[]string{"pr", "reply", "123", "--keep", "r"}, "not a review-thread node id"},
+		{[]string{"pr", "reply", id}, "exactly one of --fixed"},
+		{[]string{"pr", "reply", id, "--fixed", "0123abc"}, "needs --note"},
+		{[]string{"pr", "reply", id, "--fixed", "xyz", "--note", "n"}, "not a commit sha"},
+		{[]string{"pr", "reply", id, "--keep", "r", "--repo", "nope"}, "not OWNER/NAME"},
+		{[]string{"pr", "reply", id, "--bogus"}, "flag provided but not defined"},
+	}
+	for _, c := range cases {
+		var out, errb bytes.Buffer
+		if code := Run(c.args, &out, &errb); code != 1 || !strings.Contains(errb.String(), c.want) {
+			t.Errorf("%v: exit %d, stderr %q; want 1 and %q", c.args, code, errb.String(), c.want)
+		}
+	}
+}
+
+func TestPRReplyHelp(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := Run([]string{"pr", "reply", "--help"}, &out, &errb); code != 0 || !strings.Contains(out.String(), "agentflow pr reply") {
+		t.Errorf("exit %d, stdout %q", code, out.String())
+	}
+}
+
+func TestReplyExitCodesCoverEveryStatus(t *testing.T) {
+	all := []pr.ReplyStatus{pr.ReplyDone, pr.ReplyRefused, pr.ReplyNotResolved, pr.ReplyGHError, pr.ReplyInterrupted}
+	seen := map[int]pr.ReplyStatus{}
+	for _, s := range all {
+		code, ok := replyExitCodes[s]
+		if !ok {
+			t.Errorf("no exit code for %s", s)
+		}
+		if prev, dup := seen[code]; dup {
+			t.Errorf("exit %d used by %s and %s", code, prev, s)
+		}
+		seen[code] = s
+	}
+	if len(replyExitCodes) != len(all) {
+		t.Errorf("replyExitCodes has %d entries, want %d", len(replyExitCodes), len(all))
+	}
+}

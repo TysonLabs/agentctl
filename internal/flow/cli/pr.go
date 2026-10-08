@@ -42,6 +42,23 @@ Exit codes: 0 reviewed, no open threads · 1 usage or gh error · 2 not
 reviewed yet (--once) · 3 review skipped (draft, base, paused) · 4 rate-limited
 · 5 PR closed before its head was reviewed · 10 reviewed, open threads
 · 124 timeout · 130 interrupted.
+
+agentflow pr reply <thread-id> (--fixed SHA --note TEXT | --keep REASON) [flags]
+
+Reply to one review thread, then resolve it. The reply reads "Fixed in <sha>:
+<note>" or "Keeping as-is: <reason>". Take the thread id from pr wait's
+"open_threads". A thread never gets a second identical reply, so a run that
+posted the reply but failed to resolve can simply be repeated.
+
+  --fixed SHA        the commit that fixes the finding; it must already be
+                     pushed (GitHub must know it), or nothing is posted
+  --note TEXT        what the fix changed (required with --fixed)
+  --keep REASON      why the code stays as it is
+  --repo OWNER/NAME  refuse unless the thread belongs to this repository
+
+Exit codes: 0 replied and resolved (or already done) · 1 usage or gh error,
+nothing posted · 2 refused, nothing posted · 3 replied but not resolved
+(run it again) · 130 interrupted, nothing posted.
 `
 
 var prExitCodes = map[pr.Status]int{
@@ -63,7 +80,11 @@ func runPR(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stdout, prUsage)
 		return 0
 	}
-	if args[0] != "wait" {
+	switch args[0] {
+	case "wait":
+	case "reply":
+		return runPRReply(ctx, args[1:], stdout, stderr)
+	default:
 		fmt.Fprintf(stderr, "agentflow pr: unknown subcommand %q\n\n%s", args[0], prUsage)
 		return 1
 	}
