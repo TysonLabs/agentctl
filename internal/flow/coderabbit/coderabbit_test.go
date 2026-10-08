@@ -452,3 +452,61 @@ func assertDead(t *testing.T, pid int) {
 	_ = syscall.Kill(pid, syscall.SIGKILL)
 	t.Fatalf("child %d of the coderabbit process group survived", pid)
 }
+
+// realRateLimit is a CLI 0.8.2 stream that hit the free review limit (long
+// free-text fields shortened). Its error event is typed and marked
+// recoverable, and the CLI then exits 1.
+var realRateLimit = []string{
+	"{\"type\": \"review_context\", \"reviewType\": \"committed\", \"currentBranch\": \"feat/agentflow-pr-merge\", \"baseBranch\": \"origin/main\", \"workingDirectory\": \"/repo\"}",
+	"{\"type\": \"status\", \"phase\": \"connecting\", \"status\": \"connecting_to_review_service\"}",
+	"{\"type\": \"status\", \"phase\": \"analyzing\", \"status\": \"setting_up\", \"message\": \"TysonLabs/agentctl is not connected to a CodeRabbit organization you can access,\"}",
+	"{\"type\": \"status\", \"phase\": \"setup\", \"status\": \"setting_up\"}",
+	"{\"type\": \"error\", \"errorType\": \"rate_limit\", \"message\": \"Rate limit exceeded\", \"recoverable\": true, \"details\": {}, \"metadata\": {\"isProUser\": false, \"waitTime\": \"45 minutes\"}}",
+}
+
+func feed(lines ...string) *stream {
+	st := &stream{}
+	for _, l := range lines {
+		st.handle([]byte(l))
+	}
+	return st
+}
+
+func TestRealRateLimitStreamIsRateLimited(t *testing.T) {
+	if s, msg := decide(1, feed(realRateLimit...), "Error: Rate limit exceeded\n"); s != StatusRateLimited {
+		t.Fatalf("got %s %q", s, msg)
+	}
+}
+
+// The typed errorType names a rate limit even when no text says so.
+func TestTypedRateLimitWithNeutralMessage(t *testing.T) {
+	st := feed(`{"type":"error","errorType":"rate_limit","message":"Request denied","recoverable":false}`)
+	if s, msg := decide(1, st, ""); s != StatusRateLimited || msg != "Request denied" {
+		t.Fatalf("got %s %q", s, msg)
+	}
+}
+
+func TestRecoverableErrorThenResultIsTheResult(t *testing.T) {
+	st := feed(
+		`{"type":"error","errorType":"network","message":"connection reset, retrying","recoverable":true}`,
+		`{"type":"complete","status":"review_completed","findings":0,"reviewedFiles":["a.go"],"outcome":"completed"}`,
+	)
+	if s, msg := decide(0, st, ""); s != StatusClean {
+		t.Fatalf("got %s %q", s, msg)
+	}
+	// Without a result, the recoverable error is still the reason.
+	st = feed(`{"type":"error","errorType":"network","message":"connection reset, retrying","recoverable":true}`)
+	if s, msg := decide(1, st, ""); s != StatusFailed || msg != "connection reset, retrying" {
+		t.Fatalf("got %s %q", s, msg)
+	}
+}
+
+func TestNonRecoverableErrorFailsEvenWithAResult(t *testing.T) {
+	st := feed(
+		`{"type":"error","errorType":"internal","message":"sandbox lost","recoverable":false}`,
+		`{"type":"complete","status":"review_completed","findings":0,"outcome":"completed"}`,
+	)
+	if s, msg := decide(0, st, ""); s != StatusFailed || msg != "sandbox lost" {
+		t.Fatalf("got %s %q", s, msg)
+	}
+}

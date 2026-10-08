@@ -300,7 +300,7 @@ func decide(code int, st *stream, stderrText string) (Status, string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	limited := func(s Status, msg string) (Status, string) {
-		if rateLimitRe.MatchString(msg) || rateLimitRe.MatchString(st.messages) || rateLimitRe.MatchString(stderrText) {
+		if st.rateLimited || rateLimitRe.MatchString(msg) || rateLimitRe.MatchString(st.messages) || rateLimitRe.MatchString(stderrText) {
 			return StatusRateLimited, msg
 		}
 		return s, msg
@@ -308,6 +308,9 @@ func decide(code int, st *stream, stderrText string) (Status, string) {
 	switch {
 	case code != 0:
 		msg := st.errorMsg
+		if msg == "" {
+			msg = st.recoverableMsg
+		}
 		if msg == "" {
 			msg = lastLine(stderrText)
 		}
@@ -399,6 +402,8 @@ type event struct {
 	Phase         string          `json:"phase"`
 	Message       string          `json:"message"`
 	Error         json.RawMessage `json:"error"`
+	ErrorType     string          `json:"errorType"`
+	Recoverable   *bool           `json:"recoverable"`
 	BaseBranch    string          `json:"baseBranch"`
 	BaseCommit    string          `json:"baseCommit"`
 	ReviewType    string          `json:"reviewType"`
@@ -419,8 +424,12 @@ type stream struct {
 	context  *event
 	findings []Finding
 	complete *event
-	errorMsg string
-	messages string // every status/complete/error message, for rate-limit detection
+	errorMsg string // the last non-recoverable error event
+	// recoverableMsg is the last error event marked recoverable: it fails a
+	// run only when no valid result follows (a nonzero exit or no complete).
+	recoverableMsg string
+	rateLimited    bool   // an error event typed rate_limit, whatever its message says
+	messages       string // every status/complete/error message, for rate-limit detection
 }
 
 func (s *stream) consume(r io.Reader, raw io.Writer) {
@@ -465,7 +474,14 @@ func (s *stream) handle(line []byte) {
 		if msg == "" {
 			msg = "coderabbit reported an error event"
 		}
-		s.errorMsg = msg
+		if ev.ErrorType == "rate_limit" {
+			s.rateLimited = true
+		}
+		if ev.Recoverable != nil && *ev.Recoverable {
+			s.recoverableMsg = msg
+		} else {
+			s.errorMsg = msg
+		}
 		s.messages += msg + "\n"
 	}
 }
