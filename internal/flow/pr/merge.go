@@ -80,7 +80,7 @@ func ValidBranch(name string) bool {
 	return branchRe.MatchString(name) && !strings.Contains(name, "..")
 }
 
-var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
+var fullSHARe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // prState is one read of the fields readiness and confirmation depend on.
 type prState struct {
@@ -109,7 +109,7 @@ func Merge(ctx context.Context, o MergeOptions) MergeResult {
 		res.CheckedAt = time.Now().UTC().Format(time.RFC3339)
 		return res
 	}
-	if !shaRe.MatchString(strings.ToLower(o.Head)) && o.Head != "" {
+	if !fullSHARe.MatchString(strings.ToLower(o.Head)) && o.Head != "" {
 		return finish(MergeGHError, "", "--head must be a full 40-character commit sha")
 	}
 
@@ -160,7 +160,7 @@ func Merge(ctx context.Context, o MergeOptions) MergeResult {
 	} else if *st.IsDraft {
 		res.Reasons = append(res.Reasons, "PR is a draft")
 	}
-	if !shaRe.MatchString(res.Head) {
+	if !fullSHARe.MatchString(res.Head) {
 		res.Reasons = append(res.Reasons, "PR head is not a full commit sha")
 	}
 	if o.Head != "" && !strings.EqualFold(o.Head, res.Head) {
@@ -285,7 +285,7 @@ func confirmMerged(ctx context.Context, o MergeOptions, pinned string) confirmat
 				case !strings.EqualFold(st.HeadRefOid, pinned):
 					c.err = fmt.Errorf("PR read back as merged at head %s, not the pinned %s", strings.ToLower(st.HeadRefOid), pinned)
 					return c // a merged PR's head no longer changes
-				case shaRe.MatchString(sha):
+				case fullSHARe.MatchString(sha):
 					c.sha, c.base = sha, st.BaseRefName
 					return c
 				default:
@@ -427,7 +427,7 @@ func syncBranch(ctx context.Context, o MergeOptions, base string) *Sync {
 			SHA string `json:"sha"`
 		} `json:"object"`
 	}
-	if err := json.Unmarshal(out, &ref); err != nil || !shaRe.MatchString(strings.ToLower(ref.Object.SHA)) {
+	if err := json.Unmarshal(out, &ref); err != nil || !fullSHARe.MatchString(strings.ToLower(ref.Object.SHA)) {
 		s.Status, s.Error = "failed", "could not read the head of "+base
 		return s
 	}
