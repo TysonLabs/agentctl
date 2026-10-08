@@ -218,25 +218,43 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	if err != nil {
 		return res, err
 	}
+	er, ew, err := os.Pipe()
+	if err != nil {
+		pr.Close()
+		pw.Close()
+		return res, err
+	}
 	cmd := exec.Command(o.Bin, res.Args...)
 	cmd.Dir = o.Dir
 	// cmd.Stdin stays nil: os/exec connects /dev/null.
 	cmd.Stdout = pw
-	cmd.Stderr = activityWriter{w: stderrFile, st: st}
+	// Give os/exec a file rather than activityWriter directly. A non-file
+	// writer makes cmd.Wait wait for os/exec's internal copy pipe, which an
+	// escaped descendant can hold open forever after the process group dies.
+	cmd.Stderr = ew
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
 		pr.Close()
 		pw.Close()
+		er.Close()
+		ew.Close()
 		return res, fmt.Errorf("starting %s: %w", o.Bin, err)
 	}
 	pw.Close() // the child holds the write end now
+	ew.Close()
 
-	readerDone := make(chan struct{})
+	var readers sync.WaitGroup
+	readers.Add(2)
 	go func() {
-		defer close(readerDone)
+		defer readers.Done()
 		st.consume(pr, events)
+	}()
+	go func() {
+		defer readers.Done()
+		defer er.Close()
+		_, _ = io.Copy(activityWriter{w: stderrFile, st: st}, er)
 	}()
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
@@ -246,14 +264,21 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	if killed == "" {
 		proc.CleanupGroup(cmd.Process.Pid, o.Grace)
 	}
-	// A grandchild that left the group could hold the pipe open forever.
+	// A grandchild that left the group could hold either pipe open forever.
+	readersDone := make(chan struct{})
+	go func() {
+		readers.Wait()
+		close(readersDone)
+	}()
 	select {
-	case <-readerDone:
+	case <-readersDone:
 	case <-time.After(o.Grace):
 		pr.Close()
-		<-readerDone
+		er.Close()
+		<-readersDone
 	}
 	pr.Close()
+	er.Close()
 
 	st.fill(&res)
 	if killed != "" {
@@ -301,9 +326,9 @@ func decide(code int, st *stream, stderrText string) (Status, string) {
 		}
 		return limited(StatusFailed, msg)
 	case st.complete.Findings == nil:
-		return StatusNoResult, "the complete event has no findings count"
+		return limited(StatusNoResult, "the complete event has no findings count")
 	case *st.complete.Findings != len(st.findings):
-		return StatusNoResult, fmt.Sprintf("the complete event reports %d findings but the stream carried %d", *st.complete.Findings, len(st.findings))
+		return limited(StatusNoResult, fmt.Sprintf("the complete event reports %d findings but the stream carried %d", *st.complete.Findings, len(st.findings)))
 	case len(st.findings) == 0:
 		return StatusClean, ""
 	default:

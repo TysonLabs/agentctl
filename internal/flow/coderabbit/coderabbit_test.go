@@ -61,6 +61,13 @@ func fakeCodeRabbit(mode string) int {
 		emit(complete(2))
 	case "no-count":
 		emit(`{"type":"complete","status":"review_completed","outcome":"completed"}`)
+	case "ratelimit-no-count":
+		emit(`{"type":"status","phase":"reviewing","status":"error","message":"Rate limit exceeded"}`)
+		emit(`{"type":"complete","status":"review_completed","outcome":"completed"}`)
+	case "ratelimit-mismatch":
+		emit(`{"type":"status","phase":"reviewing","status":"error","message":"Rate limit exceeded"}`)
+		emit(findingOne)
+		emit(complete(2))
 	case "no-complete":
 		emit(heartbeat)
 	case "bad-outcome":
@@ -89,11 +96,27 @@ func fakeCodeRabbit(mode string) int {
 			emit(heartbeat)
 		}
 		emit(complete(0))
+	case "slow-stderr":
+		for range 3 {
+			time.Sleep(time.Second)
+			fmt.Fprintln(os.Stderr, "still working")
+		}
+		emit(complete(0))
 	case "child":
 		c := exec.Command(os.Args[0])
 		c.Env = append(os.Environ(), "FAKE_CR_MODE=silent")
 		_ = c.Start()
 		_ = os.WriteFile(filepath.Join(rec, "child.pid"), []byte(strconv.Itoa(c.Process.Pid)), 0o644)
+		time.Sleep(time.Hour)
+	case "escaped-stderr":
+		c := exec.Command(os.Args[0])
+		c.Env = append(os.Environ(), "FAKE_CR_MODE=stderr-holder")
+		c.Stderr = os.Stderr
+		c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		_ = c.Start()
+		_ = os.WriteFile(filepath.Join(rec, "escaped.pid"), []byte(strconv.Itoa(c.Process.Pid)), 0o644)
+		time.Sleep(time.Hour)
+	case "stderr-holder":
 		time.Sleep(time.Hour)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown fake mode "+mode)
@@ -120,6 +143,23 @@ func run(t *testing.T, mode string, tweak func(*Options)) (Result, string) {
 }
 
 func TestClean(t *testing.T) {
+	parentStdin, err := os.CreateTemp(t.TempDir(), "parent-stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parentStdin.WriteString("must not reach coderabbit\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parentStdin.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	originalStdin := os.Stdin
+	os.Stdin = parentStdin
+	t.Cleanup(func() {
+		os.Stdin = originalStdin
+		_ = parentStdin.Close()
+	})
+
 	res, rec := run(t, "clean", nil)
 	if res.Status != StatusClean || res.Exit == nil || *res.Exit != 0 || res.Error != "" {
 		t.Fatalf("got %+v", res)
@@ -193,6 +233,18 @@ func TestRateLimitTextDoesNotOverrideAResult(t *testing.T) {
 	}
 }
 
+func TestRateLimitTextOverridesEveryNoResult(t *testing.T) {
+	for mode, reason := range map[string]string{
+		"ratelimit-no-count": "no findings count",
+		"ratelimit-mismatch": "reports 2 findings but the stream carried 1",
+	} {
+		res, _ := run(t, mode, nil)
+		if res.Status != StatusRateLimited || !strings.Contains(res.Error, reason) {
+			t.Errorf("%s: got %s %q, want rate_limited with reason %q", mode, res.Status, res.Error, reason)
+		}
+	}
+}
+
 func TestStallKillsSilentRun(t *testing.T) {
 	res, _ := run(t, "silent", func(o *Options) { o.Stall = 150 * time.Millisecond })
 	if res.Status != StatusStalled || res.Exit != nil {
@@ -204,6 +256,13 @@ func TestHeartbeatsResetStall(t *testing.T) {
 	// 3 heartbeats 1s apart run 3s in total, twice the 1.5s stall window; the
 	// window leaves room for a slow (race-instrumented) start.
 	res, _ := run(t, "slow-heartbeats", func(o *Options) { o.Stall = 1500 * time.Millisecond })
+	if res.Status != StatusClean {
+		t.Fatalf("got %s %q", res.Status, res.Error)
+	}
+}
+
+func TestStderrResetsStall(t *testing.T) {
+	res, _ := run(t, "slow-stderr", func(o *Options) { o.Stall = 1500 * time.Millisecond })
 	if res.Status != StatusClean {
 		t.Fatalf("got %s %q", res.Status, res.Error)
 	}
@@ -226,6 +285,53 @@ func TestTimeoutKillsWholeProcessGroup(t *testing.T) {
 func TestTimeoutOfChattyRun(t *testing.T) {
 	if res, _ := run(t, "chatty", func(o *Options) { o.Timeout = 200 * time.Millisecond }); res.Status != StatusTimeout {
 		t.Fatalf("got %+v", res)
+	}
+}
+
+func TestEscapedStderrHolderCannotBlockTimeout(t *testing.T) {
+	rec := t.TempDir()
+	t.Setenv("FAKE_CR_MODE", "escaped-stderr")
+	t.Setenv("FAKE_CR_REC", rec)
+	type outcome struct {
+		res Result
+		err error
+	}
+	dir, out := t.TempDir(), t.TempDir()
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := Run(context.Background(), Options{
+			Bin: os.Args[0], Dir: dir, Scope: Scope{Base: "origin/main"},
+			Timeout: 500 * time.Millisecond, Stall: 0, OutDir: out,
+			Poll: 10 * time.Millisecond, Grace: 100 * time.Millisecond,
+		})
+		done <- outcome{res: res, err: err}
+	}()
+
+	killEscaped := func() {
+		b, err := os.ReadFile(filepath.Join(rec, "escaped.pid"))
+		if err != nil {
+			return
+		}
+		pid, err := strconv.Atoi(string(b))
+		if err != nil || pid <= 0 {
+			return
+		}
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+	defer killEscaped()
+
+	select {
+	case got := <-done:
+		if got.err != nil || got.res.Status != StatusTimeout {
+			t.Fatalf("got %+v, %v", got.res, got.err)
+		}
+	case <-time.After(3 * time.Second):
+		killEscaped() // release the old os/exec stderr-copy wait before failing
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("Run hung after its timeout because an escaped helper held stderr open")
 	}
 }
 
