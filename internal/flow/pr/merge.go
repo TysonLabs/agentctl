@@ -19,8 +19,8 @@ const (
 	MergeMerged      MergeStatus = "merged"      // merged (and synced, if asked)
 	MergeRefused     MergeStatus = "refused"     // not ready: reasons listed, nothing changed
 	MergeSyncFailed  MergeStatus = "sync_failed" // merged, but the sync branch was not fast-forwarded
-	MergeUnconfirmed MergeStatus = "unconfirmed" // the merge call's outcome could not be confirmed
-	MergeGHError     MergeStatus = "gh_error"    // gh failed; nothing was merged
+	MergeUnconfirmed MergeStatus = "unconfirmed" // the merge call ran but its outcome was not confirmed
+	MergeGHError     MergeStatus = "gh_error"    // gh failed before the merge call; nothing was merged
 	MergeInterrupted MergeStatus = "interrupted" // cancelled before the merge started
 )
 
@@ -61,6 +61,7 @@ type MergeResult struct {
 	Base      string      `json:"base,omitempty"`
 	Method    string      `json:"method"`
 	MergeSHA  string      `json:"merge_sha,omitempty"`
+	AutoMerge bool        `json:"auto_merge,omitempty"` // GitHub holds an auto-merge request for the PR
 	Sync      *Sync       `json:"sync,omitempty"`
 	Reasons   []string    `json:"reasons"`
 	Next      string      `json:"next,omitempty"`
@@ -75,13 +76,17 @@ var BranchRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-
 
 var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
-// prState is one read of the fields readiness depends on.
+// prState is one read of the fields readiness and confirmation depend on.
 type prState struct {
-	State       string `json:"state"`
-	IsDraft     *bool  `json:"isDraft"`
-	HeadRefOid  string `json:"headRefOid"`
-	BaseRefName string `json:"baseRefName"`
-	Mergeable   string `json:"mergeable"`
+	State               string `json:"state"`
+	IsDraft             *bool  `json:"isDraft"`
+	HeadRefOid          string `json:"headRefOid"`
+	BaseRefName         string `json:"baseRefName"`
+	Mergeable           string `json:"mergeable"`
+	IsMergeQueueEnabled *bool  `json:"isMergeQueueEnabled"`
+	AutoMergeRequest    *struct {
+		EnabledAt string `json:"enabledAt"`
+	} `json:"autoMergeRequest"`
 	MergeCommit *struct {
 		Oid string `json:"oid"`
 	} `json:"mergeCommit"`
@@ -134,6 +139,16 @@ func Merge(ctx context.Context, o MergeOptions) MergeResult {
 	if st.State != "OPEN" {
 		res.Reasons = append(res.Reasons, "PR is "+strings.ToLower(st.State))
 	}
+	if st.BaseRefName == "" {
+		res.Reasons = append(res.Reasons, "PR base branch is unknown")
+	}
+	// On a merge-queue base, gh pr merge queues the PR or enables auto-merge
+	// instead of merging, even without --auto: neither is a merge to report.
+	if st.IsMergeQueueEnabled == nil {
+		res.Reasons = append(res.Reasons, "whether the base branch uses a merge queue is unknown")
+	} else if *st.IsMergeQueueEnabled {
+		res.Reasons = append(res.Reasons, "the base branch uses a merge queue (gh would queue the PR or enable auto-merge, not merge it)")
+	}
 	if st.IsDraft == nil {
 		res.Reasons = append(res.Reasons, "PR draft state is unknown")
 	} else if *st.IsDraft {
@@ -171,30 +186,33 @@ func Merge(ctx context.Context, o MergeOptions) MergeResult {
 	}
 	_, mergeErr := o.GH(dctx, args...)
 
-	// gh can fail after GitHub merged (a dropped response), so a failed call
-	// still gets one read back; a successful one is re-read until confirmed.
-	wait := o.ConfirmWait
-	if mergeErr != nil {
-		wait = 0
-	}
-	merged, mergedBase, err := confirmMerged(dctx, o, wait)
-	switch {
-	case merged != "":
-		res.MergeSHA = merged
-		if mergedBase != "" {
-			res.Base = mergedBase
+	// Once gh pr merge has run, a failure no longer proves nothing merged (a
+	// dropped response, a late merge), so every outcome is read back for the
+	// full window and only a positive confirmation counts as merged.
+	c := confirmMerged(dctx, o, res.Head)
+	res.AutoMerge = c.autoMerge
+	if c.sha != "" {
+		res.MergeSHA = c.sha
+		if c.base != "" {
+			res.Base = c.base
 		}
-	case err != nil:
-		msg := err.Error()
+	} else {
+		var msgs []string
 		if mergeErr != nil {
-			msg = mergeErr.Error() + "; confirmation failed: " + msg
+			msgs = append(msgs, mergeErr.Error())
 		}
-		return finish(MergeUnconfirmed, "check the PR on GitHub before verifying a deploy", msg)
-	case mergeErr != nil:
-		return finish(MergeGHError, "", mergeErr.Error())
-	default:
-		return finish(MergeUnconfirmed, "check the PR on GitHub (a merge queue may hold it) before verifying a deploy", "PR did not read back as merged")
+		if c.err != nil {
+			msgs = append(msgs, "confirmation failed: "+c.err.Error())
+		} else {
+			msgs = append(msgs, "PR did not read back as merged at "+res.Head)
+		}
+		next := "check the PR on GitHub before verifying a deploy"
+		if c.autoMerge {
+			next = "GitHub holds an auto-merge request for the PR: disable it or let it land, then check the PR before verifying a deploy"
+		}
+		return finish(MergeUnconfirmed, next, strings.Join(msgs, "; "))
 	}
+	mergedBase := c.base
 
 	if o.SyncBranch == "" {
 		return finish(MergeMerged, "verify the deploy with the merge_sha", "")
@@ -220,7 +238,7 @@ func Merge(ctx context.Context, o MergeOptions) MergeResult {
 func readMergeable(ctx context.Context, o MergeOptions) (prState, error) {
 	deadline := time.Now().Add(o.MergeableWait)
 	for {
-		st, err := readPR(ctx, o, "state,isDraft,headRefOid,baseRefName,mergeable")
+		st, err := readPR(ctx, o)
 		if err != nil || st.Mergeable != "UNKNOWN" || !time.Now().Before(deadline) {
 			return st, err
 		}
@@ -233,46 +251,84 @@ func readMergeable(ctx context.Context, o MergeOptions) (prState, error) {
 	}
 }
 
-// confirmMerged re-reads the PR until it is MERGED with a merge commit, up
-// to wait, and returns that commit's sha and the base it merged into.
-func confirmMerged(ctx context.Context, o MergeOptions, wait time.Duration) (string, string, error) {
-	deadline := time.Now().Add(wait)
-	var lastErr error
+// confirmation is what the read-back after the merge call showed.
+type confirmation struct {
+	sha, base string // set only when the PR read back MERGED at the pinned head
+	autoMerge bool   // the last read showed an auto-merge request
+	err       error  // the last read's error, if it failed
+}
+
+// confirmMerged re-reads the PR for up to ConfirmWait until it is MERGED
+// with a merge commit AND its head is the pinned one. A PR merged at any
+// other head is not this merge.
+func confirmMerged(ctx context.Context, o MergeOptions, pinned string) confirmation {
+	deadline := time.Now().Add(o.ConfirmWait)
+	var c confirmation
 	for {
-		st, err := readPR(ctx, o, "state,mergeCommit,baseRefName")
-		lastErr = err
+		st, err := readPR(ctx, o)
+		c.err = err
 		if err == nil {
+			c.autoMerge = st.AutoMergeRequest != nil
 			switch st.State {
 			case "MERGED":
+				sha := ""
 				if st.MergeCommit != nil {
-					if sha := strings.ToLower(st.MergeCommit.Oid); shaRe.MatchString(sha) {
-						return sha, st.BaseRefName, nil
-					}
+					sha = strings.ToLower(st.MergeCommit.Oid)
 				}
-				lastErr = fmt.Errorf("PR read back as merged without a valid merge commit sha")
+				switch {
+				case !strings.EqualFold(st.HeadRefOid, pinned):
+					c.err = fmt.Errorf("PR read back as merged at head %s, not the pinned %s", strings.ToLower(st.HeadRefOid), pinned)
+					return c // a merged PR's head no longer changes
+				case shaRe.MatchString(sha):
+					c.sha, c.base = sha, st.BaseRefName
+					return c
+				default:
+					c.err = fmt.Errorf("PR read back as merged without a valid merge commit sha")
+				}
 			case "OPEN", "CLOSED":
-				lastErr = nil
 			default:
-				lastErr = fmt.Errorf("PR read back with unknown state %q", st.State)
+				c.err = fmt.Errorf("PR read back with unknown state %q", st.State)
 			}
 		}
 		if !time.Now().Before(deadline) {
-			return "", "", lastErr
+			return c
 		}
 		time.Sleep(min(o.ConfirmInterval, time.Until(deadline)))
 	}
 }
 
-func readPR(ctx context.Context, o MergeOptions, fields string) (prState, error) {
+const prQuery = `query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){` +
+	`state isDraft headRefOid baseRefName mergeable isMergeQueueEnabled autoMergeRequest{enabledAt} mergeCommit{oid}}}}`
+
+// readPR reads the PR through GraphQL: gh pr view --json does not offer
+// isMergeQueueEnabled.
+func readPR(ctx context.Context, o MergeOptions) (prState, error) {
 	var st prState
-	out, err := o.GH(ctx, "pr", "view", fmt.Sprint(o.PR), "-R", o.Repo, "--json", fields)
+	owner, name, _ := strings.Cut(o.Repo, "/")
+	out, err := o.GH(ctx, "api", "graphql", "-f", "o="+owner, "-f", "n="+name, "-F", fmt.Sprintf("p=%d", o.PR), "-f", "query="+prQuery)
 	if err != nil {
 		return st, err
 	}
-	if err := json.Unmarshal(out, &st); err != nil {
-		return st, fmt.Errorf("gh pr view: %w", err)
+	var doc struct {
+		Data struct {
+			Repository *struct {
+				PullRequest *prState `json:"pullRequest"`
+			} `json:"repository"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
 	}
-	return st, nil
+	if err := json.Unmarshal(out, &doc); err != nil {
+		return st, fmt.Errorf("gh api graphql: %w", err)
+	}
+	if len(doc.Errors) > 0 {
+		return st, fmt.Errorf("gh api graphql: %s", doc.Errors[0].Message)
+	}
+	if doc.Data.Repository == nil || doc.Data.Repository.PullRequest == nil {
+		return st, fmt.Errorf("gh api graphql: response has no pullRequest")
+	}
+	return *doc.Data.Repository.PullRequest, nil
 }
 
 const allThreadsQuery = `query($o:String!,$n:String!,$p:Int!,$endCursor:String){repository(owner:$o,name:$n){pullRequest(number:$p){` +

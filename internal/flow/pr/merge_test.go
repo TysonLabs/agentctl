@@ -12,7 +12,9 @@ import (
 
 const mergeSHA = "4444444444444444444444444444444444444444"
 
-// mergeFake answers the gh calls Merge makes and records every call.
+// mergeFake answers the gh calls Merge makes and records every call. The PR
+// fields come from one document served both as `gh pr view --json` and as the
+// GraphQL pullRequest query, so a test means the same thing on either path.
 type mergeFake struct {
 	mu                sync.Mutex
 	state             string // default OPEN
@@ -21,7 +23,13 @@ type mergeFake struct {
 	draft             bool
 	omitDraft         bool
 	omitHead          bool
-	mergeable         []string // one per pr view read; the last repeats. default MERGEABLE
+	omitBase          bool
+	queue             string   // isMergeQueueEnabled: "" false, "true", "omit"
+	autoMerge         bool     // autoMergeRequest set after a merge attempt
+	mergedHead        string   // headRefOid once merged; default head
+	mergeLands        bool     // pr merge errors, but the merge lands anyway
+	mergedAfter       int      // read-backs after the merge call before MERGED shows
+	mergeable         []string // one per readiness read; the last repeats. default MERGEABLE
 	threads           string   // raw GraphQL response; default: one resolved thread, complete
 	draftAfterThreads bool
 	mergeErr          error
@@ -30,51 +38,86 @@ type mergeFake struct {
 	neverMerg         bool // pr merge succeeds but the PR never reads back as merged
 	syncErr           error
 	mergeAttempted    bool
+	readbacks         int
 	views             int
 	calls             [][]string
+}
+
+// prDoc is the PR as GitHub would report it now.
+func (f *mergeFake) prDoc() map[string]any {
+	base := f.base
+	if base == "" {
+		base = "main"
+	}
+	if f.mergeAttempted {
+		f.readbacks++
+		if (f.merged || f.mergeLands) && !f.neverMerg && f.readbacks > f.mergedAfter {
+			if f.baseAfterMerge != "" {
+				base = f.baseAfterMerge
+			}
+			h := f.mergedHead
+			if h == "" {
+				h = head
+			}
+			return map[string]any{"state": "MERGED", "isDraft": false, "headRefOid": strings.ToUpper(h), "baseRefName": base,
+				"mergeable": "UNKNOWN", "isMergeQueueEnabled": false, "autoMergeRequest": nil,
+				"mergeCommit": map[string]any{"oid": strings.ToUpper(mergeSHA)}}
+		}
+	}
+	st := f.state
+	if st == "" {
+		st = "OPEN"
+	}
+	m := "MERGEABLE"
+	if len(f.mergeable) > 0 && !f.mergeAttempted {
+		i := f.views
+		if i >= len(f.mergeable) {
+			i = len(f.mergeable) - 1
+		}
+		m = f.mergeable[i]
+		f.views++
+	} else if !f.mergeAttempted {
+		f.views++
+	}
+	pv := map[string]any{"state": st, "mergeable": m, "mergeCommit": nil, "autoMergeRequest": nil}
+	if f.mergeAttempted && f.autoMerge {
+		pv["autoMergeRequest"] = map[string]any{"enabledAt": "2026-10-08T00:00:00Z"}
+	}
+	if !f.omitBase {
+		pv["baseRefName"] = base
+	}
+	if !f.omitDraft {
+		pv["isDraft"] = f.draft
+	}
+	if !f.omitHead {
+		pv["headRefOid"] = strings.ToUpper(head)
+	}
+	switch f.queue {
+	case "":
+		pv["isMergeQueueEnabled"] = false
+	case "true":
+		pv["isMergeQueueEnabled"] = true
+	}
+	return pv
 }
 
 func (f *mergeFake) gh(_ context.Context, args ...string) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, args)
+	query := ""
+	for _, a := range args {
+		if strings.HasPrefix(a, "query=") {
+			query = a
+		}
+	}
 	switch {
 	case args[0] == "pr" && args[1] == "view":
 		if f.mergeAttempted && f.confirmErr != nil {
 			return nil, f.confirmErr
 		}
-		st := f.state
-		if st == "" {
-			st = "OPEN"
-		}
-		base := f.base
-		if base == "" {
-			base = "main"
-		}
-		if f.merged && !f.neverMerg {
-			if f.baseAfterMerge != "" {
-				base = f.baseAfterMerge
-			}
-			return json.Marshal(map[string]any{"state": "MERGED", "baseRefName": base, "mergeCommit": map[string]any{"oid": strings.ToUpper(mergeSHA)}})
-		}
-		m := "MERGEABLE"
-		if len(f.mergeable) > 0 {
-			i := f.views
-			if i >= len(f.mergeable) {
-				i = len(f.mergeable) - 1
-			}
-			m = f.mergeable[i]
-		}
-		f.views++
-		pv := map[string]any{"state": st, "baseRefName": base, "mergeable": m, "mergeCommit": nil}
-		if !f.omitDraft {
-			pv["isDraft"] = f.draft
-		}
-		if !f.omitHead {
-			pv["headRefOid"] = strings.ToUpper(head)
-		}
-		return json.Marshal(pv)
-	case args[0] == "api" && args[1] == "graphql":
+		return json.Marshal(f.prDoc())
+	case args[0] == "api" && args[1] == "graphql" && strings.Contains(query, "reviewThreads"):
 		if f.draftAfterThreads {
 			f.draft = true
 		}
@@ -82,6 +125,11 @@ func (f *mergeFake) gh(_ context.Context, args ...string) ([]byte, error) {
 			return []byte(f.threads), nil
 		}
 		return []byte(`[{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":[{"isResolved":true}]}}}}}]`), nil
+	case args[0] == "api" && args[1] == "graphql":
+		if f.mergeAttempted && f.confirmErr != nil {
+			return nil, f.confirmErr
+		}
+		return json.Marshal(map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": f.prDoc()}}})
 	case args[0] == "pr" && args[1] == "merge":
 		f.mergeAttempted = true
 		if f.mergeErr != nil {
@@ -202,14 +250,6 @@ func TestMergeWaitsOutUnknownMergeable(t *testing.T) {
 	}
 }
 
-func TestMergeGHFailureMergesNothing(t *testing.T) {
-	f := &mergeFake{mergeErr: errors.New("gh pr merge: Head branch was modified")}
-	r := runMerge(f, nil)
-	if r.Status != MergeGHError || !strings.Contains(r.Error, "Head branch was modified") || r.MergeSHA != "" {
-		t.Fatalf("got %+v", r)
-	}
-}
-
 func TestMergeGHFailureWithFailedReadbackIsUnconfirmed(t *testing.T) {
 	f := &mergeFake{
 		mergeErr:   errors.New("gh pr merge: request timed out"),
@@ -310,12 +350,13 @@ func TestMergeGraphQLStringVariablesAreRawFields(t *testing.T) {
 		t.Fatalf("got %+v", r)
 	}
 	calls := f.called("api", "graphql")
-	if len(calls) != 1 {
+	if len(calls) < 2 { // the thread count and at least one PR read
 		t.Fatalf("GraphQL calls: %v", calls)
 	}
-	got := strings.Join(calls[0], " ")
-	if !strings.Contains(got, "-f o=true -f n=null -F p=7") {
-		t.Fatalf("GraphQL args use typed fields for string variables: %s", got)
+	for _, c := range calls {
+		if got := strings.Join(c, " "); !strings.Contains(got, "-f o=true -f n=null -F p=7") {
+			t.Fatalf("GraphQL args use typed fields for string variables: %s", got)
+		}
 	}
 }
 
@@ -351,5 +392,57 @@ func TestMergeInterruptedBeforeMerge(t *testing.T) {
 	r := Merge(ctx, MergeOptions{Repo: "o/r", PR: 7, Method: "merge", GH: f.gh})
 	if r.Status != MergeInterrupted || len(f.called("pr", "merge")) != 0 {
 		t.Fatalf("got %+v", r)
+	}
+}
+
+// Confirmation-round fixes (C1–C4).
+
+func TestMergeRefusesMergeQueue(t *testing.T) {
+	for _, q := range []string{"true", "omit"} {
+		f := &mergeFake{queue: q}
+		r := runMerge(f, nil)
+		if r.Status != MergeRefused || !strings.Contains(strings.Join(r.Reasons, "; "), "merge queue") || len(f.called("pr", "merge")) != 0 {
+			t.Errorf("queue=%s: got %s %v, merge calls %d", q, r.Status, r.Reasons, len(f.called("pr", "merge")))
+		}
+	}
+}
+
+func TestMergeFailureWithAutoMergeIsUnconfirmed(t *testing.T) {
+	f := &mergeFake{mergeErr: errors.New("gh pr merge: HTTP 502"), autoMerge: true}
+	r := runMerge(f, nil)
+	if r.Status != MergeUnconfirmed || !r.AutoMerge || r.MergeSHA != "" {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+func TestMergeFailureThatLandsLateIsMerged(t *testing.T) {
+	f := &mergeFake{mergeErr: errors.New("gh pr merge: HTTP 502"), mergeLands: true, mergedAfter: 2}
+	r := runMerge(f, nil)
+	if r.Status != MergeMerged || r.MergeSHA != mergeSHA {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+func TestMergeFailureNeverMergedIsUnconfirmedNotGHError(t *testing.T) {
+	f := &mergeFake{mergeErr: errors.New("gh pr merge: Head branch was modified")}
+	r := runMerge(f, nil)
+	if r.Status != MergeUnconfirmed || !strings.Contains(r.Error, "Head branch was modified") || r.MergeSHA != "" {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+func TestMergeReadBackWithOtherHeadIsUnconfirmed(t *testing.T) {
+	f := &mergeFake{mergedHead: older}
+	r := runMerge(f, nil)
+	if r.Status != MergeUnconfirmed || r.MergeSHA != "" {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+func TestMergeRefusesMissingBase(t *testing.T) {
+	f := &mergeFake{omitBase: true}
+	r := runMerge(f, nil)
+	if r.Status != MergeRefused || !strings.Contains(strings.Join(r.Reasons, "; "), "base branch") || len(f.called("pr", "merge")) != 0 {
+		t.Fatalf("got %s %v", r.Status, r.Reasons)
 	}
 }
