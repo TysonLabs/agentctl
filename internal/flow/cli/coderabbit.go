@@ -157,8 +157,14 @@ func runCodeRabbit(ctx context.Context, args []string, stdout, stderr io.Writer)
 	}
 	defer unlockRepo()
 	if scopes == 0 {
-		base, err := coderabbit.DefaultBase(o.Dir, ghDefaultBranch)
+		base, err := coderabbit.DefaultBase(o.Dir, func(dir string) (string, error) {
+			return ghDefaultBranch(ctx, dir)
+		})
 		if err != nil {
+			if ctx.Err() != nil {
+				fmt.Fprintln(stderr, "agentflow coderabbit: interrupted while deriving the default branch")
+				return coderabbitExitCodes[coderabbit.StatusInterrupted]
+			}
 			return fail("%v", err)
 		}
 		o.Scope.Base = base
@@ -197,7 +203,7 @@ func runCodeRabbit(ctx context.Context, args []string, stdout, stderr io.Writer)
 }
 
 // ghDefaultBranch asks gh for the repository's default branch name.
-func ghDefaultBranch(dir string) (string, error) {
+func ghDefaultBranch(ctx context.Context, dir string) (string, error) {
 	bin := os.Getenv("AGENTFLOW_GH")
 	if bin == "" {
 		var err error
@@ -205,7 +211,7 @@ func ghDefaultBranch(dir string) (string, error) {
 			return "", err
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name")
 	cmd.Dir = dir

@@ -2,12 +2,14 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/TysonLabs/agentctl/internal/flow/coderabbit"
 )
@@ -141,5 +143,32 @@ func TestCodeRabbitRefusesWhileRepoLocked(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(rec, "args.txt")); err == nil {
 		t.Fatal("coderabbit ran despite the lock")
+	}
+}
+
+func TestCodeRabbitCancellationInterruptsDefaultBranchLookup(t *testing.T) {
+	repo, rec := crRepo(t)
+	if out, err := exec.Command("git", "-C", repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD").CombinedOutput(); err != nil {
+		t.Fatalf("delete origin/HEAD: %v %s", err, out)
+	}
+	gh := filepath.Join(t.TempDir(), "gh")
+	if err := os.WriteFile(gh, []byte("#!/bin/sh\nexec sleep 2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENTFLOW_GH", gh)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	start := time.Now()
+	var out, errb bytes.Buffer
+	code := runCodeRabbit(ctx, []string{"--dir", repo, "--out", filepath.Join(t.TempDir(), "out")}, &out, &errb)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("cancellation took %s; gh lookup did not use the command context", elapsed)
+	}
+	if code != coderabbitExitCodes[coderabbit.StatusInterrupted] {
+		t.Fatalf("exit %d, stderr %q; want interrupted exit %d", code, errb.String(), coderabbitExitCodes[coderabbit.StatusInterrupted])
+	}
+	if _, err := os.Stat(filepath.Join(rec, "args.txt")); !os.IsNotExist(err) {
+		t.Fatalf("coderabbit ran after cancellation; stat error = %v", err)
 	}
 }
