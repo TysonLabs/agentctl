@@ -1,6 +1,7 @@
 // Package cli implements the agentflow command dispatch. Exit codes are
 // assigned in this package and nowhere else, one table per command
-// (exitCodes for codex, shipExitCodes for ship verify). 0 is success, 1 a
+// (exitCodes for codex, shipExitCodes for ship verify, prExitCodes for pr
+// wait). 0 is success, 1 a
 // usage or precondition error, 124 a timeout and 130 an interruption for
 // every command.
 package cli
@@ -35,6 +36,8 @@ Usage:
   agentflow ship announce <svc.env> --verified FILE ...
                                                post a verified deploy to Slack
                                                (see: agentflow ship --help)
+  agentflow pr wait <number> [--repo O/N]      wait for CodeRabbit's review of the PR head;
+                                               list open threads (see: agentflow pr --help)
   agentflow worktree done <branch|path>        remove a merged, clean, unused worktree
   agentflow worktree sweep [--yes]             list (or remove) every such worktree
                                                (see: agentflow worktree --help)
@@ -109,6 +112,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		return runWorktree(ctx, args[1:], stdout, stderr)
+	case "pr":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runPR(ctx, args[1:], stdout, stderr)
 	case "version", "--version":
 		fmt.Fprintln(stdout, "agentflow "+Version)
 		return 0

@@ -28,8 +28,12 @@ background and keep working; your harness tells you when it exits. Never wait in
    default branch. If it fails, fix it and rerun the failing part.
 6. **Push and open a PR** whose body says what changed, how it was verified, and any
    review fix you did not take as written, with the reason.
-7. **Handle every PR review thread.** Reply first ("Fixed in <sha>: …" or "Keeping
-   as-is: …"), then resolve it. Never resolve a thread silently.
+7. **Handle every PR review thread.** If the repo uses CodeRabbit, run
+   `agentflow pr wait <number>` in the background after each push that needs a review:
+   exit 0 means the head is reviewed and clean, 10 lists the open threads (with ids) in
+   its JSON, and `next` says what to do for any other exit. For each thread, reply first
+   ("Fixed in <sha>: …" or "Keeping as-is: …"), then resolve it. Never resolve a thread
+   silently.
 8. **Merge only on the go-ahead the repo's policy requires.** Changes that need a human
    step (database migrations, credentials) wait for that human.
 9. **Verify the deploy against reality:**
