@@ -428,6 +428,74 @@ func TestRetire(t *testing.T) {
 	}
 }
 
+func TestRetirePreservesBytesOutsideMovedBlock(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Lessons")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	topic := "# Exact header\t\n\n" +
+		"### Retire me\n#cr/concurrency · alpha · 2026-01-01 ^l10\n\n- **Avoid by:** old.\n- **Used:** 0\n\n\n" +
+		"### Keep me\n#cr/concurrency · alpha · 2026-06-01 ^l11\n\n- **Avoid by:** current.\n- **Used:** 2\n\n\n"
+	archiveBefore := "# Existing archive\n\n\n"
+	if err := os.WriteFile(filepath.Join(dir, "Concurrency.md"), []byte(topic), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ArchiveFile), []byte(archiveBefore), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	header, blocks := splitBlocks(topic)
+	if len(blocks) != 2 {
+		t.Fatalf("fixture split into %d blocks", len(blocks))
+	}
+	today := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := Retire(dir, filepath.Join(root, PrinciplesFile), 90, today); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := read(t, filepath.Join(dir, "Concurrency.md")), header+blocks[1]; got != want {
+		t.Errorf("topic bytes outside the moved block changed\ngot:  %q\nwant: %q", got, want)
+	}
+	archiveAfter := read(t, filepath.Join(dir, ArchiveFile))
+	if !strings.HasPrefix(archiveAfter, archiveBefore) {
+		t.Errorf("existing archive bytes changed\nbefore: %q\nafter:  %q", archiveBefore, archiveAfter)
+	}
+	retiredLine := "- **Retired:** 2026-07-01 from Concurrency (never used, last activity 2026-01-01)\n"
+	withoutRetiredLine := strings.Replace(archiveAfter, retiredLine, "", 1)
+	if !strings.Contains(withoutRetiredLine, blocks[0]) {
+		t.Errorf("moved block bytes changed\nblock:   %q\narchive: %q", blocks[0], archiveAfter)
+	}
+	if fi, err := os.Stat(filepath.Join(dir, "Concurrency.md")); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm() != 0o640 {
+		t.Errorf("topic mode = %v; want 0640", fi.Mode().Perm())
+	}
+	if fi, err := os.Stat(filepath.Join(dir, ArchiveFile)); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm() != 0o600 {
+		t.Errorf("archive mode = %v; want 0600", fi.Mode().Perm())
+	}
+}
+
+func TestRetireIncludesExactAgeBoundary(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Lessons")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lesson := "### Exactly ninety days old\n#cr/concurrency · alpha · 2026-04-02 ^l10\n\n- **Avoid by:** retire on the boundary.\n- **Used:** 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "Concurrency.md"), []byte(lesson), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	today := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	cands, err := RetireCandidates(dir, filepath.Join(root, PrinciplesFile), 90, today)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || cands[0].ID != "l10" {
+		t.Fatalf("candidates = %+v, want l10 at the 90-day boundary", cands)
+	}
+}
+
 func TestRetireCreatesArchive(t *testing.T) {
 	dir, principles := vault(t)
 	os.Remove(filepath.Join(dir, ArchiveFile))

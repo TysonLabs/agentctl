@@ -663,7 +663,7 @@ func RetireCandidates(dir, principles string, days int, today time.Time) ([]Cand
 		switch {
 		case l.Misled > l.Used:
 			reason = fmt.Sprintf("misled %d > used %d", l.Misled, l.Used)
-		case l.Used == 0 && l.Last != "" && l.Last < cutoff:
+		case l.Used == 0 && l.Last != "" && l.Last <= cutoff:
 			reason = "never used, last activity " + l.Last
 		default:
 			continue
@@ -719,19 +719,15 @@ func Retire(dir, principles string, days int, today time.Time) ([]Candidate, err
 				keep = append(keep, blk)
 				continue
 			}
-			moved = append(moved, strings.TrimRight(blk, "\n")+
-				fmt.Sprintf("\n- **Retired:** %s from %s (%s)\n", today.Format("2006-01-02"), strings.TrimSuffix(f, ".md"), c.Reason))
+			retiredLine := fmt.Sprintf("- **Retired:** %s from %s (%s)\n",
+				today.Format("2006-01-02"), strings.TrimSuffix(f, ".md"), c.Reason)
+			moved = append(moved, insertBeforeTrailingNewlines(blk, retiredLine))
 			retired = append(retired, c)
 		}
 		if len(keep) == len(blocks) {
 			continue
 		}
-		for i := range keep {
-			if i < len(keep)-1 && !strings.HasSuffix(keep[i], "\n\n") {
-				keep[i] = strings.TrimRight(keep[i], "\n") + "\n\n"
-			}
-		}
-		rewrites[f] = strings.TrimRight(header+strings.Join(keep, ""), "\n") + "\n"
+		rewrites[f] = header + strings.Join(keep, "")
 	}
 	ap := filepath.Join(dir, ArchiveFile)
 	old, err := os.ReadFile(ap)
@@ -741,7 +737,11 @@ func Retire(dir, principles string, days int, today time.Time) ([]Candidate, err
 	if err != nil {
 		return nil, err
 	}
-	if err := writeAtomic(ap, strings.TrimRight(string(old), "\n")+"\n\n"+strings.Join(moved, "\n")); err != nil {
+	archive := string(old)
+	for _, blk := range moved {
+		archive = appendMarkdownBlock(archive, blk)
+	}
+	if err := writeAtomic(ap, archive); err != nil {
 		return nil, err
 	}
 	for f, c := range rewrites {
@@ -750,6 +750,38 @@ func Retire(dir, principles string, days int, today time.Time) ([]Candidate, err
 		}
 	}
 	return retired, nil
+}
+
+// insertBeforeTrailingNewlines adds line to a block without deleting or
+// rewriting any byte already in the block. Keeping the original trailing
+// newlines after the inserted line also preserves the separator before the
+// next heading when the block came from the middle of a topic file.
+func insertBeforeTrailingNewlines(block, line string) string {
+	i := len(block)
+	for i > 0 && block[i-1] == '\n' {
+		i--
+	}
+	if i < len(block) {
+		return block[:i+1] + line + block[i+1:]
+	}
+	return block + "\n" + line
+}
+
+// appendMarkdownBlock appends a block after at least one blank line. It only
+// adds separator bytes; in particular, it never trims or normalizes the
+// existing archive or the moved block.
+func appendMarkdownBlock(text, block string) string {
+	newlines := 0
+	for i := len(text); i > 0 && text[i-1] == '\n'; i-- {
+		newlines++
+	}
+	switch newlines {
+	case 0:
+		text += "\n\n"
+	case 1:
+		text += "\n"
+	}
+	return text + block
 }
 
 // Stats summarizes the folder.
