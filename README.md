@@ -533,6 +533,43 @@ JSON result, and exits 3. Exit codes: 0 removed (or would be, or sweep finished)
 1 usage · 2 refused · 3 git/gh error. A missing or incomplete `lsof` check is a
 safety refusal.
 
+### `agentflow lessons`: feed past review findings back into the next review
+
+```sh
+export AGENTFLOW_LESSONS_DIR=~/notes/review-lessons   # or --lessons-dir on each call
+agentflow codex --base main --prompt-file brief.md --write --lessons concurrency,database
+agentflow lessons brief --topics concurrency --repo myrepo   # print the section only
+agentflow lessons bump --used l12,l40 --misled l7 --fp-seen fp3
+agentflow lessons retire                  # list; --apply moves them to Archive.md
+agentflow lessons stats
+```
+
+A reviewer that never hears about last month's defects finds them again, or misses
+them. `agentflow` reads a folder of lessons kept as Markdown (an Obsidian folder works):
+one file per topic, each lesson a `### title` block with a tag line
+(`#cr/<topic> · <repo> · <date> ^l<id>`), an `Avoid by:` bullet, `Used:` and an optional
+`Misled:` counter. `Inbox.md` (new lessons), `Archive.md` and
+`Reviewer False Positives.md` (`#fp/<topic>` and `^fp<id>` entries with `Why it's wrong`,
+`Tell` and `Seen`) are special. The package doc in `internal/flow/lessons` has the format.
+
+- **`--lessons TOPICS`** on `codex` and `claude` appends a "learned checks" section
+  between your brief and the diff: the top 8 lessons for those topics, ranked by
+  `Used − 2×Misled`, then a repo match (default: `--dir`'s origin name), then recency.
+  The reviewer does its open review first, then checks the diff against each lesson
+  and tags those findings `[learned l<id>]`. The section also lists the most-seen
+  reviewer false positives, which the reviewer reports only with a concrete failing
+  scenario. It needs a prompt for codex, since `codex exec review` takes no extra
+  instructions. The prompt-size cap counts the section.
+- **`bump`** is the only safe way to change counters: it locks the folder, changes all
+  ids or none (exit 2 names any id it could not find), and writes each file atomically.
+- **`retire`** finds topic-file lessons with `Used 0` and no activity (date or
+  `Also seen:`) for `--days` (90), or with `Misled > Used`. `--apply` moves them to
+  `Archive.md` with a `Retired:` line, writing the archive first so an interrupted run
+  never loses a lesson. Lessons that `Code Review Principles.md` links (`#^l<id>`) stay.
+
+A missing folder, a folder with no lessons and an unknown topic are errors, never an
+empty section. Exit codes: 0 ok · 1 usage or precondition · 2 an id was not found.
+
 ## agentcfg (companion binary): edit the registry, keep tokens in the Keychain
 
 ```sh

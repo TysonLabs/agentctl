@@ -20,7 +20,8 @@ background and keep working; your harness tells you when it exits. Never wait in
    what changed, the contract it must keep, and where to look hardest. Then audit every
    fix it made: accept it, revert it, or amend it, each one for a stated reason. For a
    read-only review, drop `--write`. For a big diff, run one pass per area with
-   `--path`. Exit 0 means `final.md` holds a real answer; anything else means there was
+   `--path`. If you keep a lessons folder (`AGENTFLOW_LESSONS_DIR`), add
+   `--lessons <the diff's topics>` so the reviewer also checks past defects. Exit 0 means `final.md` holds a real answer; anything else means there was
    no review (see the exit table in the README). **If you are the reviewer,** this step
    is done by you: review, fix what the brief asks, report, and stop. Don't start
    another review or follow the rest of this list.
