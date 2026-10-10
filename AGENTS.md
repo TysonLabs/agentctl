@@ -11,7 +11,11 @@ background and keep working; your harness tells you when it exits. Never wait in
 1. **Plan.** Read the repo's instructions and the code you will change. Check every
    fact about existing code against its source line before relying on it.
 2. **Build on a branch** off the default branch, in a worktree if others share the
-   checkout. Keep the diff to what was asked.
+   checkout: `agentflow worktree new <branch>` fetches first and branches from the
+   fresh default branch (`--clone-dir target` starts a build warm on macOS). For a
+   throwaway probe (a red/green check, a base comparison), use
+   `agentflow worktree new --scratch` and remove it with `agentflow worktree done
+   <path>`. Keep the diff to what was asked.
 3. **Run targeted checks while editing:** the tests and linters for what you touched,
    not the whole suite.
 4. **Review with a different agent from the one that wrote the code:** if Claude wrote
@@ -50,7 +54,7 @@ background and keep working; your harness tells you when it exits. Never wait in
    it from that proof: `agentflow ship announce <service.env> --verified <verify.json>
    --title ... --body-file ...` (what changed and how to test it, in plain language).
 10. **Clean up:** sync any long-lived branches the repo keeps, then remove the worktree
-    and the merged branches.
+    and the merged branches with `agentflow worktree done <branch>` (never `--force`).
 
 **When something looks wrong in a running service,** read it, don't guess:
 `agentctl endpoints <service.env>` lists what it exposes; `agentctl get <service.env>
