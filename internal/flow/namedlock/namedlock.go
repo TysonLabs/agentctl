@@ -138,8 +138,20 @@ func TryAcquire(name string, info Info) (*Lock, error) {
 // again each time the holder changes. The wait is a blocking flock, not a
 // retry loop; only the advisory holder file is re-read, every few seconds.
 func Acquire(ctx context.Context, name string, info Info, onHolder func(Holder)) (*Lock, error) {
+	if err := ValidateName(name); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	l, err := TryAcquire(name, info)
 	if !errors.Is(err, ErrBusy) {
+		if err == nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				_ = l.Release()
+				return nil, ctxErr
+			}
+		}
 		return l, err
 	}
 	f, ip, err := open(name)
@@ -177,6 +189,14 @@ func Acquire(ctx context.Context, name string, info Info, onHolder func(Holder))
 			if err != nil {
 				f.Close()
 				return nil, err
+			}
+			// got and ctx.Done can become ready together. A select chooses
+			// randomly in that case, so check the context again before
+			// publishing a lock acquired at or after cancellation.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				_ = flock(f, syscall.LOCK_UN)
+				f.Close()
+				return nil, ctxErr
 			}
 			return held(name, f, ip, info), nil
 		case <-tick.C:

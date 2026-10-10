@@ -174,6 +174,19 @@ func TestLockRunExitCodePropagation(t *testing.T) {
 	}
 }
 
+func TestLockRunNonExecutableCommandInPathReturns126(t *testing.T) {
+	d := lockIsolate(t)
+	tool := filepath.Join(d, "not-executable")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\nexit 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", d)
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"lock", "run", "--name", "codes", "--", "not-executable"}, &stdout, &stderr); code != 126 {
+		t.Fatalf("exit %d, want 126 for a command that exists but cannot execute (%s)", code, stderr.String())
+	}
+}
+
 func TestLockRunPassesOutputDirAndStdin(t *testing.T) {
 	d := lockIsolate(t)
 	cmd := agentflowCmd("lock", "run", "--name", "io", "--dir", d, "--", "sh", "-c", "pwd; cat; echo err >&2; ls \"$TMPDIR\" | grep -c agentflow-lock-io.json")
@@ -193,6 +206,24 @@ func TestLockRunPassesOutputDirAndStdin(t *testing.T) {
 	}
 	if strings.TrimSpace(stderr.String()) != "err" {
 		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestLockStdinPassesNonTerminalCharacterDevice(t *testing.T) {
+	f, err := os.Open("/dev/zero")
+	if err != nil {
+		t.Skipf("open /dev/zero: %v", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		t.Skip("/dev/zero is not a character device on this platform")
+	}
+	old := lockStdin
+	lockStdin = f
+	defer func() { lockStdin = old }()
+	if got := childStdin(); got != f {
+		t.Fatalf("childStdin replaced non-terminal character device %s with /dev/null", f.Name())
 	}
 }
 
@@ -371,5 +402,30 @@ func TestShellJoin(t *testing.T) {
 	}
 	if long := shellJoin([]string{strings.Repeat("a", 600)}); len(long) > 520 {
 		t.Fatalf("not capped: %d bytes", len(long))
+	}
+}
+
+func TestIsTerminal(t *testing.T) {
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+	if isTerminal(null.Fd()) {
+		t.Fatal("/dev/null reported as a terminal")
+	}
+	// The positive case needs a real tty (a pty master does not answer the
+	// termios read on macOS); it is checked by hand under script(1).
+}
+
+func TestLockRunDirectoryNamedLikeCommandIsNotFound(t *testing.T) {
+	d := lockIsolate(t)
+	if err := os.Mkdir(filepath.Join(d, "a-dir-cmd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", d)
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"lock", "run", "--name", "codes", "--", "a-dir-cmd"}, &stdout, &stderr); code != 127 {
+		t.Fatalf("exit %d, want 127 (%s)", code, stderr.String())
 	}
 }

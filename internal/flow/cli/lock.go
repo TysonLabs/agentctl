@@ -134,6 +134,9 @@ func runLockRun(args []string, stdout, stderr io.Writer) int {
 	}
 	path, err := exec.LookPath(cmdArgs[0])
 	if err != nil && !strings.Contains(cmdArgs[0], "/") {
+		if commandExistsInPath(cmdArgs[0]) {
+			return fail(lockExitCodes.cannotRun, "%s: command cannot be run", cmdArgs[0])
+		}
 		return fail(lockExitCodes.notFound, "%s: command not found", cmdArgs[0])
 	}
 	if err != nil {
@@ -248,10 +251,29 @@ func childStdin() io.Reader {
 	if lockStdin == nil {
 		return nil
 	}
-	if fi, err := lockStdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+	if isTerminal(lockStdin.Fd()) {
 		return nil // exec opens /dev/null
 	}
 	return lockStdin
+}
+
+// commandExistsInPath tells "not executable" (126) from "not found" (127)
+// after exec.LookPath, which reports both as not found.
+func commandExistsInPath(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			dir = "."
+		}
+		// A regular file that LookPath rejected is not executable (126);
+		// a directory of that name is skipped, as a shell does.
+		if fi, err := os.Stat(filepath.Join(dir, name)); err == nil && fi.Mode().IsRegular() {
+			return true
+		}
+	}
+	return false
 }
 
 func describeHolder(h namedlock.Holder) string {

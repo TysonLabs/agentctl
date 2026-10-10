@@ -163,6 +163,23 @@ func TestAcquireTimesOutAndAbandonedWaitDoesNotKeepLock(t *testing.T) {
 	third.Release()
 }
 
+func TestAcquireDoesNotTakeFreeLockAfterContextCanceled(t *testing.T) {
+	isolate(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	l, err := Acquire(ctx, "canceled", NewInfo("must not run", "/"), nil)
+	if l != nil {
+		_ = l.Release()
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Acquire = lock %v, error %v; want context.Canceled", l, err)
+	}
+	st, statusErr := Status("canceled")
+	if statusErr != nil || st.Held || st.Holder != nil {
+		t.Fatalf("canceled Acquire changed lock state: %+v, %v", st, statusErr)
+	}
+}
+
 func TestLockReleasedWhenHolderIsKilled(t *testing.T) {
 	isolate(t)
 	h := holdInSubprocess(t, "k")
