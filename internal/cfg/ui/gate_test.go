@@ -2,6 +2,7 @@ package ui
 
 import (
 	"encoding/json"
+	"io/fs"
 	"strings"
 	"testing"
 )
@@ -109,5 +110,23 @@ func TestGateAPI(t *testing.T) {
 	post("/api/gate/remove", `{"name":"pay"}`, 200)
 	if len(st.Gates) != 0 {
 		t.Fatalf("gate not removed: %+v", st.Gates)
+	}
+}
+
+func TestNewGateProjectWritesRepoFirst(t *testing.T) {
+	js, err := fs.ReadFile(assets, "assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js)
+	start := strings.Index(src, "function openGateStep(")
+	end := strings.Index(src, "function openGateLock(")
+	if start < 0 || end < start {
+		t.Fatal("could not find openGateStep")
+	}
+	body := src[start:end]
+	meta, step := strings.Index(body, `write("/api/meta"`), strings.Index(body, `write("/api/gate/step"`)
+	if meta < 0 || step < 0 || meta > step {
+		t.Fatal("a new gate project must save its repo before its first step")
 	}
 }

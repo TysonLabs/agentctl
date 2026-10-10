@@ -518,8 +518,9 @@ stop_on_fail = true              # skip the later steps if this one fails
   The holder writes `$TMPDIR/agentflow-lock-<name>.json` (`pid`, `cmd`, `dir`, `since`); a
   waiter prints it and reports `waited_secs` and `waited_for` in its JSON. The tree is read
   after the lock is taken, so a second run on the same tree reuses the first run's receipts.
-- If a step changes the work tree, the JSON says `tree_changed`: the receipts cover the
-  tree as it was before the run.
+- If a step changes the work tree (a formatter that writes, say), the JSON says
+  `tree_changed`, and that step and every later one get no receipt: they did not run on
+  the tree the run started from, so nothing can claim that tree passed them.
 
 The JSON: `{status, project, dir, head, tree, dirty, ok, steps: [{name, status, secs, exit,
 log}], log_dir, receipts, lock, warnings}`; a step's status is `passed`, `failed`, `timeout`,

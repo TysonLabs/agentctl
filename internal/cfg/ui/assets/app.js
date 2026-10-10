@@ -493,15 +493,12 @@
         if (fresh && groups().some((g) => g.name === form.proj)) {
           throw new Error(form.proj + " already exists. Use its Gate step button.");
         }
-        await write("/api/gate/step", { name: form.proj, original: st ? st.name : "", step: form.step });
+        // The repo goes first: a gate without meta.repo cannot run, while a
+        // refused step leaves only the repo, and resubmitting adds the step.
         if (form.repo) {
-          try {
-            await write("/api/meta", { name: form.proj, meta: { repo: form.repo } });
-          } catch (e) {
-            toast("Added the step, but the repo was not saved: " + e.message, true);
-            return;
-          }
+          await write("/api/meta", { name: form.proj, meta: { repo: form.repo } });
         }
+        await write("/api/gate/step", { name: form.proj, original: st ? st.name : "", step: form.step });
         toast((st ? "Saved step " : "Added step ") + form.step.name);
       });
   }

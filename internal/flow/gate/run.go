@@ -83,7 +83,7 @@ type Result struct {
 	LogDir      string       `json:"log_dir,omitempty"`
 	Receipts    string       `json:"receipts,omitempty"`
 	Lock        *LockInfo    `json:"lock,omitempty"`
-	TreeChanged bool         `json:"tree_changed,omitempty"` // a step changed the work tree
+	TreeChanged bool         `json:"tree_changed,omitempty"` // a step changed the work tree; it and later steps have no receipt
 	Warnings    []string     `json:"warnings,omitempty"`
 	Error       string       `json:"error,omitempty"`
 }
@@ -217,11 +217,25 @@ func Run(ctx context.Context, o Options) *Result {
 				res.Warnings = append(res.Warnings, st.Name+": "+err.Error())
 			}
 			o.logf("%s: %s in %.1fs", st.Name, status, sr.Secs)
-			if status != StepInterrupted {
-				r := Receipt{RunHash: runHash(st.Run), OK: status == StepPassed, Status: status, Exit: exit, Secs: sr.Secs, At: time.Now().UTC(), Head: ts.head}
-				if err := recordReceipt(res.Receipts, t.project, ts.tree, st.Name, r); err != nil {
-					res.Warnings = append(res.Warnings, "recording the receipt of "+st.Name+": "+err.Error())
-					o.logf("warning: recording the receipt of %s: %v", st.Name, err)
+			// A receipt claims the step ran on ts.tree. If this step (or an
+			// earlier one) changed the work tree, or the tree cannot be read
+			// again, that claim is unproven and no receipt is written.
+			if status != StepInterrupted && !res.TreeChanged {
+				after, err := workTree(ctx, t.root)
+				switch {
+				case err != nil:
+					res.Warnings = append(res.Warnings, "re-hashing the work tree after "+st.Name+": "+err.Error()+"; no receipt recorded")
+					o.logf("warning: re-hashing the work tree after %s: %v; no receipt recorded", st.Name, err)
+				case after.tree != ts.tree:
+					res.TreeChanged = true
+					res.Warnings = append(res.Warnings, st.Name+" changed the work tree; no receipt recorded for it or later steps")
+					o.logf("warning: %s changed the work tree; no receipt recorded for it or later steps", st.Name)
+				default:
+					r := Receipt{RunHash: runHash(st.Run), OK: status == StepPassed, Status: status, Exit: exit, Secs: sr.Secs, At: time.Now().UTC(), Head: ts.head}
+					if err := recordReceipt(res.Receipts, t.project, ts.tree, st.Name, r); err != nil {
+						res.Warnings = append(res.Warnings, "recording the receipt of "+st.Name+": "+err.Error())
+						o.logf("warning: recording the receipt of %s: %v", st.Name, err)
+					}
 				}
 			}
 			switch status {
@@ -238,13 +252,6 @@ func Run(ctx context.Context, o Options) *Result {
 		res.Steps = append(res.Steps, sr)
 	}
 
-	if !interrupted {
-		if after, err := workTree(ctx, t.root); err == nil && after.tree != ts.tree {
-			res.TreeChanged = true
-			res.Warnings = append(res.Warnings, "the steps changed the work tree; receipts are for the tree before the run ("+ts.tree+")")
-			o.logf("warning: the steps changed the work tree; receipts cover the tree before the run")
-		}
-	}
 	switch {
 	case interrupted:
 		res.Status = StatusInterrupted

@@ -706,3 +706,33 @@ func TestTreeHashLeavesIndexAlone(t *testing.T) {
 		t.Fatalf("hashing changed the index: %q -> %q", before, after)
 	}
 }
+
+func TestStepThatChangesTheTreeLeavesNoReceipt(t *testing.T) {
+	repo := newRepo(t)
+	cfg := writeConfig(t, repo, "",
+		stepDef{name: "before", run: "true"},
+		stepDef{name: "rewrite", run: "echo formatted > a.txt"},
+		stepDef{name: "after", run: "true"},
+	)
+	o := opts(t, cfg, repo)
+	res := Run(context.Background(), o)
+	if res.Status != StatusPassed || !res.TreeChanged {
+		t.Fatalf("status %s tree_changed %v", res.Status, res.TreeChanged)
+	}
+	rf, err := readReceipts(res.Receipts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rf.lookup("p", res.Tree, "before", runHash("true")); !ok {
+		t.Fatal("the step before the change lost its receipt")
+	}
+	for _, name := range []string{"rewrite", "after"} {
+		for _, r := range rf.Projects["p"][res.Tree][name] {
+			t.Fatalf("%s has a receipt for the tree it did not test: %+v", name, r)
+		}
+	}
+	// The original tree (HEAD) must not pass --check.
+	if c := Check(context.Background(), o, "", "HEAD"); c.OK {
+		t.Fatalf("HEAD's tree passed --check although a step rewrote it: %+v", c)
+	}
+}
