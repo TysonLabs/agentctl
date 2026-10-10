@@ -44,16 +44,26 @@ Usage:
                                                default branch (or B); return an existing one
   agentflow pr wait <number> [--repo O/N]      wait for CodeRabbit's review of the PR head;
                                                list open threads (see: agentflow pr --help)
+  agentflow pr thread <thread-id> [--repo O/N] print one review thread's comments (read-only)
   agentflow pr reply <thread-id> --fixed SHA --note TEXT | --keep REASON
                                                reply to a review thread, then resolve it
   agentflow pr merge <number> [--sync-branch B] merge a ready PR pinned to its head;
                                                report the merge sha
+  agentflow worktree new <branch>|--scratch    create a worktree under .claude/worktrees
   agentflow worktree done <branch|path>        remove a merged, clean, unused worktree
   agentflow worktree sweep [--yes]             list (or remove) every such worktree
                                                (see: agentflow worktree --help)
-  agentflow lessons brief|bump|retire|stats    code-review lessons: brief section, counters,
-                                               retirement (see: agentflow lessons --help)
+  agentflow lessons <subcommand>               code-review lessons: brief, bump, add, seen,
+                                               search, triage, retire, stats
+                                               (see: agentflow lessons --help)
   agentflow version                           print agentflow's own version
+
+Output: every command that prints a JSON result also takes --format json|text.
+json (the default) is the stable API. text is a short summary for reading:
+"<command>: <status> (exit N)", then one "key: value" per line, then lists as
+"- ..." lines. Exit codes are the same in both formats, and a command that
+saves its JSON (<out>/result.json) saves it in both. Text from reviews and
+other tools is printed with control characters escaped (\x1b, \u202e).
 
 codex and claude flags:
   --dir DIR               repository to work in (default: current directory)
@@ -77,6 +87,15 @@ codex and claude flags:
   --lessons-repo NAME     rank that repo's lessons first (default: the name of
                           --dir's origin remote)
   --lessons-dir DIR       the lessons folder (default: $AGENTFLOW_LESSONS_DIR)
+  --format json|text      result on stdout as JSON (default) or a text summary
+  --protocol fix|review   wrap the brief in the built-in review protocol: rules
+                          before it, the fixed output format after it. fix needs
+                          --write; review must be read-only. The brief is then
+                          optional with a scope. The JSON adds "findings",
+                          parsed from final.md (null plus a warning if it does
+                          not follow the format; the exit code is unchanged)
+  --test-cmd CMD          fix protocol: a targeted test command the reviewer
+                          runs after its fixes (repeatable)
 
   A scope with a prompt inlines the scoped diff under your prompt. A scope
   with no prompt runs codex's built-in reviewer (codex exec review); claude
@@ -89,8 +108,8 @@ codex and claude flags:
   under --dir, no network). Prompt-driven runs are told they are a sub-agent:
   do the task, report, stop, and start no other agents.
 
-Output: the JSON result on stdout (also saved as <out>/result.json); the
-review itself is in the file named by "final".
+Output: the JSON result on stdout (also saved as <out>/result.json, in both
+formats); the review itself is in the file named by "final".
 
 Exit codes: 0 ok · 1 usage/precondition · 3 agent failed · 4 no final answer
             5 rate/usage limited · 124 timeout · 125 stalled · 130 interrupted
@@ -177,6 +196,8 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 		lessonTops string
 		lessonRepo string
 		lessonDir  string
+		protoFlag  string
+		testCmds   pathList
 	)
 	fs.StringVar(&o.Dir, "dir", "", "")
 	fs.StringVar(&prompt, "prompt", "", "")
@@ -194,6 +215,9 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 	fs.StringVar(&lessonTops, "lessons", "", "")
 	fs.StringVar(&lessonRepo, "lessons-repo", "", "")
 	fs.StringVar(&lessonDir, "lessons-dir", "", "")
+	format := formatFlag(fs)
+	fs.StringVar(&protoFlag, "protocol", "", "")
+	fs.Var(&testCmds, "test-cmd", "")
 	if b == agent.Claude {
 		fs.Float64Var(&o.MaxBudgetUSD, "max-budget-usd", 0, "")
 	}
@@ -239,6 +263,15 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 	if prompt == "" && scopes == 0 {
 		return fail("give --prompt/--prompt-file, a review scope (--base, --commit, --uncommitted), or both")
 	}
+	proto, err := protocolFlags(protoFlag, testCmds, o.Write)
+	if err != nil {
+		return fail("%v", err)
+	}
+	if proto != agent.ProtocolNone {
+		// Protocol first, then the brief and the output format; the
+		// learned-checks section and the diff follow below.
+		prompt = agent.WrapBrief(agent.ProtocolPrompt{Mode: proto, TestCmds: testCmds, Lessons: lessonTops != ""}, prompt)
+	}
 	if prompt == "" && b == agent.Claude {
 		prompt = defaultReviewBrief
 		if o.Write {
@@ -277,7 +310,7 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 	}
 	if lessonTops != "" {
 		if prompt == "" {
-			return fail("--lessons needs --prompt or --prompt-file (codex's built-in reviewer takes no extra instructions)")
+			return fail("--lessons needs --prompt, --prompt-file or --protocol (codex's built-in reviewer takes no extra instructions)")
 		}
 		section, err := lessonsSection(o.Dir, lessonDir, lessonTops, lessonRepo)
 		if err != nil {
@@ -313,19 +346,46 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 	if err != nil {
 		return fail("%v", err)
 	}
+	res.SetFindings(proto)
 	out, _ := json.MarshalIndent(res, "", "  ")
 	out = append(out, '\n')
 	_ = os.WriteFile(filepath.Join(o.OutDir, "result.json"), out, 0o644)
-	_, _ = stdout.Write(out)
+	code, ok := exitCodes[res.Status]
+	if !ok {
+		code = exitCodes[agent.StatusFailed]
+	}
+	emit(stdout, *format, out, func() string { return agentText(name, res, code, o.OutDir) })
 	if res.Status != agent.StatusOK {
 		fmt.Fprintf(stderr, "agentflow %s: %s: %s (logs: %s)\n", name, res.Status, res.Error, o.OutDir)
 	}
-	code, ok := exitCodes[res.Status]
 	if !ok {
 		fmt.Fprintf(stderr, "agentflow %s: unknown result status %q\n", name, res.Status)
-		return exitCodes[agent.StatusFailed]
 	}
 	return code
+}
+
+// protocolFlags checks --protocol and --test-cmd against --write. The mode is
+// explicit, not implied by --write, so a dropped --write is refused instead of
+// silently turning a fix run into a review.
+func protocolFlags(mode string, testCmds []string, write bool) (agent.Protocol, error) {
+	p, err := agent.ParseProtocol(mode)
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case p == agent.ProtocolFix && !write:
+		return "", errors.New("--protocol fix needs --write: the reviewer must be able to edit files")
+	case p == agent.ProtocolReview && write:
+		return "", errors.New("--protocol review is read-only: drop --write, or use --protocol fix")
+	case len(testCmds) > 0 && p != agent.ProtocolFix:
+		return "", errors.New("--test-cmd needs --protocol fix: a read-only reviewer runs no tests")
+	}
+	for _, c := range testCmds {
+		if strings.TrimSpace(c) == "" || strings.ContainsAny(c, "`\n\r") {
+			return "", fmt.Errorf("--test-cmd %q must be one non-empty line without backticks", c)
+		}
+	}
+	return p, nil
 }
 
 // lockOutDir prevents concurrent runs from truncating each other's event log

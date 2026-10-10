@@ -31,8 +31,8 @@ const (
 // skipped: it does not review PRs whose base is not the default branch.
 const DefaultReviewMention = "@coderabbitai review"
 
-// MaxBodyRunes is GitHub's limit on a PR body.
-const MaxBodyRunes = 65536
+// MaxPRBodyRunes is GitHub's limit on a PR body.
+const MaxPRBodyRunes = 65536
 
 // Git runs git with args in the repository and returns its stdout.
 type Git func(ctx context.Context, args ...string) (string, error)

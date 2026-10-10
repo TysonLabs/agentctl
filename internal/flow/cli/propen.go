@@ -125,8 +125,8 @@ func runPROpen(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	if !set["title"] {
 		return fail("--title is required")
 	}
-	if n := utf8.RuneCountInString(o.Body); n > pr.MaxBodyRunes {
-		return fail("the body has %d characters; GitHub allows %d", n, pr.MaxBodyRunes)
+	if n := utf8.RuneCountInString(o.Body); n > pr.MaxPRBodyRunes {
+		return fail("the body has %d characters; GitHub allows %d", n, pr.MaxPRBodyRunes)
 	}
 	if strings.ContainsAny(o.Title, "\r\n") {
 		return fail("--title must be one line")
