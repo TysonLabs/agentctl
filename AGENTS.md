@@ -34,7 +34,9 @@ background and keep working; your harness tells you when it exits. Never wait in
    is done by you: review, fix what the brief asks, report, and stop. Don't start
    another review or follow the rest of this list.
 5. **Run the repo's full gate once**, after the review fixes and any merge from the
-   default branch. If it fails, fix it and rerun the failing part.
+   default branch. If it fails, fix it and rerun the failing part. To merge the default
+   branch in, run `agentflow branch sync --merge`: it reports what came in and which
+   files both sides touched, and lists any conflicts it leaves for you to resolve.
 6. **Push and open a PR** whose body says what changed, how it was verified, and any
    review fix you did not take as written, with the reason.
 7. **Handle every PR review thread.** If the repo uses CodeRabbit, run
