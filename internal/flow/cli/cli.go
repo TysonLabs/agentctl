@@ -3,7 +3,7 @@
 // (exitCodes for codex, coderabbitExitCodes for coderabbit, shipExitCodes
 // for ship verify, prExitCodes for pr wait, replyExitCodes for pr reply,
 // prMergeExitCodes for pr merge, lessonsExitCodes for lessons, branchExitCodes
-// for branch sync). 0 is success, 1 a
+// for branch sync, redcheckExitCodes for redcheck). 0 is success, 1 a
 // usage or precondition error, 124 a timeout and 130 an interruption for
 // every command.
 package cli
@@ -56,6 +56,9 @@ Usage:
   agentflow lessons <subcommand>               code-review lessons: brief, bump, add, seen,
                                                search, triage, retire, stats
                                                (see: agentflow lessons --help)
+  agentflow redcheck --test CMD --commit SHA|--base REF|--uncommitted
+                                               prove a fix's new test fails without the fix
+                                               (see: agentflow redcheck --help)
   agentflow version                           print agentflow's own version
 
 Output: every command that prints a JSON result also takes --format json|text.
@@ -163,6 +166,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		return runBranch(ctx, args[1:], stdout, stderr)
+	case "redcheck":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runRedcheck(ctx, args[1:], stdout, stderr)
 	case "version", "--version":
 		fmt.Fprintln(stdout, "agentflow "+Version)
 		return 0
