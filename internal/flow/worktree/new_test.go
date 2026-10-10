@@ -522,3 +522,33 @@ func TestScratchWhoseDirectoryIsGoneIsPruned(t *testing.T) {
 		t.Fatal("stale scratch record kept")
 	}
 }
+
+func TestDiscardFreshLeavesAConcurrentCreatorsTree(t *testing.T) {
+	f := newFixture(t)
+	sha := git(t, f.repo, "rev-parse", "origin/main")
+	path := filepath.Join(f.repo, ".claude", "worktrees", "feat-race")
+	// The winner created the same branch and path first (unlocked, or with
+	// its own lock); the loser's failed add must not undo it.
+	git(t, f.repo, "worktree", "add", "-q", "--no-track", "-b", "feat/race", path, sha)
+	if err := discardFresh(context.Background(), f.env, f.repo, path, "feat/race", sha, "agentflow new loser-nonce (creating)"); err != nil {
+		t.Fatal(err)
+	}
+	git(t, f.repo, "worktree", "lock", "--reason", "agentflow new winner-nonce (creating)", path)
+	if err := discardFresh(context.Background(), f.env, f.repo, path, "feat/race", sha, "agentflow new loser-nonce (creating)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil || !localHas(f, "feat/race") {
+		t.Fatalf("winner's worktree or branch removed: %v", err)
+	}
+}
+
+func TestNewBranchWorktreeIsUnlockedAfterCreation(t *testing.T) {
+	f := newFixture(t)
+	c, err := f.newWT(NewOptions{Branch: "feat/unlocked"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := f.find(c.Path); w.Locked {
+		t.Fatalf("creation lock left on %+v", w)
+	}
+}

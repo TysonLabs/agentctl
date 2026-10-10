@@ -199,11 +199,22 @@ func New(ctx context.Context, env Env, repoDir string, opt NewOptions) (Created,
 	} else {
 		// --no-track: the base is usually origin/main, and an upstream of
 		// origin/main would make a bare `git push` target main.
-		if _, err := run(ctx, main.Path, env.Git, "worktree", "add", "--quiet", "--no-track", "-b", opt.Branch, c.Path, sha); err != nil {
-			if cleanupErr := discardFresh(ctx, env, main.Path, c.Path, opt.Branch, sha, ""); cleanupErr != nil {
+		// Locked with a per-attempt nonce until it is complete: a failed
+		// add then undoes only a tree carrying this exact lock, never a
+		// concurrent creator's tree at the same path.
+		nonce, err := randomHex(16)
+		if err != nil {
+			return c, err
+		}
+		reason := "agentflow new " + nonce + " (creating)"
+		if _, err := run(ctx, main.Path, env.Git, "worktree", "add", "--quiet", "--no-track", "--lock", "--reason", reason, "-b", opt.Branch, c.Path, sha); err != nil {
+			if cleanupErr := discardFresh(ctx, env, main.Path, c.Path, opt.Branch, sha, reason); cleanupErr != nil {
 				return c, fmt.Errorf("%v; cleanup: %w", err, cleanupErr)
 			}
 			return c, err
+		}
+		if _, err := run(ctx, main.Path, env.Git, "worktree", "unlock", c.Path); err != nil {
+			c.Notes = append(c.Notes, "could not remove the creation lock ("+err.Error()+"); run git worktree unlock "+c.Path)
 		}
 	}
 
@@ -221,7 +232,8 @@ func New(ctx context.Context, env Env, repoDir string, opt NewOptions) (Created,
 	return c, nil
 }
 
-// discardFresh undoes the worktree this call just created when a later
+// discardFresh undoes the worktree this call just created (identified by
+// ownLock, the per-attempt lock reason it was added with) when a later
 // step failed (a failing checkout hook, a marker write). It never forces:
 // git's own remove refuses if anything modified or untracked appeared, and
 // then the tree is left in place and named in the error.
@@ -234,23 +246,19 @@ func discardFresh(ctx context.Context, env Env, repoDir, path, branch, sha, ownL
 	if err != nil {
 		return nil // git registered nothing
 	}
-	if w.Locked && w.LockReason != ownLock {
-		return fmt.Errorf("%s is locked by someone else (%s); left in place", path, w.LockReason)
+	if !w.Locked || w.LockReason != ownLock {
+		return nil // not the tree this call created (e.g. a concurrent creator won)
 	}
 	if contained, err := containedRefusals(ctx, env, path); err != nil {
 		return fmt.Errorf("%s left in place: %w", path, err)
 	} else if len(contained) > 0 {
 		return fmt.Errorf("%s left in place: %s", path, strings.Join(contained, "; "))
 	}
-	if w.Locked {
-		if _, err := run(ctx, repoDir, env.Git, "worktree", "unlock", path); err != nil {
-			return err
-		}
+	if _, err := run(ctx, repoDir, env.Git, "worktree", "unlock", path); err != nil {
+		return err
 	}
 	if _, err := run(ctx, repoDir, env.Git, "worktree", "remove", path); err != nil {
-		if w.Locked {
-			_, _ = run(ctx, repoDir, env.Git, "worktree", "lock", "--reason", ownLock, path)
-		}
+		_, _ = run(ctx, repoDir, env.Git, "worktree", "lock", "--reason", ownLock, path)
 		return fmt.Errorf("%s left in place: %v", path, err)
 	}
 	if branch != "" {
