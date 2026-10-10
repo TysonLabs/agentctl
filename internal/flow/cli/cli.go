@@ -2,10 +2,12 @@
 // assigned in this package and nowhere else, one table per command
 // (exitCodes for codex, coderabbitExitCodes for coderabbit, shipExitCodes
 // for ship verify, prExitCodes for pr wait, replyExitCodes for pr reply,
-// prMergeExitCodes for pr merge, lessonsExitCodes for lessons, gateExitCodes
-// for gate). 0 is success, 1 a
-// usage or precondition error, 124 a timeout and 130 an interruption for
-// every command.
+// prMergeExitCodes for pr merge, prOpenExitCodes for pr open, lessonsExitCodes
+// for lessons, branchExitCodes for branch sync, redcheckExitCodes for redcheck,
+// lockExitCodes for lock, gateExitCodes for gate). 0 is success, 1 a usage or
+// precondition error, 124 a timeout and 130 an interruption for every command,
+// except that lock run passes its command's exit code through and reports a
+// lock wait timeout as 75.
 package cli
 
 import (
@@ -40,6 +42,9 @@ Usage:
   agentflow ship announce <svc.env> --verified FILE ...
                                                post a verified deploy to Slack
                                                (see: agentflow ship --help)
+  agentflow pr open --title T --body-file F [--base B]
+                                               push the branch, open a PR against the
+                                               default branch (or B); return an existing one
   agentflow pr wait <number> [--repo O/N]      wait for CodeRabbit's review of the PR head;
                                                list open threads (see: agentflow pr --help)
   agentflow pr thread <thread-id> [--repo O/N] print one review thread's comments (read-only)
@@ -51,6 +56,8 @@ Usage:
   agentflow worktree done <branch|path>        remove a merged, clean, unused worktree
   agentflow worktree sweep [--yes]             list (or remove) every such worktree
                                                (see: agentflow worktree --help)
+  agentflow branch sync [--base REF] [--merge] report ahead/behind/overlap vs the default
+                                               branch; merge it in (see: agentflow branch --help)
   agentflow gate [--project P] [--only a,b] [--force]
                                                run the project's gate steps from
                                                services.toml; receipts per tree
@@ -59,6 +66,13 @@ Usage:
   agentflow lessons <subcommand>               code-review lessons: brief, bump, add, seen,
                                                search, triage, retire, stats
                                                (see: agentflow lessons --help)
+  agentflow redcheck --test CMD --commit SHA|--base REF|--uncommitted
+                                               prove a fix's new test fails without the fix
+                                               (see: agentflow redcheck --help)
+  agentflow lock run --name N [--wait DUR] -- CMD [ARGS...]
+                                               run CMD under an exclusive named lock
+  agentflow lock status [--name N]             list named locks and holders (JSON)
+                                               (see: agentflow lock --help)
   agentflow version                           print agentflow's own version
 
 Output: every command that prints a JSON result also takes --format json|text.
@@ -166,6 +180,16 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return runGate(ctx, args[1:], stdout, stderr)
 	case "lessons":
 		return runLessons(args[1:], stdout, stderr)
+	case "branch":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runBranch(ctx, args[1:], stdout, stderr)
+	case "redcheck":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runRedcheck(ctx, args[1:], stdout, stderr)
+	case "lock":
+		return runLock(args[1:], stdout, stderr)
 	case "version", "--version":
 		fmt.Fprintln(stdout, "agentflow "+Version)
 		return 0

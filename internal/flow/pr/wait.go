@@ -377,11 +377,16 @@ func SafeBody(body string) (string, bool) {
 }
 
 // GHCLI returns a GH that runs the gh binary at bin.
-func GHCLI(bin string, perCall time.Duration) GH {
+func GHCLI(bin string, perCall time.Duration) GH { return GHCLIIn(bin, "", perCall) }
+
+// GHCLIIn is GHCLI run in dir ("" = the current directory), for gh calls
+// that read the repository from the directory's git remotes.
+func GHCLIIn(bin, dir string, perCall time.Duration) GH {
 	return func(ctx context.Context, args ...string) ([]byte, error) {
 		cctx, cancel := context.WithTimeout(ctx, perCall)
 		defer cancel()
 		cmd := exec.CommandContext(cctx, bin, args...)
+		cmd.Dir = dir
 		cmd.WaitDelay = time.Second
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
