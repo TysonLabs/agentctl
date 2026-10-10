@@ -13,6 +13,14 @@
 // optional "- **Misled:** N" and "- **Used:** N". A false-positive entry uses
 // "#fp/<topic>" tags, a "^fp<N>" id and "Claim", "Why it's wrong", "Tell" and
 // "Seen" bullets. Everything else in a file is kept byte for byte.
+//
+// Inbox.md holds the id counter, a "Next free id: l<N>" line, and groups its
+// lessons under dated sections, newest first:
+//
+//	## 2026-10-09, some-repo (#123)
+//
+// A lesson ends at the next "### ", "## " or "# " heading outside a fenced
+// code block; a "## " section heading that follows a lesson is not part of it.
 package lessons
 
 import (

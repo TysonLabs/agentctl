@@ -540,6 +540,12 @@ export AGENTFLOW_LESSONS_DIR=~/notes/review-lessons   # or --lessons-dir on each
 agentflow codex --base main --prompt-file brief.md --write --lessons concurrency,database
 agentflow lessons brief --topics concurrency --repo myrepo   # print the section only
 agentflow lessons bump --used l12,l40 --misled l7 --fp-seen fp3
+agentflow lessons search lock check write                     # find a lesson before writing one
+agentflow lessons add --repo myrepo --ref "#123" --topics concurrency \
+  --title "..." --what "..." --why "..." --avoid "..."       # new Inbox lesson; prints duplicates
+agentflow lessons seen l12 --repo myrepo --ref "#123" --note "..."   # Also seen line + Used +1
+agentflow lessons triage                  # Inbox with duplicates and a suggested file
+agentflow lessons triage --apply plan.json
 agentflow lessons retire                  # list; --apply moves them to Archive.md
 agentflow lessons stats
 ```
@@ -562,13 +568,56 @@ one file per topic, each lesson a `### title` block with a tag line
   instructions. The prompt-size cap counts the section.
 - **`bump`** is the only safe way to change counters: it locks the folder, changes all
   ids or none (exit 2 names any id it could not find), and writes each file atomically.
+- **`search`** ranks lessons by word overlap with the terms: a word in the title counts
+  most, then in `Avoid by`, then in `What went wrong` or an `Also seen:` line, and rare
+  words count more than common ones. It is lexical and deterministic, not semantic, so
+  try a second wording before you conclude a habit is new.
+- **`add`** writes a lesson to `Inbox.md`. It takes the id from the Inbox's
+  `Next free id: l<N>` line and raises that line, both under the folder lock, so two
+  sessions never get the same id (if the counter is behind an id already in the folder,
+  it skips past it and says so in `counter_was`). The lesson goes to the top of the
+  section `## <date>, <repo> (<ref>)`, which is created newest first when absent, with
+  `Used: 0`. Topics must already be in use (`--new-topic` allows a new one), and
+  `--principle` must be a `## <name>` heading in the principles file. The JSON lists
+  candidate duplicates (search score at or above `--dup-threshold`, 0.35, archive
+  included). Read them: if one records the same habit, use `seen` on it instead.
+  `--if-no-duplicate` writes nothing and exits 3 when there is a candidate; `--dry-run`
+  writes nothing and prints the block.
+- **`seen ID`** adds `- **Also seen:** <date>, <repo> (<ref>): <note>` after the
+  lesson's last `Also seen:` line (or before its counters) and raises `Used` by one
+  (`--no-bump`: not), in one write. An archived lesson needs `--revive`, which moves it
+  back to the end of the topic file its `Retired:` line names and drops that line.
+- **`triage`** lists every Inbox lesson with its candidate duplicates and a suggested
+  topic file (the file holding most lessons with its first topic). Triage needs
+  judgment, so you (or your agent) write the plan, and `triage --apply plan.json`
+  carries it out, all or nothing:
+
+  ```json
+  [{"id": "l937", "action": "move", "file": "Concurrency.md"},
+   {"id": "l938", "action": "merge", "target": "l12", "note": "same race in the dialer"}]
+  ```
+
+  `move` appends the lesson to the end of the topic file (which must exist). `merge`
+  adds an `Also seen:` line to the target (the note defaults to the lesson's title; the
+  ref and date come from its Inbox section and tag line unless the step gives `ref` or
+  `date`), adds 1 plus the merged lesson's `Used` to the target's `Used`, and drops the
+  Inbox lesson. Sections the plan empties are removed; the Inbox header and its counter
+  stay. A plan that would leave an id in two files is refused. Lesson text is never
+  rewritten.
 - **`retire`** finds topic-file lessons with `Used 0` and no activity (date or
   `Also seen:`) for `--days` (90), or with `Misled > Used`. `--apply` moves them to
   `Archive.md` with a `Retired:` line, writing the archive first so an interrupted run
   never loses a lesson. Lessons that `Code Review Principles.md` links (`#^l<id>`) stay.
 
+Every command that writes takes the folder lock, checks the whole request first, and
+then writes each changed file atomically; bytes outside the lines it changes stay as
+they were. When a command changes two files, the file that receives a lesson is written
+before the one it leaves, so an interrupted run can leave a lesson in both, never in
+neither.
+
 A missing folder, a folder with no lessons and an unknown topic are errors, never an
-empty section. Exit codes: 0 ok · 1 usage or precondition · 2 an id was not found.
+empty section. Exit codes: 0 ok · 1 usage or precondition · 2 an id was not found
+(nothing written) · 3 `add --if-no-duplicate` found a candidate (nothing written).
 
 ## agentcfg (companion binary): edit the registry, keep tokens in the Keychain
 
