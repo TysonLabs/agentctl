@@ -250,3 +250,115 @@ func TestLessonsWriteCommands(t *testing.T) {
 		t.Errorf("merge target:\n%s", conc)
 	}
 }
+
+func TestLessonsAddRejectsNaNThresholdWithoutWriting(t *testing.T) {
+	dir := lessonsFixture(t)
+	t.Setenv("AGENTFLOW_LESSONS_DIR", dir)
+	inbox := filepath.Join(dir, "Inbox.md")
+	want := "# Inbox\n\nNext free id: l2\n"
+	if err := os.WriteFile(inbox, []byte(want), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, errOut := run(t, "lessons", "add", "--repo", "alpha", "--ref", "#5", "--topics", "concurrency",
+		"--date", "2026-07-01", "--title", "A distinct title", "--what", "w", "--why", "y",
+		"--avoid", "a distinct remedy", "--dup-threshold", "NaN")
+	if code != 1 || !strings.Contains(errOut, "--dup-threshold") {
+		t.Fatalf("exit %d stderr %q, want invalid threshold", code, errOut)
+	}
+	if got, err := os.ReadFile(inbox); err != nil || string(got) != want {
+		t.Fatalf("invalid threshold must write nothing: err=%v content=%q", err, got)
+	}
+}
+
+func TestLessonsSearchRejectsUnknownTopic(t *testing.T) {
+	dir := lessonsFixture(t)
+	t.Setenv("AGENTFLOW_LESSONS_DIR", dir)
+
+	code, _, errOut := run(t, "lessons", "search", "lock", "--topics", "concurreny")
+	if code != 1 || !strings.Contains(errOut, "known topics: concurrency") {
+		t.Fatalf("exit %d stderr %q, want unknown-topic error", code, errOut)
+	}
+}
+
+func TestLessonsSearchAcceptsArchivedTopicWhenIncluded(t *testing.T) {
+	dir := lessonsFixture(t)
+	t.Setenv("AGENTFLOW_LESSONS_DIR", dir)
+	archive := `# Archive
+
+### Archived parser lesson
+#cr/parsing · alpha · 2026-01-01 ^l9
+
+- **Avoid by:** preserve the parser boundary.
+- **Used:** 1
+`
+	if err := os.WriteFile(filepath.Join(dir, "Archive.md"), []byte(archive), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, errOut := run(t, "lessons", "search", "parser", "--topics", "parsing", "--include-archive")
+	if code != 0 || !strings.Contains(out, `"id": "l9"`) {
+		t.Fatalf("exit %d\nstdout %s\nstderr %s", code, out, errOut)
+	}
+}
+
+func TestLessonsSearchRejectsEmptyTerm(t *testing.T) {
+	dir := lessonsFixture(t)
+	t.Setenv("AGENTFLOW_LESSONS_DIR", dir)
+
+	code, _, errOut := run(t, "lessons", "search", " \t ")
+	if code != 1 || !strings.Contains(errOut, "search term") {
+		t.Fatalf("exit %d stderr %q, want missing-term error", code, errOut)
+	}
+}
+
+func TestLessonsSearchHonorsDoubleDash(t *testing.T) {
+	dir := lessonsFixture(t)
+	t.Setenv("AGENTFLOW_LESSONS_DIR", dir)
+
+	code, out, errOut := run(t, "lessons", "search", "--", "lock", "--limit")
+	if code != 0 || !strings.Contains(out, `"query": "lock --limit"`) {
+		t.Fatalf("exit %d\nstdout %s\nstderr %s", code, out, errOut)
+	}
+}
+
+func TestLessonsTriageRejectsTrailingJSONWithoutWriting(t *testing.T) {
+	dir := lessonsFixture(t)
+	t.Setenv("AGENTFLOW_LESSONS_DIR", dir)
+	inbox := filepath.Join(dir, "Inbox.md")
+	inboxText := `# Inbox
+
+Next free id: l3
+
+## 2026-07-01, alpha (#5)
+
+### Move this lesson
+#cr/concurrency · alpha · 2026-07-01 ^l2
+
+- **Avoid by:** validate the whole plan.
+- **Used:** 0
+`
+	if err := os.WriteFile(inbox, []byte(inboxText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	topic := filepath.Join(dir, "Concurrency.md")
+	topicBefore, err := os.ReadFile(topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(plan, []byte(`[{"id":"l2","action":"move","file":"Concurrency.md"}]]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, errOut := run(t, "lessons", "triage", "--apply", plan)
+	if code != 1 || !strings.Contains(errOut, "trailing data") {
+		t.Fatalf("exit %d stderr %q, want trailing-data error", code, errOut)
+	}
+	if got, err := os.ReadFile(inbox); err != nil || string(got) != inboxText {
+		t.Fatalf("invalid plan changed Inbox.md: err=%v content=%q", err, got)
+	}
+	if got, err := os.ReadFile(topic); err != nil || string(got) != string(topicBefore) {
+		t.Fatalf("invalid plan changed topic file: err=%v content=%q", err, got)
+	}
+}

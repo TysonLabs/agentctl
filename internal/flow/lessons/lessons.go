@@ -66,7 +66,7 @@ var (
 )
 
 func fieldRe(name string) *regexp.Regexp {
-	return regexp.MustCompile(`(?m)^- \*\*` + regexp.QuoteMeta(name) + `:\*\* (\d+)[ \t]*$`)
+	return regexp.MustCompile(`(?m)^- \*\*` + regexp.QuoteMeta(name) + `:\*\* (\d+)[ \t]*\r?$`)
 }
 
 func bulletRe(name string) *regexp.Regexp {
@@ -123,17 +123,12 @@ type Vault struct {
 // the blocks gives back the input exactly.
 func splitBlocks(text string) (string, []string) {
 	var starts []int
-	if strings.HasPrefix(text, "### ") {
-		starts = append(starts, 0)
-	}
-	for i := 0; ; {
-		j := strings.Index(text[i:], "\n### ")
-		if j < 0 {
-			break
+	lines(text, func(start int, line string, outside bool) bool {
+		if outside && strings.HasPrefix(line, "### ") {
+			starts = append(starts, start)
 		}
-		starts = append(starts, i+j+1)
-		i += j + 1
-	}
+		return true
+	})
 	if len(starts) == 0 {
 		return text, nil
 	}
@@ -169,13 +164,29 @@ func metaRepo(tag string) string {
 	return strings.TrimSpace(parts[1])
 }
 
+func metaDate(tag string) string {
+	parts := strings.Split(tag, "·")
+	if len(parts) < 3 {
+		return ""
+	}
+	return reDate.FindString(parts[2])
+}
+
 func intField(re *regexp.Regexp, block string) int {
-	m := re.FindStringSubmatch(block)
-	if m == nil {
+	locs := outsideMatches(block, re)
+	if len(locs) == 0 {
 		return 0
 	}
-	n, _ := strconv.Atoi(m[1])
+	n, _ := strconv.Atoi(block[locs[0][2]:locs[0][3]])
 	return n
+}
+
+func firstGroupOutside(re *regexp.Regexp, text string) string {
+	locs := outsideMatches(text, re)
+	if len(locs) == 0 || len(locs[0]) < 4 {
+		return ""
+	}
+	return strings.TrimSpace(text[locs[0][2]:locs[0][3]])
 }
 
 func firstGroup(re *regexp.Regexp, s string) string {
@@ -207,18 +218,19 @@ func parseLesson(file, block string) Lesson {
 		Repo:   metaRepo(tag),
 		Used:   intField(reUsed, block),
 		Misled: intField(reMisled, block),
-		Avoid:  firstGroup(reAvoid, block),
-		What:   firstGroup(reWhat, block),
+		Avoid:  firstGroupOutside(reAvoid, block),
+		What:   firstGroupOutside(reWhat, block),
 	}
-	for _, m := range reAlsoTx.FindAllStringSubmatch(block, -1) {
-		l.Also = append(l.Also, strings.TrimSpace(m[1]))
+	for _, m := range outsideMatches(block, reAlsoTx) {
+		l.Also = append(l.Also, strings.TrimSpace(block[m[2]:m[3]]))
 	}
-	l.Date = reDate.FindString(tag)
+	l.Date = metaDate(tag)
 	l.Last = l.Date
 	if l.Date != "" {
-		for _, m := range reAlso.FindAllStringSubmatch(block, -1) {
-			if m[1] > l.Last {
-				l.Last = m[1]
+		for _, m := range outsideMatches(block, reAlso) {
+			date := block[m[2]:m[3]]
+			if date > l.Last {
+				l.Last = date
 			}
 		}
 	}
@@ -233,8 +245,8 @@ func parseFP(block string) FalsePositive {
 		Topics: allGroups(reFPTag, tag),
 		Repo:   metaRepo(tag),
 		Seen:   intField(reSeen, block),
-		Why:    firstGroup(reWhy, block),
-		Tell:   firstGroup(reTell, block),
+		Why:    firstGroupOutside(reWhy, block),
+		Tell:   firstGroupOutside(reTell, block),
 	}
 }
 
@@ -259,6 +271,19 @@ func mdFiles(dir string) ([]string, error) {
 // false-positive entry with an id. A folder with no lessons is an error: it
 // almost always means the wrong folder.
 func Load(dir string) (*Vault, error) {
+	v, err := loadAll(dir)
+	if err != nil {
+		return nil, err
+	}
+	if len(v.Lessons) == 0 {
+		return nil, fmt.Errorf("no lessons (### blocks with a ^l<N> id) in %s", dir)
+	}
+	return v, nil
+}
+
+// loadAll is Load without the "no lessons" check, for Add: a new folder has
+// an Inbox with its counter and no lessons yet.
+func loadAll(dir string) (*Vault, error) {
 	files, err := mdFiles(dir)
 	if err != nil {
 		return nil, err
@@ -271,19 +296,17 @@ func Load(dir string) (*Vault, error) {
 		}
 		_, blocks := splitBlocks(string(b))
 		for _, blk := range blocks {
+			own, _ := splitTail(blk)
 			if f == FPFile {
-				if fp := parseFP(blk); fp.ID != "" { // the header's format example has no id
+				if fp := parseFP(own); fp.ID != "" { // the header's format example has no id
 					v.FalsePositives = append(v.FalsePositives, fp)
 				}
 				continue
 			}
-			if l := parseLesson(f, blk); l.ID != "" {
+			if l := parseLesson(f, own); l.ID != "" {
 				v.Lessons = append(v.Lessons, l)
 			}
 		}
-	}
-	if len(v.Lessons) == 0 {
-		return nil, fmt.Errorf("no lessons (### blocks with a ^l<N> id) in %s", dir)
 	}
 	return v, nil
 }
@@ -529,12 +552,14 @@ func (r BumpRequest) empty() bool { return len(r.Used)+len(r.Misled)+len(r.Seen)
 // Used line when it is absent (Misled is optional).
 func bumpBlock(block, field string, n int) (string, int, int, error) {
 	re := fieldRe(field)
-	if loc := re.FindStringSubmatchIndex(block); loc != nil {
+	if locs := outsideMatches(block, re); len(locs) > 0 {
+		loc := locs[0]
 		from, _ := strconv.Atoi(block[loc[2]:loc[3]])
-		return block[:loc[0]] + fmt.Sprintf("- **%s:** %d", field, from+n) + block[loc[1]:], from, from + n, nil
+		return block[:loc[2]] + strconv.Itoa(from+n) + block[loc[3]:], from, from + n, nil
 	}
 	if field == "Misled" {
-		if loc := reUsed.FindStringIndex(block); loc != nil {
+		if locs := outsideMatches(block, reUsed); len(locs) > 0 {
+			loc := locs[0]
 			return block[:loc[0]] + fmt.Sprintf("- **Misled:** %d\n", n) + block[loc[0]:], 0, n, nil
 		}
 	}

@@ -7,9 +7,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -218,23 +220,16 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 	}
 	// seen and search take positional arguments, which may come before,
 	// between or after the flags.
-	var pos []string
-	for rest := args[1:]; ; {
-		if err := fs.Parse(rest); err != nil {
-			if errors.Is(err, flag.ErrHelp) {
-				fmt.Fprint(stdout, lessonsUsage)
-				return lessonsExitCodes.ok
-			}
-			return fail("%v (see: agentflow lessons --help)", err)
+	pos, err := parseInterleaved(fs, args[1:])
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(stdout, lessonsUsage)
+			return lessonsExitCodes.ok
 		}
-		if fs.NArg() == 0 {
-			break
-		}
-		if sub != "seen" && sub != "search" {
-			return fail("unexpected argument %q", fs.Arg(0))
-		}
-		pos = append(pos, fs.Arg(0))
-		rest = fs.Args()[1:]
+		return fail("%v (see: agentflow lessons --help)", err)
+	}
+	if len(pos) > 0 && sub != "seen" && sub != "search" {
+		return fail("unexpected argument %q", pos[0])
 	}
 	dir, err := lessonsDir(dirFlag)
 	if err != nil {
@@ -297,7 +292,7 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 		req := lessons.AddRequest{Repo: repo, Ref: ref, Title: title, What: what, Why: why, Avoid: avoid,
 			Principle: principle, Date: date, Topics: splitTopics(topics), NewTopic: newTopic,
 			DryRun: dryRun, IfNoDuplicate: ifNoDup, DupThreshold: dupThreshold}
-		if dupThreshold <= 0 || dupThreshold > 1 {
+		if math.IsNaN(dupThreshold) || dupThreshold <= 0 || dupThreshold > 1 {
 			return fail("--dup-threshold must be in (0, 1]")
 		}
 		res, err := lessons.Add(dir, principles, req)
@@ -331,18 +326,45 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 		if limit < 0 {
 			return fail("--limit must not be negative")
 		}
+		q := strings.Join(pos, " ")
+		if strings.TrimSpace(q) == "" {
+			return fail("give at least one non-empty search term")
+		}
 		v, err := lessons.Load(dir)
 		if err != nil {
 			return fail("%v", err)
 		}
-		q := strings.Join(pos, " ")
-		res := v.Search(q, lessons.SearchOptions{Topics: splitTopics(topics), IncludeArchive: inclArchive, Limit: limit})
+		searchTopics := splitTopics(topics)
+		known := map[string]bool{}
+		var knownTopics []string
+		for _, lesson := range v.Lessons {
+			if lesson.File == lessons.ArchiveFile && !inclArchive {
+				continue
+			}
+			for _, topic := range lesson.Topics {
+				if !known[topic] {
+					known[topic] = true
+					knownTopics = append(knownTopics, topic)
+				}
+			}
+		}
+		sort.Strings(knownTopics)
+		var unknown []string
+		for _, topic := range searchTopics {
+			if !known[topic] {
+				unknown = append(unknown, topic)
+			}
+		}
+		if len(unknown) > 0 {
+			return fail("%v", &lessons.UnknownTopicError{Unknown: unknown, Known: knownTopics})
+		}
+		res := v.Search(q, lessons.SearchOptions{Topics: searchTopics, IncludeArchive: inclArchive, Limit: limit})
 		if res == nil {
 			res = []lessons.Match{}
 		}
 		return writeJSON(map[string]any{"query": q, "results": res})
 	case "triage":
-		if dupThreshold <= 0 || dupThreshold > 1 {
+		if math.IsNaN(dupThreshold) || dupThreshold <= 0 || dupThreshold > 1 {
 			return fail("--dup-threshold must be in (0, 1]")
 		}
 		if planFile == "" {
@@ -362,7 +384,8 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 		if err := dec.Decode(&plan); err != nil {
 			return fail("plan %s: %v", planFile, err)
 		}
-		if dec.More() {
+		var trailing any
+		if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
 			return fail("plan %s: trailing data after the JSON list", planFile)
 		}
 		res, err := lessons.TriageApply(dir, plan)

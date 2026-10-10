@@ -1,6 +1,8 @@
 package lessons
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -72,5 +74,21 @@ func TestSearchRanking(t *testing.T) {
 func TestIDLess(t *testing.T) {
 	if !idLess("l9", "l10") || idLess("l10", "l9") {
 		t.Error("numeric id order")
+	}
+}
+
+func TestSearchDoesNotReadPastSectionBoundary(t *testing.T) {
+	dir, _ := vault(t)
+	p := filepath.Join(dir, InboxFile)
+	inbox := fxInbox + "\n## 2026-06-29, alpha (#0)\n\n- **Also seen:** 2026-07-09, alpha (#9): boundarytoken\n"
+	if err := os.WriteFile(p, []byte(inbox), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := v.Search("boundarytoken", SearchOptions{}); len(got) != 0 {
+		t.Errorf("section text attributed to previous lesson: %v", ids(got))
 	}
 }

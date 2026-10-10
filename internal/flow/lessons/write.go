@@ -53,11 +53,33 @@ func idNum(id string) int {
 	return n
 }
 
+// fenceRun returns a Markdown fence's marker, width and remaining text. Up to
+// three leading spaces are allowed.
+func fenceRun(line string) (byte, int, string, bool) {
+	i := 0
+	for i < len(line) && i < 3 && line[i] == ' ' {
+		i++
+	}
+	if i == len(line) || (line[i] != '`' && line[i] != '~') {
+		return 0, 0, "", false
+	}
+	marker := line[i]
+	j := i
+	for j < len(line) && line[j] == marker {
+		j++
+	}
+	if j-i < 3 {
+		return 0, 0, "", false
+	}
+	return marker, j - i, line[j:], true
+}
+
 // lines calls fn for each line of text with its start offset and its text
 // without the newline, and whether it is outside a fenced code block. A
 // fence line itself counts as inside.
 func lines(text string, fn func(start int, line string, outside bool) bool) {
-	fenced := false
+	var fence byte
+	var fenceWidth int
 	for start := 0; start < len(text); {
 		end := strings.IndexByte(text[start:], '\n')
 		next := len(text)
@@ -68,15 +90,44 @@ func lines(text string, fn func(start int, line string, outside bool) bool) {
 			end = len(text)
 		}
 		line := text[start:end]
-		isFence := strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~")
-		if isFence {
-			fenced = !fenced
-		}
-		if !fn(start, line, !fenced && !isFence) {
-			return
+		marker, width, rest, isFence := fenceRun(line)
+		if fence != 0 {
+			if !fn(start, line, false) {
+				return
+			}
+			if isFence && marker == fence && width >= fenceWidth && strings.Trim(rest, " \t\r") == "" {
+				fence, fenceWidth = 0, 0
+			}
+		} else {
+			isOpen := isFence && (marker != '`' || !strings.Contains(rest, "`"))
+			if !fn(start, line, !isOpen) {
+				return
+			}
+			if isOpen {
+				fence, fenceWidth = marker, width
+			}
 		}
 		start = next
 	}
+}
+
+func outsideMatches(text string, re *regexp.Regexp) [][]int {
+	var out [][]int
+	lines(text, func(start int, line string, outside bool) bool {
+		if !outside {
+			return true
+		}
+		if m := re.FindStringSubmatchIndex(line); m != nil {
+			for i := range m {
+				if m[i] >= 0 {
+					m[i] += start
+				}
+			}
+			out = append(out, m)
+		}
+		return true
+	})
+	return out
 }
 
 // isSectionHeading reports a "# " or "## " heading line: one that ends the
@@ -103,11 +154,6 @@ func splitTail(block string) (own, tail string) {
 		return true
 	})
 	return block[:cut], block[cut:]
-}
-
-// trimNewlines returns block ending in exactly one newline.
-func trimNewlines(block string) string {
-	return strings.TrimRight(block, "\n") + "\n"
 }
 
 // fileSet is every .md file of the folder, split into header and blocks, so a
@@ -237,18 +283,67 @@ func checkDate(d string) error {
 	return nil
 }
 
+type nextIDLoc struct {
+	start, end int
+}
+
+func nextIDLocs(text string) []nextIDLoc {
+	var out []nextIDLoc
+	lines(text, func(start int, line string, outside bool) bool {
+		if !outside {
+			return true
+		}
+		if m := reNextID.FindStringSubmatchIndex(line); m != nil {
+			out = append(out, nextIDLoc{start: start + m[2], end: start + m[3]})
+		}
+		return true
+	})
+	return out
+}
+
+type retiredLoc struct {
+	start, end int
+	topic      string
+}
+
+func retiredLocs(text string) []retiredLoc {
+	var out []retiredLoc
+	lines(text, func(start int, line string, outside bool) bool {
+		if !outside {
+			return true
+		}
+		if m := reRetired.FindStringSubmatchIndex(line); m != nil {
+			end := start + m[1]
+			if end < len(text) && text[end] == '\n' {
+				end++
+			}
+			out = append(out, retiredLoc{
+				start: start + m[0],
+				end:   end,
+				topic: line[m[2]:m[3]],
+			})
+		}
+		return true
+	})
+	return out
+}
+
 // insertAlsoSeen adds line (ending in a newline) after the lesson's last Also
 // seen line, or else just before its Misled or Used line.
 func insertAlsoSeen(own, line string) (string, error) {
-	if locs := reAlsoLine.FindAllStringIndex(own, -1); len(locs) > 0 {
+	if locs := outsideMatches(own, reAlsoLine); len(locs) > 0 {
 		end := locs[len(locs)-1][1]
 		if end == len(own) {
 			return own + "\n" + line, nil
 		}
-		return own[:end+1] + line + own[end+1:], nil
+		if own[end] == '\n' {
+			end++
+		}
+		return own[:end] + line + own[end:], nil
 	}
 	for _, re := range []*regexp.Regexp{reMisled, reUsed} {
-		if l := re.FindStringIndex(own); l != nil {
+		if locs := outsideMatches(own, re); len(locs) > 0 {
+			l := locs[0]
 			return own[:l[0]] + line + own[l[0]:], nil
 		}
 	}
@@ -267,9 +362,18 @@ func alsoSeenLine(date, repo, ref, note string) string {
 func spliceBlock(text string, pos int, chunk string) string {
 	before, after := text[:pos], text[pos:]
 	if before != "" {
-		if !strings.HasSuffix(before, "\n") {
+		lineBreaks := 0
+		for i := len(before); i > 0 && before[i-1] == '\n'; {
+			lineBreaks++
+			i--
+			if i > 0 && before[i-1] == '\r' {
+				i--
+			}
+		}
+		switch lineBreaks {
+		case 0:
 			chunk = "\n\n" + chunk
-		} else if !strings.HasSuffix(before, "\n\n") {
+		case 1:
 			chunk = "\n" + chunk
 		}
 	}
@@ -311,6 +415,9 @@ func (r *AddRequest) validate() error {
 	}
 	if strings.ContainsAny(r.Repo, "·,()") {
 		return errors.New("--repo must not contain '·', ',' or parentheses")
+	}
+	if reCRTag.MatchString(r.Repo) {
+		return errors.New("--repo must not contain a #cr/<topic> tag")
 	}
 	if err := checkDate(r.Date); err != nil {
 		return err
@@ -376,7 +483,7 @@ func Add(dir, principles string, req AddRequest) (AddResult, error) {
 		return AddResult{}, err
 	}
 	defer unlock()
-	v, err := Load(dir)
+	v, err := loadAll(dir)
 	if err != nil {
 		return AddResult{}, err
 	}
@@ -412,11 +519,11 @@ func Add(dir, principles string, req AddRequest) (AddResult, error) {
 		return AddResult{}, fmt.Errorf("%s not found in %s", InboxFile, dir)
 	}
 	inbox := fs.text(InboxFile)
-	m := reNextID.FindAllStringSubmatchIndex(inbox, -1)
+	m := nextIDLocs(inbox)
 	if len(m) != 1 {
 		return AddResult{}, fmt.Errorf("%s must have exactly one \"Next free id: l<N>\" line, found %d", InboxFile, len(m))
 	}
-	next, err := strconv.Atoi(inbox[m[0][2]:m[0][3]])
+	next, err := strconv.Atoi(inbox[m[0].start:m[0].end])
 	if err != nil {
 		return AddResult{}, err
 	}
@@ -440,7 +547,7 @@ func Add(dir, principles string, req AddRequest) (AddResult, error) {
 		return res, ErrDuplicate
 	}
 
-	inbox = inbox[:m[0][2]] + strconv.Itoa(next+1) + inbox[m[0][3]:]
+	inbox = inbox[:m[0].start] + strconv.Itoa(next+1) + inbox[m[0].end:]
 	res.Section = fmt.Sprintf("## %s, %s (%s)", req.Date, strings.TrimSpace(req.Repo), strings.TrimSpace(req.Ref))
 	inbox, res.CreatedSection = insertInbox(inbox, res.Section, req.Date, block)
 	if req.DryRun {
@@ -580,18 +687,19 @@ func Seen(dir string, req SeenRequest) (SeenResult, error) {
 		res.Used = &Change{ID: req.ID, File: at.file, Field: "Used", From: from, To: to}
 	}
 	if at.file == ArchiveFile {
-		m := reRetired.FindStringSubmatchIndex(own)
-		if m == nil {
-			return SeenResult{}, fmt.Errorf("%s has no \"Retired: <date> from <topic> (…)\" line naming its topic file", req.ID)
+		retired := retiredLocs(own)
+		if len(retired) != 1 {
+			return SeenResult{}, fmt.Errorf("%s must have exactly one \"Retired: <date> from <topic> (…)\" line naming its topic file, found %d", req.ID, len(retired))
 		}
-		dest := own[m[2]:m[3]] + ".md"
+		r := retired[0]
+		dest := r.topic + ".md"
 		if filepath.Base(dest) != dest || !isTopicFile(dest) || !fs.has(dest) {
 			return SeenResult{}, fmt.Errorf("%s: its Retired line names %q, which is not a topic file in the folder (nothing written)", req.ID, dest)
 		}
-		own = own[:m[0]] + own[m[1]:]
+		own = own[:r.start] + own[r.end:]
 		fs.blocks[at.file][at.idx] = tail
 		fs.dirty[at.file] = true
-		fs.header[dest], fs.blocks[dest] = appendMarkdownBlock(fs.text(dest), trimNewlines(own)), nil
+		fs.header[dest], fs.blocks[dest] = appendMarkdownBlock(fs.text(dest), own), nil
 		fs.dirty[dest] = true
 		res.Revived, res.File = ArchiveFile, dest
 		if res.Used != nil {
@@ -684,8 +792,9 @@ func Triage(dir string, threshold float64) (TriageReport, error) {
 		return TriageReport{}, fmt.Errorf("%s not found in %s", InboxFile, dir)
 	}
 	rep := TriageReport{Items: []TriageItem{}}
-	if m := reNextID.FindStringSubmatch(fs.text(InboxFile)); m != nil {
-		rep.NextFreeID = "l" + m[1]
+	if locs := nextIDLocs(fs.text(InboxFile)); len(locs) > 0 {
+		inbox := fs.text(InboxFile)
+		rep.NextFreeID = "l" + inbox[locs[0].start:locs[0].end]
 	}
 	secs := inboxSections(fs.header[InboxFile], fs.blocks[InboxFile])
 	for _, l := range v.Lessons {
@@ -889,7 +998,7 @@ func TriageApply(dir string, plan []PlanStep) (TriageResult, error) {
 		i := src[st.ID]
 		own, tail := splitTail(fs.blocks[InboxFile][i])
 		if st.Action == "move" {
-			fs.header[st.File] = appendMarkdownBlock(fs.text(st.File), trimNewlines(own))
+			fs.header[st.File] = appendMarkdownBlock(fs.text(st.File), own)
 			fs.blocks[st.File] = nil
 			fs.dirty[st.File] = true
 			res.Applied = append(res.Applied, TriageDone{ID: st.ID, Action: "move", File: st.File})

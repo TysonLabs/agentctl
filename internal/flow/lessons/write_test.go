@@ -152,6 +152,7 @@ func TestAddRejectsBadInputAndWritesNothing(t *testing.T) {
 		{"unknown principle", func(r *AddRequest) { r.Principle = "nope" }, "not a"},
 		{"bad date", func(r *AddRequest) { r.Date = "2026-13-01" }, "YYYY-MM-DD"},
 		{"repo separator", func(r *AddRequest) { r.Repo = "a · b" }, "--repo"},
+		{"repo topic tag", func(r *AddRequest) { r.Repo = "alpha #cr/forged" }, "--repo"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -193,6 +194,23 @@ func TestAddCounterProblems(t *testing.T) {
 	})
 }
 
+func TestAddIgnoresFencedCounterExample(t *testing.T) {
+	dir, principles := vault(t)
+	p := filepath.Join(dir, InboxFile)
+	inbox := strings.Replace(fxInbox, "- **Avoid by:** fresh habit.\n",
+		"- **Avoid by:** fresh habit.\n\n```text\nNext free id: l999\n```\n", 1)
+	if err := os.WriteFile(p, []byte(inbox), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Add(dir, principles, baseAdd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ID != "l10" || !strings.Contains(read(t, p), "Next free id: l11\n") {
+		t.Errorf("result %+v\n%s", res, read(t, p))
+	}
+}
+
 // A counter at or below an id already in the folder (a hand-added lesson)
 // must not hand out that id again.
 func TestAddCounterBehindExistingIDs(t *testing.T) {
@@ -221,6 +239,29 @@ func TestAddNewTopic(t *testing.T) {
 	if !strings.Contains(read(t, filepath.Join(dir, InboxFile)), "#cr/brand-new · alpha") {
 		t.Error("new topic not written")
 	}
+}
+
+func TestAddRepoDateDoesNotOverrideLessonDate(t *testing.T) {
+	dir, principles := vault(t)
+	req := baseAdd()
+	req.Repo = "service-2025-01-01"
+	res, err := Add(dir, principles, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range v.Lessons {
+		if l.ID == res.ID {
+			if l.Date != req.Date {
+				t.Fatalf("parsed date %q from repo instead of lesson date %q", l.Date, req.Date)
+			}
+			return
+		}
+	}
+	t.Fatalf("added lesson %s not loaded", res.ID)
 }
 
 func TestAddDuplicatesDryRunAndRefusal(t *testing.T) {
@@ -344,6 +385,25 @@ func TestSeenAfterLastAlsoSeenAndNoBump(t *testing.T) {
 	}
 }
 
+func TestSeenIgnoresFencedFieldsAndPreservesCounterLine(t *testing.T) {
+	dir, _ := vault(t)
+	p := filepath.Join(dir, "Concurrency.md")
+	content := strings.Replace(fxConcurrency, "- **Used:** 3\n",
+		"```text\n- **Also seen:** 2020-01-01, sample: example\n- **Used:** 99\n```\n- **Used:** 3  \r\n", 1)
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Seen(dir, SeenRequest{ID: "l1", Note: "again.", Repo: "beta", Ref: "#7", Date: "2026-07-03"}); err != nil {
+		t.Fatal(err)
+	}
+	got := read(t, p)
+	want := "```text\n- **Also seen:** 2020-01-01, sample: example\n- **Used:** 99\n```\n" +
+		"- **Also seen:** 2026-07-03, beta (#7): again.\n- **Used:** 4  \r\n"
+	if !strings.Contains(got, want) {
+		t.Errorf("fenced field or counter line changed:\n%q\nwant fragment %q", got, want)
+	}
+}
+
 func TestSeenErrorsWriteNothing(t *testing.T) {
 	dir, _ := vault(t)
 	before := snapshot(t, dir)
@@ -416,6 +476,42 @@ func TestSeenReviveNeedsTopicFile(t *testing.T) {
 			t.Errorf("want error for archive:\n%s", arch)
 		}
 		unchangedExcept(t, before, snapshot(t, dir))
+	}
+}
+
+func TestSeenReviveIgnoresFencedRetiredExample(t *testing.T) {
+	dir, _ := vault(t)
+	p := filepath.Join(dir, ArchiveFile)
+	archive := strings.Replace(fxArchive, "- **Retired:** 2026-05-01 from Concurrency (never used)\n",
+		"```text\n- **Retired:** 2026-01-01 from Media (example)\n```\n- **Retired:** 2026-05-01 from Concurrency (never used)\n", 1)
+	if err := os.WriteFile(p, []byte(archive), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Seen(dir, SeenRequest{ID: "l9", Note: "back.", Repo: "alpha", Ref: "#8", Date: "2026-07-06", Revive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.File != "Concurrency.md" {
+		t.Fatalf("revived into %s, want Concurrency.md", res.File)
+	}
+	got := read(t, filepath.Join(dir, "Concurrency.md"))
+	if !strings.Contains(got, "- **Retired:** 2026-01-01 from Media (example)") || strings.Contains(got, "from Concurrency (never used)") {
+		t.Errorf("wrong Retired line removed:\n%s", got)
+	}
+}
+
+func TestSeenRevivePreservesLessonEnding(t *testing.T) {
+	dir, _ := vault(t)
+	archive := fxArchive + "\n\n"
+	if err := os.WriteFile(filepath.Join(dir, ArchiveFile), []byte(archive), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Seen(dir, SeenRequest{ID: "l9", Note: "back.", Repo: "alpha", Ref: "#8", Date: "2026-07-06", Revive: true}); err != nil {
+		t.Fatal(err)
+	}
+	wantSuffix := "- **Also seen:** 2026-07-06, alpha (#8): back.\n- **Used:** 10\n\n\n"
+	if got := read(t, filepath.Join(dir, "Concurrency.md")); !strings.HasSuffix(got, wantSuffix) {
+		t.Errorf("revived lesson ending changed:\n%q\nwant suffix %q", got, wantSuffix)
 	}
 }
 
@@ -632,11 +728,81 @@ func TestTriageApplyKeepsSectionsItDidNotEmpty(t *testing.T) {
 	}
 }
 
+func TestTriageApplyMovePreservesLessonTrailingBytes(t *testing.T) {
+	dir := triageVault(t)
+	p := filepath.Join(dir, InboxFile)
+	inbox := strings.Replace(triageInbox,
+		"- **Used:** 0\n\n## 2026-06-30",
+		"- **Used:** 0\n\n\n## 2026-06-30", 1)
+	if err := os.WriteFile(p, []byte(inbox), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := TriageApply(dir, []PlanStep{{ID: "l12", Action: "move", File: "Concurrency.md"}}); err != nil {
+		t.Fatal(err)
+	}
+	wantSuffix := "### Third fresh lesson\n#cr/concurrency · alpha · 2026-07-02 ^l12\n\n- **Avoid by:** third habit.\n- **Used:** 0\n\n\n"
+	if got := read(t, filepath.Join(dir, "Concurrency.md")); !strings.HasSuffix(got, wantSuffix) {
+		t.Errorf("moved lesson trailing bytes changed:\n%q\nwant suffix %q", got, wantSuffix)
+	}
+}
+
+func TestTriageApplyMoveKeepsFencedHeadingInLesson(t *testing.T) {
+	dir := triageVault(t)
+	p := filepath.Join(dir, InboxFile)
+	inbox := strings.Replace(triageInbox, "- **Avoid by:** third habit.\n- **Used:** 0",
+		"- **Avoid by:** third habit.\n\n   ```md\n### example heading\n## example section\n   ```\n- **Used:** 0", 1)
+	if err := os.WriteFile(p, []byte(inbox), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := TriageApply(dir, []PlanStep{{ID: "l12", Action: "move", File: "Concurrency.md"}}); err != nil {
+		t.Fatal(err)
+	}
+	got := read(t, filepath.Join(dir, "Concurrency.md"))
+	if !strings.Contains(got, "   ```md\n### example heading\n## example section\n   ```\n- **Used:** 0") {
+		t.Errorf("fenced content was not moved with lesson:\n%s", got)
+	}
+	if got := read(t, p); strings.Contains(got, "example heading") || strings.Contains(got, "example section") {
+		t.Errorf("fenced content was left behind in Inbox:\n%s", got)
+	}
+}
+
 // A heading-like line inside a fenced code block belongs to the lesson.
 func TestSplitTailIgnoresFences(t *testing.T) {
 	block := "### T\n#cr/x · r · 2026-01-01 ^l1\n\n```sh\n# a shell comment\n## not a heading\n```\n- **Used:** 0\n\n## 2026-01-01, r (x)\n\n"
 	own, tail := splitTail(block)
 	if tail != "## 2026-01-01, r (x)\n\n" || own+tail != block {
 		t.Errorf("own %q tail %q", own, tail)
+	}
+}
+
+func TestSpliceBlockRecognizesCRLFBlankLine(t *testing.T) {
+	before := "## 2026-01-01, repo (#1)\r\n\r\n"
+	if got, want := spliceBlock(before, len(before), "### Lesson\n"), before+"### Lesson\n"; got != want {
+		t.Errorf("splice added an unnecessary newline: %q, want %q", got, want)
+	}
+}
+
+// The first lesson of a new folder: an Inbox with a counter and nothing else.
+func TestAddToEmptyFolder(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Lessons")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, InboxFile)
+	if err := os.WriteFile(p, []byte("# Inbox\n\nNext free id: l1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	req := baseAdd()
+	if _, err := Add(dir, filepath.Join(root, PrinciplesFile), req); err == nil || !strings.Contains(err.Error(), "--new-topic") {
+		t.Fatalf("unknown topic in an empty folder: %v", err)
+	}
+	req.NewTopic = true
+	res, err := Add(dir, filepath.Join(root, PrinciplesFile), req)
+	if err != nil || res.ID != "l1" {
+		t.Fatalf("%v %+v", err, res)
+	}
+	if got := read(t, p); !strings.HasPrefix(got, "# Inbox\n\nNext free id: l2\n\n## 2026-07-02, alpha (#3)\n\n### Write the counter") {
+		t.Errorf("inbox:\n%s", got)
 	}
 }
