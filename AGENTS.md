@@ -17,7 +17,9 @@ background and keep working; your harness tells you when it exits. Never wait in
    `agentflow worktree new --scratch` and remove it with `agentflow worktree done
    <path>`. Keep the diff to what was asked.
 3. **Run targeted checks while editing:** the tests and linters for what you touched,
-   not the whole suite.
+   not the whole suite. If other agents build on the same machine, wrap heavy
+   builds and test runs in `agentflow lock run --name <name> -- <command>`, never a
+   `mkdir`/`sleep` loop: it waits without polling, names the holder, and cannot leak.
 4. **Review with a different agent from the one that wrote the code:** if Claude wrote
    it, `agentflow codex --base main --prompt-file brief.md --write --protocol fix`
    (fix mode); if Codex or another agent wrote it, `agentflow claude` with the same
@@ -26,14 +28,17 @@ background and keep working; your harness tells you when it exits. Never wait in
    Name the targeted tests with `--test-cmd`. The JSON's `findings` lists each fix
    (null with a warning if the answer did not follow the format: then read `final.md`).
    Then audit every fix it made: accept it, revert it, or amend it, each one for a
-   stated reason. For a read-only review, drop `--write` and use `--protocol review`. For a big diff, run one pass per area with
+   stated reason. Prove a fix's new test fails without it: `agentflow redcheck --test
+   '<cmd>' --uncommitted` (or `--commit <sha>`). For a read-only review, drop `--write` and use `--protocol review`. For a big diff, run one pass per area with
    `--path`. If you keep a lessons folder (`AGENTFLOW_LESSONS_DIR`), add
    `--lessons <the diff's topics>` so the reviewer also checks past defects. Exit 0 means `final.md` holds a real answer; anything else means there was
    no review (see the exit table in the README). **If you are the reviewer,** this step
    is done by you: review, fix what the brief asks, report, and stop. Don't start
    another review or follow the rest of this list.
 5. **Run the repo's full gate once**, after the review fixes and any merge from the
-   default branch. If it fails, fix it and rerun the failing part.
+   default branch. If it fails, fix it and rerun the failing part. To merge the default
+   branch in, run `agentflow branch sync --merge`: it reports what came in and which
+   files both sides touched, and lists any conflicts it leaves for you to resolve.
 6. **Push and open a PR** with `agentflow pr open --title ... --body-file pr.md`: it
    derives the base from the default branch (never type `main`), never force-pushes,
    returns the existing PR on a rerun, and requests the CodeRabbit review on a

@@ -2,9 +2,11 @@
 // assigned in this package and nowhere else, one table per command
 // (exitCodes for codex, coderabbitExitCodes for coderabbit, shipExitCodes
 // for ship verify, prExitCodes for pr wait, replyExitCodes for pr reply,
-// prMergeExitCodes for pr merge, prOpenExitCodes for pr open, lessonsExitCodes for lessons). 0 is success, 1 a
-// usage or precondition error, 124 a timeout and 130 an interruption for
-// every command.
+// prMergeExitCodes for pr merge, prOpenExitCodes for pr open, lessonsExitCodes
+// for lessons, branchExitCodes for branch sync, redcheckExitCodes for redcheck,
+// lockExitCodes for lock). 0 is success, 1 a usage or precondition error, 124 a
+// timeout and 130 an interruption for every command, except that lock run passes
+// its command's exit code through and reports a lock wait timeout as 75.
 package cli
 
 import (
@@ -53,9 +55,18 @@ Usage:
   agentflow worktree done <branch|path>        remove a merged, clean, unused worktree
   agentflow worktree sweep [--yes]             list (or remove) every such worktree
                                                (see: agentflow worktree --help)
+  agentflow branch sync [--base REF] [--merge] report ahead/behind/overlap vs the default
+                                               branch; merge it in (see: agentflow branch --help)
   agentflow lessons <subcommand>               code-review lessons: brief, bump, add, seen,
                                                search, triage, retire, stats
                                                (see: agentflow lessons --help)
+  agentflow redcheck --test CMD --commit SHA|--base REF|--uncommitted
+                                               prove a fix's new test fails without the fix
+                                               (see: agentflow redcheck --help)
+  agentflow lock run --name N [--wait DUR] -- CMD [ARGS...]
+                                               run CMD under an exclusive named lock
+  agentflow lock status [--name N]             list named locks and holders (JSON)
+                                               (see: agentflow lock --help)
   agentflow version                           print agentflow's own version
 
 Output: every command that prints a JSON result also takes --format json|text.
@@ -159,6 +170,16 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return runPR(ctx, args[1:], stdout, stderr)
 	case "lessons":
 		return runLessons(args[1:], stdout, stderr)
+	case "branch":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runBranch(ctx, args[1:], stdout, stderr)
+	case "redcheck":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runRedcheck(ctx, args[1:], stdout, stderr)
+	case "lock":
+		return runLock(args[1:], stdout, stderr)
 	case "version", "--version":
 		fmt.Fprintln(stdout, "agentflow "+Version)
 		return 0
