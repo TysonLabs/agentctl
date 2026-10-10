@@ -1,6 +1,9 @@
 package redcheck
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestMatch(t *testing.T) {
 	cases := []struct {
@@ -58,8 +61,13 @@ func TestJudgeSource(t *testing.T) {
 		{"rust test attribute above module", "a.rs", 'M', code, "#[test]\nfn g() {}\n" + code + mod, true, false, true},
 		{"rust moved test is not a new test", "a.rs", 'M', "#[test]\nfn g() {}\n" + code, code + "#[test]\nfn g() {}\n", true, false, false},
 		{"python test in source", "m.py", 'M', "def f(): pass\n", "def f(): pass\ndef test_f(): pass\n", true, false, true},
+		{"python test body changed", "m.py", 'M', "def f(): return 0\ndef test_f():\n    assert f() == 0\n", "def f(): return 1\ndef test_f():\n    assert f() == 1\n", true, false, true},
 		{"python plain change", "m.py", 'M', "def f(): pass\n", "def f(): return 1\n", true, false, false},
 		{"js in-source test", "m.js", 'M', "export const f = 1\n", "export const f = 1\ntest('f', () => {})\n", true, false, true},
+		{"js test body changed", "m.js", 'M', "export const f = 0\ntest('f', () => {\n  expect(f).toBe(0)\n})\n", "export const f = 1\ntest('f', () => {\n  expect(f).toBe(1)\n})\n", true, false, true},
+		{"rust standalone test body changed", "a.rs", 'M', "fn f() -> i32 { 0 }\n#[test]\nfn t() { assert_eq!(f(), 0); }\n", "fn f() -> i32 { 1 }\n#[test]\nfn t() { assert_eq!(f(), 1); }\n", true, false, true},
+		{"rust non-trailing module is not spliced", "a.rs", 'M', code + mod + "fn helper() -> i32 { 0 }\n", "fn f() { 1; }\n" + strings.ReplaceAll(mod, "fn t() {}", "fn t() { assert!(true); }") + "fn helper() -> i32 { 1 }\n", true, false, true},
+		{"rust module moved to end is not duplicated", "a.rs", 'M', code + mod + "fn helper() -> i32 { 0 }\n", "fn f() { 1; }\nfn helper() -> i32 { 1 }\n" + strings.ReplaceAll(mod, "fn t() {}", "fn t() { assert!(true); }"), true, false, true},
 		{"deleted rust file", "a.rs", 'D', code + mod, "", true, false, false},
 	}
 	for _, c := range cases {

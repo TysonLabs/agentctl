@@ -241,6 +241,32 @@ func TestPhasesSeeTheRightFiles(t *testing.T) {
 	}
 }
 
+func TestPhasesRemoveDirectoriesThatDoNotExistInTheSelectedState(t *testing.T) {
+	dir := newRepo(t)
+	commit(t, dir, map[string]*string{
+		"src/value.txt":       s("broken\n"),
+		"src/removed/old.txt": s("old\n"),
+	}, "base")
+	fix := commit(t, dir, map[string]*string{
+		"src/value.txt":       s("fixed\n"),
+		"src/added/new.txt":   s("new\n"),
+		"src/removed/old.txt": nil,
+		"tests/check.sh": s(`if [ "$AGENTFLOW_REDCHECK_PHASE" = red ]; then
+  test ! -d src/added || exit 8
+  test -d src/removed || exit 9
+else
+  test -d src/added || exit 10
+  test ! -d src/removed || exit 11
+fi
+grep -q fixed src/value.txt
+`),
+	}, "fix")
+	res := runCheck(t, Options{Dir: dir, Test: "sh tests/check.sh", Scope: Scope{Commit: fix}})
+	if res.Status != StatusRed || res.Red == nil || res.Red.Exit != 1 || res.Green == nil || res.Green.Exit != 0 {
+		t.Fatalf("got %+v", res)
+	}
+}
+
 func TestUncommittedWithUntrackedTest(t *testing.T) {
 	dir := newRepo(t)
 	commit(t, dir, map[string]*string{"src/value.txt": s("broken\n"), ".gitignore": s("ignored/\n")}, "base")
@@ -264,6 +290,29 @@ func TestUncommittedWithUntrackedTest(t *testing.T) {
 	}
 	if res.Before != git(t, dir, "rev-parse", "HEAD") || res.After == res.Before {
 		t.Errorf("before=%s after=%s", res.Before, res.After)
+	}
+}
+
+func TestUncommittedIncludesForceAddedIgnoredFile(t *testing.T) {
+	dir := newRepo(t)
+	commit(t, dir, map[string]*string{
+		".gitignore":     s("*.fixture\n"),
+		"src/value.txt":  s("broken\n"),
+		"tests/check.sh": s("test -f data.fixture || exit 5\ngrep -q fixed src/value.txt\n"),
+	}, "base")
+	write(t, dir, map[string]*string{
+		"src/value.txt": s("fixed\n"),
+		"data.fixture":  s("staged despite ignore\n"),
+	})
+	git(t, dir, "add", "-f", "data.fixture")
+	res := runCheck(t, Options{
+		Dir: dir, Test: "sh tests/check.sh", Scope: Scope{Uncommitted: true}, Keep: []string{"data.fixture"},
+	})
+	if res.Status != StatusRed || res.Red == nil || res.Red.Exit != 1 || res.Green == nil || res.Green.Exit != 0 {
+		t.Fatalf("got %+v", res)
+	}
+	if strings.Join(res.Kept, ",") != "data.fixture" {
+		t.Errorf("kept=%v", res.Kept)
 	}
 }
 
@@ -362,6 +411,30 @@ mod tests {
 	}
 }
 
+func TestRustSpliceUsesBeforeFileMode(t *testing.T) {
+	dir := newRepo(t)
+	write(t, dir, map[string]*string{"src/lib.rs": s(rustBefore)})
+	if err := os.Chmod(filepath.Join(dir, "src/lib.rs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "-q", "-m", "base")
+	after := rustBefore[:strings.Index(rustBefore, "a - b")] + "a + b\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {}\n}\n"
+	write(t, dir, map[string]*string{"src/lib.rs": s(after)})
+	if err := os.Chmod(filepath.Join(dir, "src/lib.rs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "-q", "-m", "fix")
+	fix := git(t, dir, "rev-parse", "HEAD")
+	test := `if [ "$AGENTFLOW_REDCHECK_PHASE" = red ] && [ ! -x src/lib.rs ]; then exit 0; fi
+grep -q 'a + b' src/lib.rs`
+	res := runCheck(t, Options{Dir: dir, Test: test, Scope: Scope{Commit: fix}})
+	if res.Status != StatusRed || res.Green == nil || res.Green.Exit != 0 {
+		t.Fatalf("got %+v", res)
+	}
+}
+
 func TestOnlyTestsChangedIsInconclusive(t *testing.T) {
 	dir := newRepo(t)
 	commit(t, dir, map[string]*string{"src/value.txt": s("fixed\n")}, "base")
@@ -380,6 +453,33 @@ func TestCommandNotFoundIsError(t *testing.T) {
 	}
 }
 
+func TestCommandNotFoundDuringGreenIsError(t *testing.T) {
+	dir, fix := shellFixture(t)
+	test := `if [ "$AGENTFLOW_REDCHECK_PHASE" = red ]; then exit 1; fi
+no-such-command-redcheck`
+	res := runCheck(t, Options{Dir: dir, Test: test, Scope: Scope{Commit: fix}})
+	if res.Status != StatusError || !strings.Contains(res.Error, "127") {
+		t.Fatalf("got %+v", res)
+	}
+}
+
+func TestBaseScopeDoesNotRefreshUserIndex(t *testing.T) {
+	dir := newRepo(t)
+	commit(t, dir, map[string]*string{"src/value.txt": s("broken\n"), "stable.txt": s("stable\n")}, "base")
+	commit(t, dir, map[string]*string{
+		"src/value.txt":  s("fixed\n"),
+		"tests/check.sh": s("grep -q fixed src/value.txt\n"),
+	}, "fix")
+	old := time.Unix(1, 0)
+	if err := os.Chtimes(filepath.Join(dir, "stable.txt"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	res := runCheck(t, Options{Dir: dir, Test: "sh tests/check.sh", Scope: Scope{Base: "HEAD~1"}})
+	if res.Status != StatusRed {
+		t.Fatalf("got %+v", res)
+	}
+}
+
 func TestTimeoutCleansUp(t *testing.T) {
 	dir, fix := shellFixture(t)
 	start := time.Now()
@@ -389,6 +489,27 @@ func TestTimeoutCleansUp(t *testing.T) {
 	}
 	if time.Since(start) > 20*time.Second {
 		t.Errorf("took %s", time.Since(start))
+	}
+}
+
+func TestCleanupFailureIsAnError(t *testing.T) {
+	dir, fix := shellFixture(t)
+	fakeGit := filepath.Join(t.TempDir(), "git")
+	write(t, filepath.Dir(fakeGit), map[string]*string{
+		filepath.Base(fakeGit): s("#!/bin/sh\ncase \" $* \" in *\" worktree prune \"*) exit 99;; esac\nexec git \"$@\"\n"),
+	})
+	if err := os.Chmod(fakeGit, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res := Run(context.Background(), Options{
+		Dir: dir, Test: "sh tests/check.sh", Scope: Scope{Commit: fix},
+		OutDir: t.TempDir(), Timeout: time.Minute, Grace: 200 * time.Millisecond, Git: fakeGit,
+	})
+	if res.Status != StatusError || res.CleanupError == "" || !strings.Contains(res.Error, "cleanup") {
+		t.Fatalf("got %+v", res)
+	}
+	if n := worktreeCount(t, dir); n != 1 {
+		t.Fatalf("%d worktrees registered after cleanup, want 1", n)
 	}
 }
 

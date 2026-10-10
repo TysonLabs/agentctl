@@ -90,6 +90,15 @@ func TestRedcheckEndToEnd(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &res); err != nil {
 		t.Fatal(err)
 	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(stdout), &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"test_in_source", "notes", "next"} {
+		if _, ok := raw[field]; !ok {
+			t.Errorf("documented JSON field %q is absent", field)
+		}
+	}
 	if res.Status != redcheck.StatusRed || res.Green == nil || filepath.Dir(res.Red.Log) != out {
 		t.Errorf("got %+v", res)
 	}

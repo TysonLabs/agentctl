@@ -92,12 +92,12 @@ type Result struct {
 	Spliced      []string     `json:"spliced"`
 	KeptTests    []string     `json:"kept_tests"`
 	Kept         []string     `json:"kept"`
-	TestInSource []SourceTest `json:"test_in_source,omitempty"`
+	TestInSource []SourceTest `json:"test_in_source"`
 	Worktree     string       `json:"worktree,omitempty"` // the temporary worktree (removed on exit)
 	CleanupError string       `json:"cleanup_error,omitempty"`
-	Notes        []string     `json:"notes,omitempty"`
+	Notes        []string     `json:"notes"`
 	Error        string       `json:"error,omitempty"`
-	Next         string       `json:"next,omitempty"`
+	Next         string       `json:"next"`
 }
 
 type change struct {
@@ -120,7 +120,10 @@ func Run(ctx context.Context, o Options) Result {
 	if o.Grace <= 0 {
 		o.Grace = 5 * time.Second
 	}
-	res := Result{Test: o.Test, Reverted: []string{}, Spliced: []string{}, KeptTests: []string{}, Kept: []string{}}
+	res := Result{
+		Test: o.Test, Reverted: []string{}, Spliced: []string{}, KeptTests: []string{}, Kept: []string{},
+		TestInSource: []SourceTest{}, Notes: []string{},
+	}
 	r := &runner{o: o, res: &res}
 	if err := r.run(ctx); err != nil {
 		res.Status = StatusError
@@ -128,6 +131,13 @@ func Run(ctx context.Context, o Options) Result {
 			res.Status = StatusInterrupted
 		}
 		res.Error = err.Error()
+	}
+	if res.CleanupError != "" {
+		res.Status = StatusError
+		if res.Error != "" {
+			res.Error += "; "
+		}
+		res.Error += "cleanup: " + res.CleanupError
 	}
 	return res
 }
@@ -229,6 +239,8 @@ func (r *runner) run(ctx context.Context) error {
 	case kill != "":
 		r.res.Status = kill
 		r.res.Next = "the green run (with the fix) did not finish; see " + green.Log
+	case green.Exit == 126 || green.Exit == 127:
+		return fmt.Errorf("the test command could not run during green (exit %d, see %s)", green.Exit, green.Log)
 	case green.Exit != 0:
 		r.res.Status = StatusGreenFailed
 		r.res.Next = "the test fails with the fix too, so the red run proves nothing; see " + green.Log
@@ -291,8 +303,19 @@ func (r *runner) resolveScope(ctx context.Context, tmp string) error {
 // the user's index nor their working tree is touched.
 func (r *runner) snapshot(ctx context.Context, tmp string) (string, error) {
 	env := []string{"GIT_INDEX_FILE=" + filepath.Join(tmp, "snapshot.index")}
-	if _, err := r.git(ctx, r.top, env, "read-tree", "HEAD"); err != nil {
+	// Seed the temporary index from the staged tree, not HEAD. This preserves
+	// force-added ignored files; add -A then overlays the working-tree state.
+	// Exporting stage entries avoids write-tree's cache-tree refresh of the
+	// user's real index.
+	stagedEntries, err := r.git(ctx, r.top, nil, "ls-files", "--stage", "-z")
+	if err != nil {
+		return "", fmt.Errorf("reading the staged state: %v", err)
+	}
+	if _, err := r.git(ctx, r.top, env, "read-tree", "--empty"); err != nil {
 		return "", err
+	}
+	if _, err := r.gitInput(ctx, r.top, env, stagedEntries, "update-index", "-z", "--index-info"); err != nil {
+		return "", fmt.Errorf("copying the staged state: %v", err)
 	}
 	if _, err := r.git(ctx, r.top, env, "add", "-A", "--", "."); err != nil {
 		return "", fmt.Errorf("snapshotting the working tree: %v", err)
@@ -399,31 +422,63 @@ func (r *runner) apply(ctx context.Context, wt string, revert []change, splices 
 	if red {
 		commit = r.res.Before
 	}
-	var checkout []string
+	var checkout, splicePaths []string
 	for _, c := range revert {
 		gone := (red && c.status == 'A') || (!red && c.status == 'D')
 		switch {
 		case gone:
-			if err := os.Remove(filepath.Join(wt, filepath.FromSlash(c.path))); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := removePathAndEmptyParents(wt, c.path); err != nil {
 				return err
 			}
 		case red && splices[c.path] != "":
-			if err := os.WriteFile(filepath.Join(wt, filepath.FromSlash(c.path)), []byte(splices[c.path]), 0o644); err != nil {
-				return err
-			}
+			checkout = append(checkout, c.path)
+			splicePaths = append(splicePaths, c.path)
 		default:
 			checkout = append(checkout, c.path)
 		}
 	}
-	if len(checkout) == 0 {
-		return nil
+	if len(checkout) > 0 {
+		list := filepath.Join(filepath.Dir(wt), "pathspec")
+		if err := os.WriteFile(list, []byte(strings.Join(checkout, "\x00")+"\x00"), 0o600); err != nil {
+			return err
+		}
+		if _, err := r.git(ctx, wt, nil, "checkout", commit, "--pathspec-from-file="+list, "--pathspec-file-nul"); err != nil {
+			return fmt.Errorf("setting the %s state: %v", map[bool]string{true: "red", false: "green"}[red], err)
+		}
 	}
-	list := filepath.Join(filepath.Dir(wt), "pathspec")
-	if err := os.WriteFile(list, []byte(strings.Join(checkout, "\x00")+"\x00"), 0o600); err != nil {
+	for _, p := range splicePaths {
+		full := filepath.Join(wt, filepath.FromSlash(p))
+		fi, err := os.Lstat(full)
+		if err != nil {
+			return err
+		}
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("cannot splice non-regular Rust source %s", p)
+		}
+		if err := os.WriteFile(full, []byte(splices[p]), fi.Mode().Perm()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removePathAndEmptyParents(wt, p string) error {
+	full := filepath.Join(wt, filepath.FromSlash(p))
+	if err := os.Remove(full); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if _, err := r.git(ctx, wt, nil, "checkout", commit, "--pathspec-from-file="+list, "--pathspec-file-nul"); err != nil {
-		return fmt.Errorf("setting the %s state: %v", map[bool]string{true: "red", false: "green"}[red], err)
+	for dir := filepath.Dir(full); dir != wt && dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+		if err := os.Remove(dir); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
+				// A non-empty parent belongs to the selected state (or contains a
+				// kept test/fixture), so cleanup stops there.
+				return nil
+			}
+			return err
+		}
 	}
 	return nil
 }
@@ -581,10 +636,18 @@ func (r *runner) cleanup(tmp, wt string, added bool) {
 // git runs git with hooks disabled, literal pathspecs and the environment
 // cleaned of variables that would redirect it to another repository.
 func (r *runner) git(ctx context.Context, dir string, env []string, args ...string) (string, error) {
+	return r.gitInput(ctx, dir, env, "", args...)
+}
+
+func (r *runner) gitInput(ctx context.Context, dir string, env []string, input string, args ...string) (string, error) {
 	full := append([]string{"-c", "core.hooksPath=/dev/null", "--literal-pathspecs"}, args...)
 	cmd := exec.CommandContext(ctx, r.o.Git, full...)
 	cmd.Dir = dir
-	cmd.Env = append(cleanEnv(), env...)
+	cmd.Env = append(cleanEnv(), "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = append(cmd.Env, env...)
+	if input != "" {
+		cmd.Stdin = strings.NewReader(input)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
@@ -600,6 +663,7 @@ func cleanEnv() []string {
 	drop := map[string]bool{
 		"GIT_DIR": true, "GIT_WORK_TREE": true, "GIT_INDEX_FILE": true, "GIT_COMMON_DIR": true,
 		"GIT_OBJECT_DIRECTORY": true, "GIT_ALTERNATE_OBJECT_DIRECTORIES": true, "GIT_PREFIX": true,
+		"GIT_OPTIONAL_LOCKS": true,
 	}
 	var env []string
 	for _, kv := range os.Environ() {
