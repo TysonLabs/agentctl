@@ -4,9 +4,10 @@
 // for ship verify, prExitCodes for pr wait, replyExitCodes for pr reply,
 // prMergeExitCodes for pr merge, prOpenExitCodes for pr open, lessonsExitCodes
 // for lessons, branchExitCodes for branch sync, redcheckExitCodes for redcheck,
-// lockExitCodes for lock). 0 is success, 1 a usage or precondition error, 124 a
-// timeout and 130 an interruption for every command, except that lock run passes
-// its command's exit code through and reports a lock wait timeout as 75.
+// lockExitCodes for lock, gateExitCodes for gate). 0 is success, 1 a usage or
+// precondition error, 124 a timeout and 130 an interruption for every command,
+// except that lock run passes its command's exit code through and reports a
+// lock wait timeout as 75.
 package cli
 
 import (
@@ -57,6 +58,11 @@ Usage:
                                                (see: agentflow worktree --help)
   agentflow branch sync [--base REF] [--merge] report ahead/behind/overlap vs the default
                                                branch; merge it in (see: agentflow branch --help)
+  agentflow gate [--project P] [--only a,b] [--force]
+                                               run the project's gate steps from
+                                               services.toml; receipts per tree
+  agentflow gate --check [--rev REV]           exit 0 only if that tree passed every step
+                                               (see: agentflow gate --help)
   agentflow lessons <subcommand>               code-review lessons: brief, bump, add, seen,
                                                search, triage, retire, stats
                                                (see: agentflow lessons --help)
@@ -168,6 +174,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		return runPR(ctx, args[1:], stdout, stderr)
+	case "gate":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runGate(ctx, args[1:], stdout, stderr)
 	case "lessons":
 		return runLessons(args[1:], stdout, stderr)
 	case "branch":

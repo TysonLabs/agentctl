@@ -38,7 +38,11 @@ background and keep working; your harness tells you when it exits. Never wait in
 5. **Run the repo's full gate once**, after the review fixes and any merge from the
    default branch. If it fails, fix it and rerun the failing part. To merge the default
    branch in, run `agentflow branch sync --merge`: it reports what came in and which
-   files both sides touched, and lists any conflicts it leaves for you to resolve.
+   files both sides touched, and lists any conflicts it leaves for you to resolve. Where
+   the repo has a `[name.gate]` table, run `agentflow gate` in the background: it runs
+   every step, logs each one, and keeps a receipt per step for the exact tree, so a rerun
+   skips what already passed on that tree. Exit 0 means every step passed; 2 or 124 name
+   the step and its log.
 6. **Push and open a PR** with `agentflow pr open --title ... --body-file pr.md`: it
    derives the base from the default branch (never type `main`), never force-pushes,
    returns the existing PR on a rerun, and requests the CodeRabbit review on a

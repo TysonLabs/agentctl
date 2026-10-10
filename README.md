@@ -152,6 +152,8 @@ letting anyone enumerate users or sessions.
 - A `[service.meta]` table is informational (repo, unit, owner, …) — shown by `ls`, never fetched.
 - A `[service.announce]` table belongs to `agentflow ship announce` (a Slack webhook). agentctl
   skips it without decoding it, so agentctl never holds a write credential.
+- A `[service.gate]` table (with `[[service.gate.steps]]`) belongs to `agentflow gate`. agentctl
+  ignores it. A project may have only `[name.meta]` and `[name.gate]`, and no env.
 - Placeholder tokens (`REPLACE_ME`, `CHANGEME`, `TODO`, `…`, `<...>`, all-`x`, anything under
   8 chars) mark a service **not wired**: `ls` shows it with the reason, `get`/`endpoints` refuse
   it, `status` skips it.
@@ -541,6 +543,85 @@ agentflow adds the header line (service, env, short SHA, PR link, verify time) a
 | 3 | `already_announced` | this commit was posted before (`posted_at` says when) |
 | 4 | `slack_error` | Slack or the network rejected the post; nothing is recorded, so a rerun retries |
 | 130 | — | interrupted |
+
+### `agentflow gate`: run a repo's full gate once, and prove it later
+
+```sh
+agentflow gate                       # in a checkout (or any worktree) of a configured repo
+agentflow gate --only fmt,lint       # just these steps
+agentflow gate --check --rev HEAD    # exit 0 only if HEAD's tree passed every step
+```
+
+The steps live in `services.toml`, per project, next to its `meta.repo`. Set them with
+agentcfg (or on its settings page):
+
+```sh
+agentcfg meta myproj repo=~/src/myproj
+agentcfg gate myproj --add fmt --run "cargo fmt --all --check"
+agentcfg gate myproj --add suite --run scripts/gate.sh --timeout 60m --stop-on-fail
+agentcfg gate myproj --lock myproj-build
+```
+
+```toml
+[myproj.meta]
+repo = "~/src/myproj"
+
+[myproj.gate]
+lock = "myproj-build"            # optional: named lock held for the whole run
+
+[[myproj.gate.steps]]
+name = "fmt"
+run = "cargo fmt --all --check"  # /bin/sh -c from the work tree root
+
+[[myproj.gate.steps]]
+name = "suite"
+run = "scripts/gate.sh"
+timeout = "60m"                  # default 30m, max 24h
+stop_on_fail = true              # skip the later steps if this one fails
+```
+
+- **Which project.** `--project`, else the project whose `meta.repo` is this checkout or
+  another worktree of the same repository (same git common dir; `~` and symlinks are
+  resolved). No match, two matches, or no `[name.gate]` table exits 1 and says which
+  `agentcfg` command fixes it. `--project` still needs the project's `meta.repo`, and in a
+  checkout of a different repo it refuses; outside any checkout it runs in `meta.repo`.
+- **Every step runs**, in the order written, so one run reports every failure. A failed or
+  timed-out step with `stop_on_fail` skips the rest (`skipped`). stdin is `/dev/null`;
+  stdout and stderr go to `<out>/<step>.log`. On a timeout or Ctrl-C the step's whole
+  process group is killed.
+- **Receipts.** After each step, a receipt goes to
+  `<git-common-dir>/agentflow/gate/receipts.json`, keyed by project, step, a hash of the
+  `run` string, and the work tree's exact content: the tree `git add -A && git write-tree`
+  would make, built in a throwaway copy of the index (the real index, HEAD and refs are
+  untouched). Uncommitted edits and untracked files count; ignored files do not. A clean
+  checkout hashes to `HEAD^{tree}`, so a tree gated before its commit still matches after
+  it. A rerun on the same tree skips steps that passed with the same `run` (`cached`);
+  `--force` reruns them. Steps that read anything outside the tree (env vars, ignored
+  files, the toolchain) are not tracked: use `--force` when those change.
+- **`--check`** runs nothing and writes nothing: no receipt, and the work tree is hashed into
+  a throwaway object store (the repo's own objects are read as an alternate). It exits 0 only if every configured step
+  has a passing receipt, with its current `run`, for the work tree, `--tree HASH` or
+  `--rev REV`'s tree; `missing` lists the others (`stale` means the `run` changed).
+- **The lock** is `flock` on `$TMPDIR/agentflow-lock-<name>.lock`, the same convention as
+  `agentflow lock run`, so a gate and any other command holding that name never overlap.
+  The holder writes `$TMPDIR/agentflow-lock-<name>.json` (`pid`, `cmd`, `dir`, `since`); a
+  waiter prints it and reports `waited_secs` and `waited_for` in its JSON. The tree is read
+  after the lock is taken, so a second run on the same tree reuses the first run's receipts.
+- If a step changes the work tree (a formatter that writes, say), the JSON says
+  `tree_changed`, and that step and every later one get no receipt: they did not run on
+  the tree the run started from, so nothing can claim that tree passed them.
+
+The JSON: `{status, project, dir, head, tree, dirty, ok, steps: [{name, status, secs, exit,
+log}], log_dir, receipts, lock, warnings}`; a step's status is `passed`, `failed`, `timeout`,
+`skipped`, `cached` or `interrupted`.
+
+| Exit | Status | Meaning |
+|---|---|---|
+| 0 | `passed` | every selected step passed or was cached (`--check`: every step has a passing receipt) |
+| 1 | `error` | usage, config or precondition (not a git checkout, no project, no gate) |
+| 2 | `failed` / `missing` | a step failed (`--check`: a step lacks a passing receipt) |
+| 124 | `timeout` | a step timed out, and none failed |
+| 130 | `interrupted` | SIGINT/SIGTERM; the running step is killed and leaves no receipt |
 
 ### `agentflow pr open`: push the branch and open a PR against the derived base
 
@@ -939,6 +1020,9 @@ agentcfg test payments.prod                   # GET /agent/version with the stor
 agentcfg ls · agentcfg meta payments repo=~/src/payments unit=payments.service · agentcfg rm payments.prod
 pbpaste | agentcfg announce payments --channel "#payments-releases" --webhook   # Slack for ship announce
 agentcfg announce payments --envs prod,dev · agentcfg announce payments --remove
+agentcfg gate payments --add test --run "make test" --timeout 20m   # steps for agentflow gate
+agentcfg gate payments                                              # list them in order
+agentcfg gate payments --move test --to 1 · --edit test --stop-on-fail · --rm test · --lock NAME
 ```
 
 agentcfg is for a person, not for agents: it is a separate binary so agentctl keeps its
@@ -946,7 +1030,8 @@ read-only guarantee, and it belongs on no agent allowlist. Exit codes: 0 ok · 1
 2 usage · 3 test failed.
 
 - **Writes are safe.** Each edit runs under a file lock, re-decodes its output to prove nothing
-  was lost (tables it does not know, like `[x.announce]`, come through unchanged), passes the
+  was lost (tables it does not know, like `[x.announce]`, and arrays of tables, like a gate's
+  `[[x.gate.steps]]`, come through unchanged), passes the
   same validation agentctl runs, and replaces the file atomically at mode 0600 (a symlinked
   file keeps its link). Comments are not kept: the file is machine-managed once agentcfg writes it.
 - **Secrets never touch argv or the file.** A token or Slack webhook goes to `security -i` on
@@ -958,6 +1043,8 @@ read-only guarantee, and it belongs on no agent allowlist. Exit codes: 0 ok · 1
   API call. The server checks the Host header exactly (DNS rebinding), refuses cross-origin
   and non-JSON writes, sends a strict CSP, shows token fingerprints only, rejects an edit made
   against a stale copy of the file (409), and stops after 15 minutes idle (`--idle`) or on Done.
+  Each project card also lists its gate steps in order, with add, edit, delete, move up/down
+  and the lock name; "Add gate project" starts a project that has only a repo and a gate.
 - **What the Keychain protects:** tokens are out of the file, its backups and `cat`. Items are
   readable by `/usr/bin/security` without a prompt, so a process running as you can still read
   them on purpose; deny `security find-generic-password` in agent permissions if that matters.

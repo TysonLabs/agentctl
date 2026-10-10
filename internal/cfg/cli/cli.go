@@ -11,12 +11,14 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/TysonLabs/agentctl/internal/cfg"
 	"github.com/TysonLabs/agentctl/internal/cfg/ui"
+	"github.com/TysonLabs/agentctl/internal/gatespec"
 	"github.com/TysonLabs/agentctl/internal/registry"
 )
 
@@ -35,6 +37,11 @@ Usage:
   agentcfg announce <name> [--channel C] [--envs prod,dev] [--webhook] [--remove]
                                              agentflow's Slack settings; --webhook reads
                                              the webhook URL from stdin into the Keychain
+  agentcfg gate <name>                       list the project's agentflow gate steps
+  agentcfg gate <name> --add STEP --run CMD [--timeout D] [--stop-on-fail] [--at N]
+  agentcfg gate <name> --edit STEP [--run CMD] [--timeout D] [--stop-on-fail|--no-stop-on-fail]
+  agentcfg gate <name> --move STEP --to N | --rm STEP | --lock NAME (--lock= clears) | --remove
+                                             edit [name.gate]; positions count from 1
   agentcfg migrate                           move every plaintext token and webhook into
                                              the Keychain
   agentcfg rm <name.env>                     remove an env and its Keychain item
@@ -69,8 +76,9 @@ type app struct {
 }
 
 // valueFlags take an argument; boolFlags do not.
-var valueFlags = map[string]bool{"config": true, "base-url": true, "idle": true, "channel": true, "envs": true}
-var boolFlags = map[string]bool{"help": true, "no-open": true, "webhook": true, "remove": true}
+var valueFlags = map[string]bool{"config": true, "base-url": true, "idle": true, "channel": true, "envs": true,
+	"add": true, "edit": true, "run": true, "timeout": true, "at": true, "move": true, "to": true, "rm": true, "lock": true}
+var boolFlags = map[string]bool{"help": true, "no-open": true, "webhook": true, "remove": true, "stop-on-fail": true, "no-stop-on-fail": true}
 
 func parseArgs(args []string) (map[string]string, []string, error) {
 	flags := map[string]string{}
@@ -150,6 +158,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			cmdErr = a.cmdTest(rest)
 		case "announce":
 			cmdErr = a.cmdAnnounce(rest)
+		case "gate":
+			cmdErr = a.cmdGate(rest)
 		case "ui":
 			cmdErr = a.cmdUI(rest)
 		case "version":
@@ -186,6 +196,10 @@ func commandFlags(cmd string, flags map[string]string) error {
 		allowed["idle"], allowed["no-open"] = true, true
 	case "announce":
 		allowed["channel"], allowed["envs"], allowed["webhook"], allowed["remove"] = true, true, true, true
+	case "gate":
+		for _, f := range []string{"add", "edit", "run", "timeout", "at", "move", "to", "rm", "lock", "stop-on-fail", "no-stop-on-fail", "remove"} {
+			allowed[f] = true
+		}
 	case "ls", "meta", "token", "migrate", "rm", "test", "version":
 	default:
 		return nil // the unknown-command diagnostic is more useful
@@ -223,7 +237,7 @@ func (a *app) cmdLs(args []string) error {
 	if st.Error != "" {
 		return errors.New(st.Error)
 	}
-	if len(st.Services) == 0 && len(st.Announces) == 0 {
+	if len(st.Services) == 0 && len(st.Announces) == 0 && len(st.Gates) == 0 {
 		fmt.Fprintf(a.stdout, "no services in %s — add one: agentcfg set <name.env> --base-url URL\n", st.Path)
 		return nil
 	}
@@ -260,6 +274,27 @@ func (a *app) cmdLs(args []string) error {
 				status = "not ready: " + an.Webhook.Reason
 			}
 			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", an.Name, an.Channel, strings.Join(an.Envs, ","), hook, status)
+		}
+		tw.Flush()
+	}
+	if len(st.Gates) > 0 {
+		if len(st.Services) > 0 || len(st.Announces) > 0 {
+			fmt.Fprintln(a.stdout)
+		}
+		tw = tabwriter.NewWriter(a.stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "GATE\tSTEPS\tLOCK\tSTATUS")
+		for _, g := range st.Gates {
+			names := make([]string, len(g.Steps))
+			for i, s := range g.Steps {
+				names[i] = s.Name
+			}
+			status := "ready"
+			if g.Error != "" {
+				status = "invalid: " + g.Error
+			} else if len(g.Steps) == 0 {
+				status = "no steps"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", g.Name, strings.Join(names, ","), dash(g.Lock), status)
 		}
 		tw.Flush()
 	}
@@ -525,4 +560,200 @@ func (a *app) cmdUI(args []string) error {
 		Open:    a.flags["no-open"] == "",
 		Stdout:  a.stdout,
 	})
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// cmdGate lists or edits [name.gate]. Exactly one action per call.
+func (a *app) cmdGate(args []string) error {
+	const shape = "<name> [--add STEP --run CMD [--timeout D] [--stop-on-fail] [--at N] | --edit STEP ... | --move STEP --to N | --rm STEP | --lock NAME | --remove]"
+	if err := a.only("gate", args, 1, shape); err != nil {
+		return err
+	}
+	name := args[0]
+	if _, _, err := cfg.SplitFull(name + ".x"); err != nil {
+		return usageError(err.Error())
+	}
+	var actions []string
+	for _, f := range []string{"add", "edit", "move", "rm", "lock", "remove"} {
+		if _, ok := a.flags[f]; ok {
+			actions = append(actions, "--"+f)
+		}
+	}
+	if len(actions) > 1 {
+		return usageError("give one of " + strings.Join(actions, ", ") + " per call")
+	}
+	action := ""
+	if len(actions) == 1 {
+		action = actions[0][2:]
+	}
+	// Each action's own flags; anything else is a mistake worth reporting.
+	extra := map[string][]string{
+		"":       {},
+		"add":    {"run", "timeout", "stop-on-fail", "at"},
+		"edit":   {"run", "timeout", "stop-on-fail", "no-stop-on-fail"},
+		"move":   {"to"},
+		"rm":     {},
+		"lock":   {},
+		"remove": {},
+	}[action]
+	for _, f := range []string{"run", "timeout", "at", "to", "stop-on-fail", "no-stop-on-fail"} {
+		if _, given := a.flags[f]; given && !slicesContains(extra, f) {
+			if action == "" {
+				return usageError("--" + f + " needs an action such as --add")
+			}
+			return usageError("--" + f + " does not apply to --" + action)
+		}
+	}
+	var (
+		res *cfg.Result
+		err error
+		msg string
+	)
+	switch action {
+	case "":
+		return a.listGate(name)
+	case "add":
+		st := cfg.GateStep{Name: a.flags["add"], Run: a.flags["run"], Timeout: a.flags["timeout"], StopOnFail: a.flags["stop-on-fail"] != ""}
+		if _, ok := a.flags["run"]; !ok {
+			return usageError("--add needs --run CMD")
+		}
+		at := 0
+		if v, ok := a.flags["at"]; ok {
+			if at, err = position(v); err != nil {
+				return err
+			}
+		}
+		res, err = a.store.AddGateStep("", name, st, at)
+		msg = "added step " + st.Name + " to " + name + ".gate"
+	case "edit":
+		if a.flags["stop-on-fail"] != "" && a.flags["no-stop-on-fail"] != "" {
+			return usageError("--stop-on-fail and --no-stop-on-fail conflict")
+		}
+		st := a.store.State()
+		if st.Error != "" {
+			return errors.New(st.Error)
+		}
+		cur, ok := findStep(st.Gates, name, a.flags["edit"])
+		if !ok {
+			return fmt.Errorf("%s has no gate step %q", name, a.flags["edit"])
+		}
+		if v, ok := a.flags["run"]; ok {
+			cur.Run = v
+		}
+		if v, ok := a.flags["timeout"]; ok {
+			cur.Timeout = v
+		}
+		if a.flags["stop-on-fail"] != "" {
+			cur.StopOnFail = true
+		}
+		if a.flags["no-stop-on-fail"] != "" {
+			cur.StopOnFail = false
+		}
+		// Pinned to the version read above: a concurrent edit is a conflict,
+		// not a silent overwrite of fields this call did not name.
+		res, err = a.store.EditGateStep(st.Version, name, cur.Name, cur)
+		msg = "saved step " + cur.Name + " of " + name + ".gate"
+	case "move":
+		v, ok := a.flags["to"]
+		if !ok {
+			return usageError("--move needs --to N")
+		}
+		to, perr := position(v)
+		if perr != nil {
+			return perr
+		}
+		res, err = a.store.MoveGateStep("", name, a.flags["move"], to)
+		msg = fmt.Sprintf("moved step %s of %s.gate to position %d", a.flags["move"], name, to)
+	case "rm":
+		res, err = a.store.RemoveGateStep("", name, a.flags["rm"])
+		msg = "removed step " + a.flags["rm"] + " from " + name + ".gate"
+	case "lock":
+		res, err = a.store.SetGateLock("", name, a.flags["lock"])
+		msg = "set " + name + ".gate lock to " + dash(strings.TrimSpace(a.flags["lock"]))
+	case "remove":
+		res, err = a.store.RemoveGate("", name)
+		msg = "removed " + name + ".gate"
+	}
+	if err != nil {
+		return err
+	}
+	a.done(res, msg)
+	return nil
+}
+
+func slicesContains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func position(v string) (int, error) {
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 0, usageError(fmt.Sprintf("position %q must be a whole number from 1", v))
+	}
+	return n, nil
+}
+
+func findStep(gates []cfg.GateView, name, step string) (cfg.GateStep, bool) {
+	for _, g := range gates {
+		if g.Name != name {
+			continue
+		}
+		for _, s := range g.Steps {
+			if s.Name == step {
+				return s, true
+			}
+		}
+	}
+	return cfg.GateStep{}, false
+}
+
+func (a *app) listGate(name string) error {
+	st := a.store.State()
+	for _, w := range st.Warnings {
+		fmt.Fprintln(a.stderr, "agentcfg: warning: "+w)
+	}
+	if st.Error != "" {
+		return errors.New(st.Error)
+	}
+	for _, g := range st.Gates {
+		if g.Name != name {
+			continue
+		}
+		fmt.Fprintf(a.stdout, "%s.gate  lock: %s  repo: %s\n", name, dash(g.Lock), dash(g.Meta["repo"]))
+		if g.Error != "" {
+			fmt.Fprintln(a.stdout, "invalid: "+g.Error)
+		}
+		if len(g.Steps) == 0 {
+			fmt.Fprintf(a.stdout, "no steps — add one: agentcfg gate %s --add NAME --run CMD\n", name)
+			return nil
+		}
+		tw := tabwriter.NewWriter(a.stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "#\tSTEP\tTIMEOUT\tSTOP ON FAIL\tRUN")
+		for i, s := range g.Steps {
+			timeout := s.Timeout
+			if timeout == "" {
+				timeout = strings.TrimSuffix(gatespec.DefaultTimeout.String(), "0s") + " (default)"
+			}
+			stop := "no"
+			if s.StopOnFail {
+				stop = "yes"
+			}
+			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", i+1, s.Name, timeout, stop, s.Run)
+		}
+		tw.Flush()
+		return nil
+	}
+	fmt.Fprintf(a.stdout, "no [%s.gate] table — add a step: agentcfg gate %s --add NAME --run CMD\n", name, name)
+	return nil
 }

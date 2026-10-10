@@ -15,8 +15,8 @@ import (
 var nameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // reservedEnvs are per-service tables that are not environments: agentctl
-// reads [name.meta], and [name.announce] belongs to agentflow.
-var reservedEnvs = map[string]bool{"meta": true, "announce": true}
+// reads [name.meta], and [name.announce] and [name.gate] belong to agentflow.
+var reservedEnvs = map[string]bool{"meta": true, "announce": true, "gate": true}
 
 // metaKeys are the [name.meta] keys agentcfg edits. Other meta keys are kept
 // as they are.
@@ -110,7 +110,7 @@ func (s *Store) SetBaseURL(expect, full, baseURL string) (*Result, error) {
 }
 
 // SetMeta sets [name.meta] keys; an empty value removes the key. Only repo
-// and unit are editable.
+// and unit are editable. Setting a value on an unknown name creates it.
 func (s *Store) SetMeta(expect, name string, kv map[string]string) (*Result, error) {
 	if err := checkName(name); err != nil {
 		return nil, err
@@ -123,8 +123,16 @@ func (s *Store) SetMeta(expect, name string, kv map[string]string) (*Result, err
 			return nil, fmt.Errorf("meta %s has control characters", k)
 		}
 	}
+	setsValue := false
+	for _, v := range kv {
+		if strings.TrimSpace(v) != "" {
+			setsValue = true
+		}
+	}
 	return s.Edit(expect, func(d *Doc) error {
-		svc, err := d.service(name, false)
+		// Setting a value may create the project: a gate-only project has
+		// meta and gate, and no env.
+		svc, err := d.service(name, setsValue)
 		if err != nil {
 			return err
 		}
@@ -144,6 +152,9 @@ func (s *Store) SetMeta(expect, name string, kv map[string]string) (*Result, err
 		}
 		if len(meta) == 0 {
 			delete(svc, "meta")
+			if len(svc) == 0 {
+				delete(d.Tree, name)
+			}
 		} else {
 			svc["meta"] = meta
 		}
@@ -190,8 +201,8 @@ func (s *Store) SetToken(expect, full, tok string) (*Result, error) {
 }
 
 // Remove deletes name.env, then its Keychain item if no other env refers to
-// it. [name.meta] goes too once the service has no env left; tables agentcfg
-// does not own (announce) stay.
+// it. [name.meta] goes too once the service has no env and no gate left;
+// tables agentcfg does not own (announce) stay.
 func (s *Store) Remove(expect, full string) (*Result, error) {
 	name, env, err := SplitFull(full)
 	if err != nil {
@@ -214,7 +225,9 @@ func (s *Store) Remove(expect, full string) (*Result, error) {
 				hasEnv = true
 			}
 		}
-		if !hasEnv {
+		// [name.gate] resolves its project through meta.repo, so a gate keeps
+		// the meta table alive after the last env goes.
+		if _, hasGate := svc["gate"]; !hasEnv && !hasGate {
 			delete(svc, "meta")
 		}
 		if len(svc) == 0 {
