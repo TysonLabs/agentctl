@@ -12,6 +12,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/TysonLabs/agentctl/internal/client"
+	"github.com/TysonLabs/agentctl/internal/gatespec"
 	"github.com/TysonLabs/agentctl/internal/keychain"
 	"github.com/TysonLabs/agentctl/internal/registry"
 	"github.com/TysonLabs/agentctl/internal/render"
@@ -27,7 +28,19 @@ type State struct {
 	Warnings  []string       `json:"warnings"`
 	Services  []ServiceView  `json:"services"`
 	Announces []AnnounceView `json:"announces"`
+	Gates     []GateView     `json:"gates"`
 	Plaintext int            `json:"plaintext"` // real tokens and webhooks still in the file
+}
+
+// GateView is one [name.gate] table (agentflow gate's steps), in order.
+// Error says why agentflow would refuse it; Steps then holds what could be
+// read.
+type GateView struct {
+	Name  string            `json:"name"`
+	Meta  map[string]string `json:"meta"` // string keys of [name.meta], for gate-only projects
+	Lock  string            `json:"lock"`
+	Steps []GateStep        `json:"steps"`
+	Error string            `json:"error,omitempty"`
 }
 
 // AnnounceView is one [name.announce] table (agentflow's Slack settings).
@@ -58,7 +71,7 @@ type TokenView struct {
 
 // State reads the file once, so Version always matches what is shown.
 func (s *Store) State() *State {
-	st := &State{Path: s.Path, Warnings: []string{}, Services: []ServiceView{}, Announces: []AnnounceView{}}
+	st := &State{Path: s.Path, Warnings: []string{}, Services: []ServiceView{}, Announces: []AnnounceView{}, Gates: []GateView{}}
 	data, err := os.ReadFile(s.Path)
 	if errors.Is(err, os.ErrNotExist) {
 		st.Version = VersionOf(nil)
@@ -104,7 +117,49 @@ func (s *Store) State() *State {
 	var inline int
 	st.Announces, inline = announceViews(data)
 	st.Plaintext += inline
+	st.Gates = gateViews(data)
 	return st
+}
+
+// gateViews reads every [name.gate] table. Validity comes from gatespec, the
+// rules agentflow gate applies.
+func gateViews(data []byte) []GateView {
+	out := []GateView{}
+	tree := map[string]any{}
+	if _, err := toml.Decode(string(data), &tree); err != nil {
+		return out
+	}
+	for _, name := range sortedKeys(tree) {
+		svc, _ := tree[name].(map[string]any)
+		raw, ok := svc["gate"]
+		if !ok {
+			continue
+		}
+		v := GateView{Name: name, Meta: map[string]string{}, Steps: []GateStep{}}
+		if meta, ok := svc["meta"].(map[string]any); ok {
+			for k, mv := range meta {
+				if s, ok := mv.(string); ok {
+					v.Meta[k] = s
+				}
+			}
+		}
+		if _, err := gatespec.FromTable(name, raw); err != nil {
+			v.Error = err.Error()
+		}
+		tbl, _ := raw.(map[string]any)
+		v.Lock, _ = tbl["lock"].(string)
+		steps, _ := gatespec.StepTables(tbl["steps"])
+		for _, m := range steps {
+			var st GateStep
+			st.Name, _ = m["name"].(string)
+			st.Run, _ = m["run"].(string)
+			st.Timeout, _ = m["timeout"].(string)
+			st.StopOnFail, _ = m["stop_on_fail"].(bool)
+			v.Steps = append(v.Steps, st)
+		}
+		out = append(out, v)
+	}
+	return out
 }
 
 // announceViews reads every [name.announce] table and counts the inline

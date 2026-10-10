@@ -26,7 +26,10 @@ background and keep working; your harness tells you when it exits. Never wait in
    is done by you: review, fix what the brief asks, report, and stop. Don't start
    another review or follow the rest of this list.
 5. **Run the repo's full gate once**, after the review fixes and any merge from the
-   default branch. If it fails, fix it and rerun the failing part.
+   default branch. If it fails, fix it and rerun the failing part. Where the repo has a
+   `[name.gate]` table, run `agentflow gate` in the background: it runs every step, logs
+   each one, and keeps a receipt per step for the exact tree, so a rerun skips what already
+   passed on that tree. Exit 0 means every step passed; 2 or 124 name the step and its log.
 6. **Push and open a PR** whose body says what changed, how it was verified, and any
    review fix you did not take as written, with the reason.
 7. **Handle every PR review thread.** If the repo uses CodeRabbit, run

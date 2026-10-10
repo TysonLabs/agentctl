@@ -50,8 +50,11 @@ func ResolvePath(flagVal string) string { return configpath.Resolve(flagVal) }
 
 // reservedTables are per-service tables that are not environments. agentctl
 // reads [name.meta]; [name.announce] belongs to agentflow (it holds a Slack
-// webhook, a write credential) and agentctl never decodes it.
-var reservedTables = map[string]bool{"meta": true, "announce": true}
+// webhook, a write credential) and agentctl never decodes it; [name.gate] is
+// agentflow gate's step list (agentcfg and agentflow validate it with
+// internal/gatespec; agentctl ignores it). A project may have only meta and
+// gate, and no env.
+var reservedTables = map[string]bool{"meta": true, "announce": true, "gate": true}
 
 // Load reads and validates the registry file, then reads every token_ref
 // from the Keychain.

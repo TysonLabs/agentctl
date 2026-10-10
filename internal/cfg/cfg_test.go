@@ -260,9 +260,8 @@ func TestConcurrentEditsAllLand(t *testing.T) {
 
 func TestUnsupportedShapesFailClosed(t *testing.T) {
 	for name, content := range map[string]string{
-		"root scalar":     "x = 1\n[a.prod]\nbase_url = \"https://a\"\n",
-		"array of tables": "[a.prod]\nbase_url = \"https://a\"\n[[a.prod.list]]\nk = 1\n",
-		"quoted name":     "[\"a b\".prod]\nbase_url = \"https://a\"\n",
+		"root scalar": "x = 1\n[a.prod]\nbase_url = \"https://a\"\n",
+		"quoted name": "[\"a b\".prod]\nbase_url = \"https://a\"\n",
 	} {
 		s := newStore(t, content)
 		if _, err := s.SetBaseURL("", "z.prod", "https://z"); err == nil {

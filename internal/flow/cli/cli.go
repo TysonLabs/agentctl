@@ -2,7 +2,8 @@
 // assigned in this package and nowhere else, one table per command
 // (exitCodes for codex, coderabbitExitCodes for coderabbit, shipExitCodes
 // for ship verify, prExitCodes for pr wait, replyExitCodes for pr reply,
-// prMergeExitCodes for pr merge, lessonsExitCodes for lessons). 0 is success, 1 a
+// prMergeExitCodes for pr merge, lessonsExitCodes for lessons, gateExitCodes
+// for gate). 0 is success, 1 a
 // usage or precondition error, 124 a timeout and 130 an interruption for
 // every command.
 package cli
@@ -48,6 +49,11 @@ Usage:
   agentflow worktree done <branch|path>        remove a merged, clean, unused worktree
   agentflow worktree sweep [--yes]             list (or remove) every such worktree
                                                (see: agentflow worktree --help)
+  agentflow gate [--project P] [--only a,b] [--force]
+                                               run the project's gate steps from
+                                               services.toml; receipts per tree
+  agentflow gate --check [--rev REV]           exit 0 only if that tree passed every step
+                                               (see: agentflow gate --help)
   agentflow lessons brief|bump|retire|stats    code-review lessons: brief section, counters,
                                                retirement (see: agentflow lessons --help)
   agentflow version                           print agentflow's own version
@@ -135,6 +141,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		return runPR(ctx, args[1:], stdout, stderr)
+	case "gate":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runGate(ctx, args[1:], stdout, stderr)
 	case "lessons":
 		return runLessons(args[1:], stdout, stderr)
 	case "version", "--version":

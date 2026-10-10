@@ -172,6 +172,11 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/migrate", s.api(s.handleMigrate))
 	mux.HandleFunc("POST /api/announce", s.api(s.handleAnnounce))
 	mux.HandleFunc("POST /api/announce/remove", s.api(s.handleAnnounceRemove))
+	mux.HandleFunc("POST /api/gate/step", s.api(s.handleGateStep))
+	mux.HandleFunc("POST /api/gate/step/remove", s.api(s.handleGateStepRemove))
+	mux.HandleFunc("POST /api/gate/move", s.api(s.handleGateMove))
+	mux.HandleFunc("POST /api/gate/lock", s.api(s.handleGateLock))
+	mux.HandleFunc("POST /api/gate/remove", s.api(s.handleGateRemove))
 	mux.HandleFunc("POST /api/test", s.api(s.handleTest))
 	mux.HandleFunc("POST /api/quit", s.api(s.handleQuit))
 	return s.guard(mux)
@@ -399,6 +404,101 @@ func (s *server) handleAnnounceRemove(r *http.Request) (any, error) {
 		return nil, err
 	}
 	res, err := s.store.RemoveAnnounce(req.Version, req.Name)
+	if err != nil {
+		return nil, err
+	}
+	return s.reply(res.Warnings...), nil
+}
+
+// handleGateStep adds a step (original "") or replaces step original,
+// which may rename it. at is a 1-based position for an add (0 appends).
+func (s *server) handleGateStep(r *http.Request) (any, error) {
+	var req struct {
+		Version  string       `json:"version"`
+		Name     string       `json:"name"`
+		Original string       `json:"original"`
+		Step     cfg.GateStep `json:"step"`
+		At       int          `json:"at"`
+	}
+	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	var (
+		res *cfg.Result
+		err error
+	)
+	if req.Original == "" {
+		res, err = s.store.AddGateStep(req.Version, req.Name, req.Step, req.At)
+	} else {
+		if req.At != 0 {
+			return nil, badRequest(errors.New("at applies only to a new step; use /api/gate/move"))
+		}
+		res, err = s.store.EditGateStep(req.Version, req.Name, req.Original, req.Step)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.reply(res.Warnings...), nil
+}
+
+func (s *server) handleGateStepRemove(r *http.Request) (any, error) {
+	var req struct {
+		Version string `json:"version"`
+		Name    string `json:"name"`
+		Step    string `json:"step"`
+	}
+	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	res, err := s.store.RemoveGateStep(req.Version, req.Name, req.Step)
+	if err != nil {
+		return nil, err
+	}
+	return s.reply(res.Warnings...), nil
+}
+
+func (s *server) handleGateMove(r *http.Request) (any, error) {
+	var req struct {
+		Version string `json:"version"`
+		Name    string `json:"name"`
+		Step    string `json:"step"`
+		To      int    `json:"to"`
+	}
+	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	res, err := s.store.MoveGateStep(req.Version, req.Name, req.Step, req.To)
+	if err != nil {
+		return nil, err
+	}
+	return s.reply(res.Warnings...), nil
+}
+
+func (s *server) handleGateLock(r *http.Request) (any, error) {
+	var req struct {
+		Version string `json:"version"`
+		Name    string `json:"name"`
+		Lock    string `json:"lock"`
+	}
+	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	res, err := s.store.SetGateLock(req.Version, req.Name, req.Lock)
+	if err != nil {
+		return nil, err
+	}
+	return s.reply(res.Warnings...), nil
+}
+
+func (s *server) handleGateRemove(r *http.Request) (any, error) {
+	var req struct {
+		Version string `json:"version"`
+		Name    string `json:"name"`
+	}
+	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	res, err := s.store.RemoveGate(req.Version, req.Name)
 	if err != nil {
 		return nil, err
 	}

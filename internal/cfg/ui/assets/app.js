@@ -105,6 +105,7 @@
     $("services").replaceChildren();
     $("summary").textContent = "";
     $("add").disabled = true;
+    $("add-gate").disabled = true;
   }
 
   function groups() {
@@ -116,6 +117,10 @@
     for (const an of state.announces || []) {
       if (!by.has(an.name)) by.set(an.name, { name: an.name, meta: {}, envs: [] });
     }
+    // A gate-only project has meta and gate, and no env.
+    for (const gt of state.gates || []) {
+      if (!by.has(gt.name)) by.set(gt.name, { name: gt.name, meta: gt.meta || {}, envs: [] });
+    }
     return [...by.values()];
   }
 
@@ -123,6 +128,7 @@
     $("path").textContent = state.path;
     $("appver").textContent = state.app_version ? "v" + state.app_version : "";
     $("add").disabled = !!state.error;
+    $("add-gate").disabled = !!state.error;
 
     const alerts = [];
     if (state.error) {
@@ -175,8 +181,69 @@
         h("div", {},
           h("button", { class: "btn ghost", type: "button", text: "Add env", onclick: () => openAdd(g.name) }),
           h("button", { class: "btn ghost", type: "button", text: "Slack", onclick: () => openSlack(g.name, an) }),
+          h("button", { class: "btn ghost", type: "button", text: "Gate step", onclick: () => openGateStep(g.name, null) }),
           h("button", { class: "btn ghost", type: "button", text: "Details", onclick: () => openMeta(g) }))),
-      g.envs.map(renderEnv));
+      g.envs.map(renderEnv),
+      renderGate(g.name));
+  }
+
+  // agentflow's [name.gate]: the ordered steps `agentflow gate` runs.
+  function renderGate(name) {
+    const gt = (state.gates || []).find((x) => x.name === name);
+    if (!gt) return null;
+    const n = gt.steps.length;
+    const lockBtn = h("button", { class: "btn", type: "button", text: gt.lock ? "Change lock" : "Set lock", onclick: () => openGateLock(name, gt) });
+    const rmGate = armedButton("Remove gate", "Confirm: remove all steps", async () => {
+      await write("/api/gate/remove", { name });
+      toast("Removed the gate of " + name);
+    });
+    const head = h("div", { class: "gate-head" },
+      h("span", { class: "pill", text: "gate" }),
+      h("div", { class: "gate-sum" },
+        h("span", { class: "muted small", text: plural(n, "step", "steps") + " · lock " }),
+        gt.lock ? h("span", { class: "chip ok mono", text: gt.lock }) : h("span", { class: "muted small", text: "none" }),
+        gt.error ? h("span", { class: "reason", text: gt.error, title: gt.error }) : null),
+      h("div", { class: "actions" }, lockBtn, rmGate));
+    const rows = gt.steps.map((st, i) => {
+      const up = h("button", { class: "btn", type: "button", text: "↑", title: "Move up", "aria-label": "Move " + st.name + " up", disabled: i === 0 || undefined });
+      up.addEventListener("click", () => busy(up, () => write("/api/gate/move", { name, step: st.name, to: i })));
+      const down = h("button", { class: "btn", type: "button", text: "↓", title: "Move down", "aria-label": "Move " + st.name + " down", disabled: i === n - 1 || undefined });
+      down.addEventListener("click", () => busy(down, () => write("/api/gate/move", { name, step: st.name, to: i + 2 })));
+      const rm = armedButton("Delete", "Confirm", async () => {
+        await write("/api/gate/step/remove", { name, step: st.name });
+        toast("Deleted step " + st.name);
+      });
+      return h("div", { class: "gate-row" },
+        h("span", { class: "gate-idx muted", text: String(i + 1) }),
+        h("div", { class: "gate-step" },
+          h("span", { class: "gate-name", text: st.name }),
+          h("span", { class: "mono gate-run", text: st.run, title: st.run })),
+        h("div", { class: "gate-flags" },
+          h("span", { class: "muted small", text: st.timeout || "30m" }),
+          st.stop_on_fail ? h("span", { class: "chip warn", title: "Later steps are skipped if this one fails", text: "stops" }) : null),
+        h("div", { class: "actions" }, up, down,
+          h("button", { class: "btn", type: "button", text: "Edit", onclick: () => openGateStep(name, st) }),
+          rm));
+    });
+    return h("div", { class: "gate" }, head, rows);
+  }
+
+  // A destructive button that needs a second click within 4 s.
+  function armedButton(text, armedText, fn) {
+    const b = h("button", { class: "btn danger", type: "button", text });
+    let armed = null;
+    b.addEventListener("click", () => {
+      if (!armed) {
+        b.classList.add("armed");
+        b.textContent = armedText;
+        armed = setTimeout(() => { armed = null; b.classList.remove("armed"); b.textContent = text; }, 4000);
+        return;
+      }
+      clearTimeout(armed);
+      armed = null;
+      busy(b, fn);
+    });
+    return b;
   }
 
   // agentflow's [name.announce]: where `agentflow ship announce` posts.
@@ -389,6 +456,64 @@
       });
   }
 
+  function checkbox(id, label, checked, hint) {
+    return h("div", { class: "field check" },
+      h("label", { for: id },
+        h("input", { id, name: id, type: "checkbox", checked: checked || undefined }), " ", label),
+      hint ? h("div", { class: "hint", text: hint }) : null);
+  }
+
+  // Add (st null) or edit a gate step. With no name, it starts a new
+  // gate-only project and can set its repo.
+  function openGateStep(name, st) {
+    const fresh = !name;
+    const fields = [];
+    if (fresh) {
+      fields.push(h("div", { class: "field-row" },
+        field("f-proj", "Project", { placeholder: "myproj", mono: true, required: true }),
+        field("f-repo", "Repo (optional)", { placeholder: "~/src/github.com/org/repo", mono: true,
+          hint: "agentflow gate finds the project from this checkout." })));
+    }
+    fields.push(
+      field("f-step", "Step name", { value: st ? st.name : "", placeholder: "test", mono: true, required: true }),
+      field("f-run", "Command", { value: st ? st.run : "", placeholder: "make test", mono: true, required: true,
+        hint: "Runs with /bin/sh -c from the repo root, stdin closed." }),
+      field("f-timeout", "Timeout", { value: st ? st.timeout : "", placeholder: "30m", mono: true,
+        hint: "Empty means 30m. The whole process group is killed when it runs out." }),
+      checkbox("f-stop", "Stop on fail", st && st.stop_on_fail, "Skip the later steps when this one fails."));
+    openDialog(st ? "Edit gate step " + st.name : (fresh ? "Add a gate project" : "Add a gate step to " + name),
+      "agentflow gate runs these steps in order and records a receipt for each pass.", fields, st ? "Save" : "Add",
+      async () => {
+        const form = {
+          proj: fresh ? val("f-proj") : name, repo: fresh ? val("f-repo") : "",
+          step: { name: val("f-step"), run: val("f-run"), timeout: val("f-timeout"), stop_on_fail: $("f-stop").checked },
+        };
+        if (fresh && groups().some((g) => g.name === form.proj)) {
+          throw new Error(form.proj + " already exists. Use its Gate step button.");
+        }
+        await write("/api/gate/step", { name: form.proj, original: st ? st.name : "", step: form.step });
+        if (form.repo) {
+          try {
+            await write("/api/meta", { name: form.proj, meta: { repo: form.repo } });
+          } catch (e) {
+            toast("Added the step, but the repo was not saved: " + e.message, true);
+            return;
+          }
+        }
+        toast((st ? "Saved step " : "Added step ") + form.step.name);
+      });
+  }
+
+  function openGateLock(name, gt) {
+    openDialog("Gate lock for " + name,
+      "agentflow gate holds this named lock for the whole run, so two gates that share it never run at once. Leave it empty for no lock.",
+      [field("f-lock", "Lock name", { value: gt.lock, placeholder: name + "-build", mono: true })], "Save",
+      async () => {
+        await write("/api/gate/lock", { name, lock: val("f-lock") });
+        toast("Saved the gate lock of " + name);
+      });
+  }
+
   function openMeta(g) {
     openDialog("Details for " + g.name, "Used by agentflow and the fleet view. Leave a field empty to clear it.",
       [
@@ -428,6 +553,7 @@
   $("dlg").addEventListener("close", () => { $("dlg-fields").replaceChildren(); onSubmit = null; });
 
   $("add").addEventListener("click", () => openAdd());
+  $("add-gate").addEventListener("click", () => openGateStep("", null));
   $("done").addEventListener("click", async () => {
     try {
       await api("POST", "/api/quit", {});

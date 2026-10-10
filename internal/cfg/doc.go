@@ -149,6 +149,17 @@ func sameTree(a, b any) bool {
 			}
 		}
 		return true
+	case []map[string]any:
+		bv := b.([]map[string]any)
+		if len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !sameTree(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
 	case []any:
 		bv := b.([]any)
 		if len(av) != len(bv) {
@@ -182,15 +193,19 @@ func renderTable(b *bytes.Buffer, path []string, tbl map[string]any) error {
 		}
 	}
 	b.WriteString("\n[" + strings.Join(path, ".") + "]\n")
+	return renderBody(b, path, tbl)
+}
+
+// renderBody writes tbl's keys, then its sub-tables and arrays of tables
+// (TOML needs a table's own keys before any nested header).
+func renderBody(b *bytes.Buffer, path []string, tbl map[string]any) error {
 	var subs []string
 	for _, k := range keyOrder(tbl) {
 		v := tbl[k]
 		switch v.(type) {
-		case map[string]any:
+		case map[string]any, []map[string]any:
 			subs = append(subs, k)
 			continue
-		case []map[string]any:
-			return fmt.Errorf("[%s] holds an array of tables (%s); agentcfg cannot rewrite that shape", strings.Join(path, "."), k)
 		}
 		line, err := encodeKV(k, v)
 		if err != nil {
@@ -199,7 +214,35 @@ func renderTable(b *bytes.Buffer, path []string, tbl map[string]any) error {
 		b.WriteString(line)
 	}
 	for _, k := range subs {
-		if err := renderTable(b, append(append([]string{}, path...), k), tbl[k].(map[string]any)); err != nil {
+		sub := append(append([]string{}, path...), k)
+		if arr, ok := tbl[k].([]map[string]any); ok {
+			if err := renderArray(b, sub, arr); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := renderTable(b, sub, tbl[k].(map[string]any)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// renderArray writes an array of tables ([[a.b]]), such as a gate's steps.
+// Each element's own sub-tables follow it, which TOML attaches to that
+// element.
+func renderArray(b *bytes.Buffer, path []string, arr []map[string]any) error {
+	for _, seg := range path {
+		if !bareKey.MatchString(seg) {
+			return fmt.Errorf("table name %q needs quoting; agentcfg only writes plain names", strings.Join(path, "."))
+		}
+	}
+	if len(arr) == 0 {
+		return fmt.Errorf("[%s] is an empty array of tables; agentcfg cannot write that shape", strings.Join(path, "."))
+	}
+	for _, el := range arr {
+		b.WriteString("\n[[" + strings.Join(path, ".") + "]]\n")
+		if err := renderBody(b, path, el); err != nil {
 			return err
 		}
 	}

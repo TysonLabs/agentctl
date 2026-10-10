@@ -122,6 +122,25 @@ h2 { font-size: 16px; margin: 0 0 4px; }
 .env-row .result { grid-column: 2 / -1; margin-top: -4px; }
 .env-row .reason { display: block; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.head-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.gate { border-top: 1px solid var(--border); }
+.gate-head, .gate-row {
+  display: grid; grid-template-columns: 88px minmax(0, 1fr) auto auto; align-items: center; gap: 12px;
+  padding: 8px 16px;
+}
+.gate-head { background: var(--subtle); }
+.gate-head .gate-sum { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.gate-head .reason { color: var(--bad-fg); font-size: 12px; overflow-wrap: anywhere; }
+.gate-row { border-top: 1px solid var(--border); }
+.gate-idx { text-align: center; font-size: 12.5px; }
+.gate-step { min-width: 0; display: flex; gap: 10px; align-items: baseline; }
+.gate-name { font-weight: 600; flex: none; }
+.gate-run { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.gate-flags { display: flex; gap: 6px; align-items: center; }
+.gate .actions { display: flex; gap: 4px; justify-content: flex-end; }
+.field.check label { display: flex; align-items: center; gap: 6px; font-weight: 550; }
+.field.check input { width: auto; }
+
 .pill {
   display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 999px;
   background: var(--subtle); border: 1px solid var(--border); text-align: center;
@@ -182,5 +201,8 @@ dialog form { padding: 20px; }
   .env-row .actions { grid-column: 1 / -1; justify-content: flex-start; flex-wrap: wrap; }
   .env-row .result { grid-column: 1 / -1; }
   .field-row { grid-template-columns: 1fr; }
+  .gate-head, .gate-row { grid-template-columns: 40px minmax(0, 1fr); }
+  .gate-flags { grid-column: 2; }
+  .gate .actions { grid-column: 1 / -1; justify-content: flex-start; flex-wrap: wrap; }
   #appver { display: none; }
 }
