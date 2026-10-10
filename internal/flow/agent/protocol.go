@@ -89,6 +89,7 @@ TEST: <TESTTEXT>
 - WHY, FIX and TEST each start a new line. A field can continue on the lines below it.
 - If you find no defects, write "None." under "## Findings".
 - If you left nothing unfixed, write "None." under "## Not fixed".
+- Always write both sections, in this order. "## Not fixed" marks the end of the list.
 `
 
 // WrapBrief returns the protocol header, the caller's brief and the output
@@ -137,6 +138,7 @@ type Finding struct {
 
 var (
 	findingsHeadRe = regexp.MustCompile(`^##\s+Findings\s*$`)
+	notFixedHeadRe = regexp.MustCompile(`^##\s+Not fixed\s*$`)
 	sectionRe      = regexp.MustCompile(`^##\s`)
 	blockStartRe   = regexp.MustCompile(`^###\s+F\d`)
 	// ### F1 [Major] path/to/file.go:42 [learned l12]   (a line range 42-48 keeps 42)
@@ -147,6 +149,39 @@ var (
 
 var severities = map[string]string{"blocker": "Blocker", "major": "Major", "minor": "Minor"}
 
+type markdownFence struct {
+	char  byte
+	width int
+}
+
+// update changes the fence state when line is an opening or matching closing
+// Markdown fence. It reports fence delimiter lines so the parser never treats
+// a closing delimiter as protocol syntax after it leaves the fence.
+func (f *markdownFence) update(line string) bool {
+	s := strings.TrimLeft(line, " \t")
+	if s == "" || (s[0] != '`' && s[0] != '~') {
+		return false
+	}
+	width := 1
+	for width < len(s) && s[width] == s[0] {
+		width++
+	}
+	if width < 3 {
+		return false
+	}
+	if f.char == 0 {
+		f.char, f.width = s[0], width
+		return true
+	}
+	if s[0] == f.char && width >= f.width && strings.TrimSpace(s[width:]) == "" {
+		f.char, f.width = 0, 0
+		return true
+	}
+	return false
+}
+
+func (f markdownFence) active() bool { return f.char != 0 }
+
 // ParseFindings reads a protocol final message. It returns an empty, non-nil
 // slice for "None." and an error when the message does not follow the format.
 // A single malformed block fails the whole parse: a partial list would read
@@ -154,7 +189,14 @@ var severities = map[string]string{"blocker": "Blocker", "major": "Major", "mino
 func ParseFindings(text string) ([]Finding, error) {
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 	start := -1
+	var headingFence markdownFence
 	for i, l := range lines {
+		if headingFence.update(l) {
+			continue
+		}
+		if headingFence.active() {
+			continue
+		}
 		if findingsHeadRe.MatchString(strings.TrimSpace(l)) {
 			if start >= 0 {
 				return nil, errors.New(`more than one "## Findings" heading`)
@@ -168,8 +210,10 @@ func ParseFindings(text string) ([]Finding, error) {
 	findings := []Finding{}
 	var cur *Finding
 	var field *string
+	nextField := 0
 	sawNone := false
-	inFence := false
+	sawNotFixed := false
+	var fence markdownFence
 	seen := map[string]bool{}
 	finish := func() error {
 		if cur == nil {
@@ -182,19 +226,32 @@ func ParseFindings(text string) ([]Finding, error) {
 			}
 		}
 		findings = append(findings, *cur)
-		cur, field = nil, nil
+		cur, field, nextField = nil, nil, 0
 		return nil
 	}
 	for _, raw := range lines[start:] {
 		l := strings.TrimRight(raw, " \t")
 		trimmed := strings.TrimSpace(l)
-		if strings.HasPrefix(trimmed, "```") {
-			inFence = !inFence
+		fenceLine := fence.update(l)
+		inFence := fence.active()
+		if !inFence && !fenceLine && noneRe.MatchString(trimmed) {
+			if sawNone {
+				return nil, errors.New(`more than one "None." under "## Findings"`)
+			}
+			if err := finish(); err != nil {
+				return nil, err
+			}
+			sawNone = true
+			continue
 		}
-		if !inFence && sectionRe.MatchString(trimmed) {
-			break // the next section ("## Not fixed") ends the findings
+		if !inFence && !fenceLine && sectionRe.MatchString(trimmed) {
+			if !notFixedHeadRe.MatchString(trimmed) {
+				return nil, fmt.Errorf("unexpected section heading %q after findings (want: ## Not fixed)", trimmed)
+			}
+			sawNotFixed = true
+			break
 		}
-		if !inFence && blockStartRe.MatchString(trimmed) {
+		if !inFence && !fenceLine && blockStartRe.MatchString(trimmed) {
 			if err := finish(); err != nil {
 				return nil, err
 			}
@@ -213,6 +270,10 @@ func ParseFindings(text string) ([]Finding, error) {
 			if seen[m[1]] {
 				return nil, fmt.Errorf("duplicate finding id %s", m[1])
 			}
+			wantID := fmt.Sprintf("F%d", len(findings)+1)
+			if m[1] != wantID {
+				return nil, fmt.Errorf("finding id %s is out of sequence (want %s)", m[1], wantID)
+			}
 			seen[m[1]] = true
 			cur = &Finding{ID: m[1], Severity: sev, File: m[3], Line: line, Learned: m[5]}
 			continue
@@ -220,14 +281,20 @@ func ParseFindings(text string) ([]Finding, error) {
 		if cur == nil {
 			switch {
 			case trimmed == "":
-			case noneRe.MatchString(trimmed):
-				sawNone = true
 			default:
 				return nil, fmt.Errorf("text outside a finding block: %q", trimmed)
 			}
 			continue
 		}
-		if m := fieldRe.FindStringSubmatch(trimmed); m != nil && !inFence {
+		if m := fieldRe.FindStringSubmatch(trimmed); m != nil && !inFence && !fenceLine {
+			fieldNumber := map[string]int{"WHY": 0, "FIX": 1, "TEST": 2}[m[1]]
+			if fieldNumber < nextField {
+				return nil, fmt.Errorf("%s has %s twice or out of order", cur.ID, m[1])
+			}
+			if fieldNumber > nextField {
+				want := []string{"WHY", "FIX", "TEST"}[nextField]
+				return nil, fmt.Errorf("%s has %s before %s", cur.ID, m[1], want)
+			}
 			switch m[1] {
 			case "WHY":
 				field = &cur.Why
@@ -236,10 +303,8 @@ func ParseFindings(text string) ([]Finding, error) {
 			default:
 				field = &cur.Test
 			}
-			if *field != "" {
-				return nil, fmt.Errorf("%s has %s twice", cur.ID, m[1])
-			}
 			*field = m[2]
+			nextField++
 			continue
 		}
 		if field == nil {
@@ -250,11 +315,14 @@ func ParseFindings(text string) ([]Finding, error) {
 		}
 		*field += "\n" + l
 	}
-	if inFence {
+	if fence.active() {
 		return nil, errors.New("unclosed code fence in the findings")
 	}
 	if err := finish(); err != nil {
 		return nil, err
+	}
+	if !sawNotFixed {
+		return nil, errors.New(`no "## Not fixed" heading after findings`)
 	}
 	if len(findings) == 0 && !sawNone {
 		return nil, errors.New(`no findings and no "None." under "## Findings"`)

@@ -393,7 +393,9 @@ agentflow parses `final.md` into the JSON result:
 `"protocol": "fix"` and `"findings": [{"id", "severity", "file", "line", "learned", "why",
 "fix", "test"}]`. `[]` means no findings. If the message does not follow the format,
 `findings` is `null` and `warnings` says why. One malformed block voids the whole list,
-so a partial list never passes for a complete one. A failed run also has `findings: null`.
+so a partial list never passes for a complete one: ids must run F1, F2, … without
+gaps, fields must come in the order WHY, FIX, TEST, and the list must end at
+`## Not fixed`, so a cut-off answer does not parse. A failed run also has `findings: null`.
 Parsing never changes the status or the exit code. Without `--protocol`, neither key
 appears.
 
