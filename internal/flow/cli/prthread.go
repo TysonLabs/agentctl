@@ -14,26 +14,23 @@ import (
 	"github.com/TysonLabs/agentctl/internal/flow/pr"
 )
 
-var replyExitCodes = map[pr.ReplyStatus]int{
-	pr.ReplyDone:        0,
-	pr.ReplyGHError:     1,
-	pr.ReplyRefused:     2,
-	pr.ReplyNotResolved: 3,
-	pr.ReplyInterrupted: 130,
+var threadExitCodes = map[pr.ThreadStatus]int{
+	pr.ThreadOK:          0,
+	pr.ThreadGHError:     1,
+	pr.ThreadRefused:     2,
+	pr.ThreadInterrupted: 130,
 }
 
-func runPRReply(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+// runPRThread prints one review thread's comments. It is read-only.
+func runPRThread(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fail := func(format string, a ...any) int {
-		fmt.Fprintf(stderr, "agentflow pr reply: "+format+"\n", a...)
+		fmt.Fprintf(stderr, "agentflow pr thread: "+format+"\n", a...)
 		return 1
 	}
-	fs := flag.NewFlagSet("agentflow pr reply", flag.ContinueOnError)
+	fs := flag.NewFlagSet("agentflow pr thread", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	var o pr.ReplyOptions
+	var o pr.ThreadOptions
 	fs.StringVar(&o.Repo, "repo", "", "")
-	fs.StringVar(&o.Fixed, "fixed", "", "")
-	fs.StringVar(&o.Note, "note", "", "")
-	fs.StringVar(&o.Keep, "keep", "", "")
 	format := formatFlag(fs)
 	pos, err := parseInterleaved(fs, args)
 	if err != nil {
@@ -47,11 +44,11 @@ func runPRReply(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		return fail("want exactly one thread id, got %d", len(pos))
 	}
 	o.Thread = pos[0]
+	if !pr.ValidThreadID(o.Thread) {
+		return fail("thread id %q is not a review-thread node id (PRRT_…, as agentflow pr wait prints it)", o.Thread)
+	}
 	if o.Repo != "" && !repoRe.MatchString(o.Repo) {
 		return fail("--repo %q is not OWNER/NAME", o.Repo)
-	}
-	if err := pr.ValidateReply(o); err != nil {
-		return fail("%v", err)
 	}
 	bin := os.Getenv("AGENTFLOW_GH")
 	if bin == "" {
@@ -61,23 +58,19 @@ func runPRReply(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	}
 	o.GH = pr.GHCLI(bin, 60*time.Second)
 
-	res := pr.Reply(ctx, o)
+	res := pr.ReadThread(ctx, o)
 	out, _ := json.MarshalIndent(res, "", "  ")
-	code, ok := replyExitCodes[res.Status]
+	code, ok := threadExitCodes[res.Status]
 	if !ok {
 		code = 1
 	}
-	emit(stdout, *format, append(out, '\n'), func() string { return replyText(res, code) })
+	emit(stdout, *format, append(out, '\n'), func() string { return threadText(res, code) })
 	if !ok {
-		fmt.Fprintf(stderr, "agentflow pr reply: unknown result status %q\n", res.Status)
+		fmt.Fprintf(stderr, "agentflow pr thread: unknown result status %q\n", res.Status)
 		return code
 	}
 	if code != 0 {
-		msg := res.Error
-		if res.Next != "" {
-			msg += " (" + res.Next + ")"
-		}
-		fmt.Fprintf(stderr, "agentflow pr reply: %s: %s\n", res.Status, msg)
+		fmt.Fprintf(stderr, "agentflow pr thread: %s: %s\n", res.Status, res.Error)
 	}
 	return code
 }

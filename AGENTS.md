@@ -28,14 +28,17 @@ background and keep working; your harness tells you when it exits. Never wait in
    Name the targeted tests with `--test-cmd`. The JSON's `findings` lists each fix
    (null with a warning if the answer did not follow the format: then read `final.md`).
    Then audit every fix it made: accept it, revert it, or amend it, each one for a
-   stated reason. For a read-only review, drop `--write` and use `--protocol review`. For a big diff, run one pass per area with
+   stated reason. Prove a fix's new test fails without it: `agentflow redcheck --test
+   '<cmd>' --uncommitted` (or `--commit <sha>`). For a read-only review, drop `--write` and use `--protocol review`. For a big diff, run one pass per area with
    `--path`. If you keep a lessons folder (`AGENTFLOW_LESSONS_DIR`), add
    `--lessons <the diff's topics>` so the reviewer also checks past defects. Exit 0 means `final.md` holds a real answer; anything else means there was
    no review (see the exit table in the README). **If you are the reviewer,** this step
    is done by you: review, fix what the brief asks, report, and stop. Don't start
    another review or follow the rest of this list.
 5. **Run the repo's full gate once**, after the review fixes and any merge from the
-   default branch. If it fails, fix it and rerun the failing part.
+   default branch. If it fails, fix it and rerun the failing part. To merge the default
+   branch in, run `agentflow branch sync --merge`: it reports what came in and which
+   files both sides touched, and lists any conflicts it leaves for you to resolve.
 6. **Push and open a PR** whose body says what changed, how it was verified, and any
    review fix you did not take as written, with the reason.
 7. **Handle every PR review thread.** If the repo uses CodeRabbit, run

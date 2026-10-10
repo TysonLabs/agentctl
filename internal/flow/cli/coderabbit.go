@@ -36,6 +36,8 @@ return its findings as JSON. Run it in the background; reviews take minutes.
                       0 disables). The CLI prints heartbeats while it works.
   --out DIR           where to write events.jsonl, stderr.log and result.json
                       (default: a new temp dir)
+  --format json|text  result on stdout as JSON (default) or a text summary;
+                      result.json is JSON either way
 
 stdin is never read and never passed on. One run per repository at a time:
 a second run while one is active exits 1. "clean" needs CodeRabbit's
@@ -86,6 +88,7 @@ func runCodeRabbit(ctx context.Context, args []string, stdout, stderr io.Writer)
 	fs.DurationVar(&o.Timeout, "timeout", 30*time.Minute, "")
 	fs.DurationVar(&o.Stall, "stall", 10*time.Minute, "")
 	fs.StringVar(&o.OutDir, "out", "", "")
+	format := formatFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fmt.Fprint(stdout, coderabbitUsage)
@@ -190,11 +193,14 @@ func runCodeRabbit(ctx context.Context, args []string, stdout, stderr io.Writer)
 	out, _ := json.MarshalIndent(res, "", "  ")
 	out = append(out, '\n')
 	_ = os.WriteFile(filepath.Join(o.OutDir, "result.json"), out, 0o644)
-	_, _ = stdout.Write(out)
 	code, ok := coderabbitExitCodes[res.Status]
 	if !ok {
+		code = coderabbitExitCodes[coderabbit.StatusFailed]
+	}
+	emit(stdout, *format, out, func() string { return coderabbitText(res, code) })
+	if !ok {
 		fmt.Fprintf(stderr, "agentflow coderabbit: unknown result status %q\n", res.Status)
-		return coderabbitExitCodes[coderabbit.StatusFailed]
+		return code
 	}
 	if code != 0 && code != 10 {
 		fmt.Fprintf(stderr, "agentflow coderabbit: %s: %s (logs: %s)\n", res.Status, res.Error, o.OutDir)
