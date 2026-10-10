@@ -70,6 +70,8 @@ var (
 	reMisled = fieldRe("Misled")
 	reSeen   = fieldRe("Seen")
 	reAvoid  = bulletRe("Avoid by")
+	reWhat   = bulletRe("What went wrong")
+	reAlsoTx = bulletRe("Also seen")
 	reWhy    = bulletRe("Why it's wrong")
 	reTell   = bulletRe("Tell")
 )
@@ -86,6 +88,8 @@ type Lesson struct {
 	Used   int      `json:"used"`
 	Misled int      `json:"misled"`
 	Avoid  string   `json:"-"`
+	What   string   `json:"-"`
+	Also   []string `json:"-"`
 }
 
 // FalsePositive is one parsed reviewer false-positive entry.
@@ -196,6 +200,10 @@ func parseLesson(file, block string) Lesson {
 		Used:   intField(reUsed, block),
 		Misled: intField(reMisled, block),
 		Avoid:  firstGroup(reAvoid, block),
+		What:   firstGroup(reWhat, block),
+	}
+	for _, m := range reAlsoTx.FindAllStringSubmatch(block, -1) {
+		l.Also = append(l.Also, strings.TrimSpace(m[1]))
 	}
 	l.Date = reDate.FindString(tag)
 	l.Last = l.Date

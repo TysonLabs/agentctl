@@ -175,3 +175,78 @@ func TestOriginRepoName(t *testing.T) {
 		}
 	}
 }
+
+func TestLessonsWriteCommands(t *testing.T) {
+	dir := lessonsFixture(t)
+	t.Setenv("AGENTFLOW_LESSONS_DIR", dir)
+	inbox := filepath.Join(dir, "Inbox.md")
+	if err := os.WriteFile(inbox, []byte("# Inbox\n\nNext free id: l2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	add := []string{"lessons", "add", "--repo", "alpha", "--ref", "#5", "--topics", "concurrency", "--date", "2026-07-01",
+		"--title", "Hold the lock across the check and the write", "--what", "w", "--why", "y", "--avoid", "take the lock first"}
+	code, out, errOut := run(t, append(add, "--if-no-duplicate")...)
+	var res struct {
+		ID         string
+		Written    bool
+		Duplicates []struct{ ID string }
+	}
+	if code != 3 || json.Unmarshal([]byte(out), &res) != nil || res.Written || len(res.Duplicates) != 1 || res.Duplicates[0].ID != "l1" {
+		t.Fatalf("duplicate: exit %d\n%s\n%s", code, out, errOut)
+	}
+	if got, _ := os.ReadFile(inbox); string(got) != "# Inbox\n\nNext free id: l2\n" {
+		t.Fatalf("exit 3 must write nothing:\n%s", got)
+	}
+	if code, out, errOut = run(t, add...); code != 0 || json.Unmarshal([]byte(out), &res) != nil || res.ID != "l2" || !res.Written {
+		t.Fatalf("add: exit %d\n%s\n%s", code, out, errOut)
+	}
+	// seen: the id may come after the flags.
+	code, out, errOut = run(t, "lessons", "seen", "--note", "again", "--repo", "beta", "--ref", "#6", "--date", "2026-07-02", "l2")
+	if code != 0 || !strings.Contains(out, `"to": 1`) {
+		t.Fatalf("seen: exit %d\n%s\n%s", code, out, errOut)
+	}
+	if code, _, errOut = run(t, "lessons", "seen", "l404", "--note", "n", "--repo", "r", "--ref", "x"); code != 2 {
+		t.Errorf("seen missing: exit %d %s", code, errOut)
+	}
+	if code, _, errOut = run(t, "lessons", "seen", "--note", "n", "--repo", "r", "--ref", "x"); code != 1 || !strings.Contains(errOut, "exactly one") {
+		t.Errorf("seen no id: exit %d %s", code, errOut)
+	}
+	// search: terms before and after flags.
+	code, out, _ = run(t, "lessons", "search", "lock", "--limit", "1", "check")
+	if code != 0 || !strings.Contains(out, `"query": "lock check"`) || strings.Count(out, `"id"`) != 1 {
+		t.Errorf("search: exit %d\n%s", code, out)
+	}
+	if code, out, _ = run(t, "lessons", "search", "zebra"); code != 0 || !strings.Contains(out, `"results": []`) {
+		t.Errorf("search none: exit %d\n%s", code, out)
+	}
+	// triage: list, then apply a plan that merges l2 into l1.
+	code, out, _ = run(t, "lessons", "triage")
+	if code != 0 || !strings.Contains(out, `"suggested_file": "Concurrency.md"`) || !strings.Contains(out, `"id": "l2"`) {
+		t.Errorf("triage: exit %d\n%s", code, out)
+	}
+	plan := filepath.Join(t.TempDir(), "plan.json")
+	write := func(s string) {
+		if err := os.WriteFile(plan, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(`[{"id":"l2","action":"merge","target":"l1","nope":1}]`)
+	if code, _, errOut = run(t, "lessons", "triage", "--apply", plan); code != 1 || !strings.Contains(errOut, "nope") {
+		t.Errorf("unknown plan field: exit %d %s", code, errOut)
+	}
+	write(`[{"id":"l404","action":"move","file":"Concurrency.md"}]`)
+	if code, _, _ = run(t, "lessons", "triage", "--apply", plan); code != 2 {
+		t.Errorf("plan missing id: exit %d", code)
+	}
+	write(`[{"id":"l2","action":"merge","target":"l1"}]`)
+	if code, out, errOut = run(t, "lessons", "triage", "--apply", plan); code != 0 {
+		t.Fatalf("apply: exit %d\n%s\n%s", code, out, errOut)
+	}
+	if got, _ := os.ReadFile(inbox); string(got) != "# Inbox\n\nNext free id: l3\n\n" {
+		t.Errorf("inbox after triage: %q", got)
+	}
+	conc, _ := os.ReadFile(filepath.Join(dir, "Concurrency.md"))
+	if !strings.Contains(string(conc), "- **Also seen:** 2026-07-01, alpha (#5): Hold the lock across the check and the write\n- **Used:** 4\n") {
+		t.Errorf("merge target:\n%s", conc)
+	}
+}
