@@ -23,7 +23,7 @@ func TestPROpenUsageErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	big := filepath.Join(dir, "big.md")
-	if err := os.WriteFile(big, bytes.Repeat([]byte("x"), pr.MaxBodyRunes+1), 0o644); err != nil {
+	if err := os.WriteFile(big, bytes.Repeat([]byte("x"), pr.MaxPRBodyRunes+1), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cases := []struct {
