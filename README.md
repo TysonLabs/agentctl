@@ -679,6 +679,52 @@ A missing folder, a folder with no lessons and an unknown topic are errors, neve
 empty section. Exit codes: 0 ok · 1 usage or precondition · 2 an id was not found
 (nothing written) · 3 `add --if-no-duplicate` found a candidate (nothing written).
 
+### `agentflow redcheck`: prove a fix's new test fails without the fix
+
+```sh
+agentflow redcheck --test 'go test ./internal/x/ -run TestNew' --commit HEAD
+agentflow redcheck --test 'cargo nextest run -p mycrate -E "test(new_case)"' --base origin/main \
+  --clone-target target
+agentflow redcheck --test 'pytest tests/test_x.py' --uncommitted --keep 'fixtures/**'
+```
+
+Auditing a fix includes checking that its test fails without it. Done by hand
+(`git stash push -- src && run && git stash pop`), that can leave the tree dirty, stash
+the test as well, or rebuild a shared build directory. `redcheck` never writes your
+checkout. It builds the change's "after" state (the commit; `HEAD`; or `HEAD` plus
+staged, unstaged and untracked changes, snapshotted through a temporary index) in a
+temporary detached worktree. There it reverts the changed source files to the "before"
+state (the parent; the merge base; `HEAD`), keeps the test files (and `--keep` files) at
+"after", and runs `--test` with `/bin/sh -c` at the worktree root, stdin `/dev/null`. It
+must fail: **red**. Then it restores the source and runs `--test` again; it must pass:
+**green** (`--no-green` skips this). Each run has a `--timeout` (20m) that kills the whole
+process group, its output goes to `red.log` / `green.log`, and the worktree is removed
+on every exit path, including errors and interrupts.
+
+- **Test files:** `*_test.go`, `test_*.py`, `*_test.py`, `conftest.py`,
+  `*.test.{js,jsx,ts,tsx}`, `*.spec.{js,jsx,ts,tsx}`, and anything under a `tests/`,
+  `test/`, `__tests__/`, `spec/` or `testdata/` directory, plus `--test-paths`. A pattern
+  without `/` matches the base name; with `/`, the repo-relative path (`**` is any number
+  of directories).
+- **Tests inside source files:** if a reverted source file's own diff adds or changes test
+  code (Rust `#[test]`/`#[cfg(test)]`, Python `def test_`, JS `test(`/`it(`), reverting it
+  would revert the test, so the result is **inconclusive** with the file list. Move the test
+  to its own file, or `--keep` the file. A Rust file whose inline `#[cfg(test)]` module
+  at the end of the file changed is instead **spliced**: before's code plus after's test
+  module (`--no-splice` turns that off).
+- **Build caches:** the environment passes through. For Rust, set `CARGO_TARGET_DIR` to a
+  separate directory, or pass `--clone-target target` to copy-on-write clone it into the
+  worktree (`cp -c` on macOS, `cp --reflink=always` on Linux; skipped with a note when
+  that is not possible, never a full copy).
+- A red result from a build error (the test calls a function the fix added) still counts as
+  red; read `red.log` when that matters. Exit 126/127 (command not found) is an error, not red.
+
+JSON on stdout and in `<out>/result.json`: `status`, `red` and `green` (`exit`, `secs`,
+`log`), `reverted`, `spliced`, `kept_tests`, `kept`, `test_in_source`, `before`, `after`,
+`notes`, `next`. Exit codes: 0 red (and green) · 1 usage, precondition or git error ·
+2 not red (the test passes without the fix) · 3 inconclusive · 4 green failed (the test
+fails with the fix too) · 124 timeout · 130 interrupted.
+
 ## agentcfg (companion binary): edit the registry, keep tokens in the Keychain
 
 ```sh
