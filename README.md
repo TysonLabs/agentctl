@@ -838,6 +838,49 @@ JSON on stdout and in `<out>/result.json`: `status`, `red` and `green` (`exit`, 
 2 not red (the test passes without the fix) · 3 inconclusive · 4 green failed (the test
 fails with the fix too) · 124 timeout · 130 interrupted.
 
+### `agentflow lock run` / `status`: serialize heavy jobs across parallel agents
+
+```sh
+agentflow lock run --name cargo -- cargo build --release   # waits for the lock, then runs
+agentflow lock run --name cargo --wait 20m -- make test     # exit 75 if not free in 20 min
+agentflow lock status                                       # every lock, held or not (JSON)
+```
+
+Parallel agents on one machine tend to share a build with a hand-rolled lock:
+`until mkdir "$L"; do sleep 10; done; trap 'rmdir $L' EXIT; cargo ...`. That lock leaks
+when the shell is SIGKILLed, says nothing about who holds it, and polls. `lock run`
+takes an exclusive `flock(2)` on a named lock instead, runs the command, and releases
+the lock when the command exits. The kernel releases a flock when its process dies,
+even on SIGKILL, so the lock cannot leak.
+
+- **The command** runs directly, with no shell (pass `sh -c '...'` for one), in
+  `--dir` (default: the current directory). Its stdout, stderr and exit code are
+  passed through (128+signal if a signal killed it). stdin is passed through as well,
+  so `lock run` is transparent, except a terminal: the command runs in its own process
+  group, where a terminal read would stop it, so it gets `/dev/null`.
+- **Signals:** SIGINT, SIGTERM, SIGHUP and SIGQUIT go to the command's whole process
+  group. A SIGKILLed `agentflow` cannot forward anything, so its command may outlive
+  the lock: kill the process group instead. Processes that the command leaves behind
+  after a normal exit (a build server, say) are left alone.
+- **Waiting** is a blocking flock, not a retry loop. One stderr line names the holder
+  (pid, whether it is alive, since, dir, command), and another appears only if the
+  holder changes. `--wait DUR` gives up after DUR with exit 75 and does not run the
+  command; `--wait 0` tries once. By default it waits as long as the holder runs,
+  as the shell loops it replaces did.
+- **`status`** prints `{"locks":[...]}`: every lock that has a file in the temp dir (or
+  only `--name N`), each with `held` (a non-blocking flock test), the holder record
+  and `holder_alive`. A holder record on a lock that is not held is stale.
+
+The convention is shared by every agentflow command that takes a named lock (package
+`internal/flow/namedlock`): the lock is `$TMPDIR/agentflow-lock-<name>.lock`, and while
+it is held, `$TMPDIR/agentflow-lock-<name>.json` holds
+`{"pid":…,"cmd":…,"dir":…,"since":"<RFC3339>"}`. The record is advisory; `held`
+always comes from the flock. A name is 1-64 characters from `A-Z a-z 0-9 . _ -`.
+
+Exit codes: `run`: the command's own · 1 usage · 75 lock not acquired within `--wait` ·
+126 command could not start · 127 command not found · 130 interrupted while waiting.
+`status`: 0 ok · 1 usage or error.
+
 ## agentcfg (companion binary): edit the registry, keep tokens in the Keychain
 
 ```sh

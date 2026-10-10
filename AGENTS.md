@@ -17,7 +17,9 @@ background and keep working; your harness tells you when it exits. Never wait in
    `agentflow worktree new --scratch` and remove it with `agentflow worktree done
    <path>`. Keep the diff to what was asked.
 3. **Run targeted checks while editing:** the tests and linters for what you touched,
-   not the whole suite.
+   not the whole suite. If other agents build on the same machine, wrap heavy
+   builds and test runs in `agentflow lock run --name <name> -- <command>`, never a
+   `mkdir`/`sleep` loop: it waits without polling, names the holder, and cannot leak.
 4. **Review with a different agent from the one that wrote the code:** if Claude wrote
    it, `agentflow codex --base main --prompt-file brief.md --write --protocol fix`
    (fix mode); if Codex or another agent wrote it, `agentflow claude` with the same
