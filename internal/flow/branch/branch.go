@@ -44,10 +44,18 @@ func (e *gitError) Error() string {
 // run runs git in dir with a pinned, non-interactive environment: C locale
 // (stable messages), no terminal or editor prompts, verbatim path names.
 func (e Env) run(ctx context.Context, dir string, args ...string) (string, error) {
+	return e.runWith(ctx, dir, nil, "", args...)
+}
+
+func (e Env) runWith(ctx context.Context, dir string, extraEnv []string, input string, args ...string) (string, error) {
 	full := append([]string{"-c", "core.quotePath=false"}, args...)
 	cmd := exec.CommandContext(ctx, e.git(), full...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C", "GIT_TERMINAL_PROMPT=0", "GIT_EDITOR=true", "GIT_MERGE_AUTOEDIT=no")
+	cmd.Env = append(cmd.Env, extraEnv...)
+	if input != "" {
+		cmd.Stdin = strings.NewReader(input)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
@@ -267,7 +275,7 @@ func Refusals(ctx context.Context, env Env, dir string, r Report, b Base) ([]str
 			refusals = append(refusals, s.what)
 		}
 	}
-	out, err := env.run(ctx, dir, "status", "--porcelain=v1", "-z", "--untracked-files=no", "--no-renames", "--ignore-submodules=none")
+	out, err := trackedStatus(ctx, env, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -281,6 +289,89 @@ func Refusals(ctx context.Context, env Env, dir string, r Report, b Base) ([]str
 		refusals = append(refusals, fmt.Sprintf("%d tracked file(s) have uncommitted changes, e.g. %s: commit or stash them first", len(dirty), dirty[0]))
 	}
 	return refusals, nil
+}
+
+// trackedStatus includes edits hidden by assume-unchanged or skip-worktree.
+// It clears those bits only in a temporary copy of the index, so the refusal
+// check does not disturb sparse-checkout state or other index metadata.
+func trackedStatus(ctx context.Context, env Env, dir string) (string, error) {
+	flags, err := env.run(ctx, dir, "ls-files", "-v", "-z")
+	if err != nil {
+		return "", err
+	}
+	var clearBoth, clearAssume []string
+	for _, entry := range strings.Split(flags, "\x00") {
+		if entry == "" {
+			continue
+		}
+		if len(entry) < 3 || entry[1] != ' ' {
+			return "", fmt.Errorf("git ls-files -v: unexpected output %q", entry)
+		}
+		tag, path := entry[0], entry[2:]
+		assumeUnchanged := tag >= 'a' && tag <= 'z'
+		skipWorktree := tag == 'S' || tag == 's'
+		if skipWorktree {
+			_, statErr := os.Lstat(filepath.Join(dir, filepath.FromSlash(path)))
+			switch {
+			case statErr == nil:
+				clearBoth = append(clearBoth, path)
+				continue
+			case !errors.Is(statErr, os.ErrNotExist):
+				return "", statErr
+			}
+		}
+		if assumeUnchanged {
+			clearAssume = append(clearAssume, path)
+		}
+	}
+	statusArgs := []string{"status", "--porcelain=v1", "-z", "--untracked-files=no", "--no-renames", "--ignore-submodules=none"}
+	if len(clearBoth) == 0 && len(clearAssume) == 0 {
+		return env.run(ctx, dir, statusArgs...)
+	}
+	indexPath, err := env.run(ctx, dir, "rev-parse", "--git-path", "index")
+	if err != nil {
+		return "", err
+	}
+	indexPath = strings.TrimSpace(indexPath)
+	if !filepath.IsAbs(indexPath) {
+		indexPath = filepath.Join(dir, indexPath)
+	}
+	index, err := os.ReadFile(indexPath)
+	if err != nil {
+		return "", err
+	}
+	// Keep the copy beside the real index: split-index files resolve their
+	// shared index relative to this directory.
+	tmp, err := os.CreateTemp(filepath.Dir(indexPath), ".agentflow-branch-index-*")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(index); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	extraEnv := []string{"GIT_INDEX_FILE=" + tmpPath}
+	clear := func(paths []string, args ...string) error {
+		if len(paths) == 0 {
+			return nil
+		}
+		input := strings.Join(paths, "\x00") + "\x00"
+		_, err := env.runWith(ctx, dir, extraEnv, input, args...)
+		return err
+	}
+	if err := clear(clearBoth, "update-index", "--no-skip-worktree", "-z", "--stdin"); err != nil {
+		return "", err
+	}
+	clearAssume = append(clearAssume, clearBoth...)
+	if err := clear(clearAssume, "update-index", "--no-assume-unchanged", "-z", "--stdin"); err != nil {
+		return "", err
+	}
+	return env.runWith(ctx, dir, extraEnv, "", statusArgs...)
 }
 
 func gitPathExists(ctx context.Context, env Env, dir, name string) (bool, error) {
@@ -322,9 +413,10 @@ var conflictKinds = map[string]string{
 type Outcome int
 
 const (
-	Merged    Outcome = iota // a merge commit or a fast-forward landed
-	Stopped                  // the merge stopped with conflicts or before committing
-	Overwrite                // git refused: the merge would overwrite untracked files
+	Merged         Outcome = iota // a merge commit or a fast-forward landed
+	Stopped                       // the merge stopped with conflicts or before committing
+	Overwrite                     // git refused: the merge would overwrite untracked files
+	TrackedChanges                // git refused: tracked work changed after the preflight
 )
 
 // MergeResult describes a merge attempt.
@@ -372,7 +464,10 @@ func Merge(ctx context.Context, env Env, dir string, r Report, b Base, abortOnSt
 		if head != r.Head {
 			return MergeResult{}, fmt.Errorf("git merge failed and HEAD moved from %s to %s: %s", short(r.Head), short(head), gitOut)
 		}
-		if strings.Contains(gitOut, "would be overwritten by merge") {
+		if strings.Contains(gitOut, "Your local changes to the following files would be overwritten by merge:") {
+			return MergeResult{Outcome: TrackedChanges, GitOutput: gitOut}, nil
+		}
+		if strings.Contains(gitOut, "untracked working tree files would be overwritten by merge:") {
 			return MergeResult{Outcome: Overwrite, GitOutput: gitOut}, nil
 		}
 		return MergeResult{}, err

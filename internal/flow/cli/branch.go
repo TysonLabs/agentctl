@@ -101,6 +101,9 @@ func runBranch(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		dir, _ = os.Getwd()
 	}
 	if !gitWorkTree(ctx, dir) {
+		if ctx.Err() != nil {
+			return fail(branchExitCodes.interrupted, "interrupted: %v", ctx.Err())
+		}
 		return fail(branchExitCodes.usage, "%s is not inside a git checkout (use --dir)", dir)
 	}
 	gitFail := func(err error) int {
@@ -131,7 +134,7 @@ func runBranch(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	switch {
 	case !merge && !rep.UpToDate:
 		res.Next = "agentflow branch sync --merge to merge the " + strconv.Itoa(rep.Behind) + " incoming commit(s)"
-	case merge && !rep.UpToDate:
+	case merge:
 		code = branchMerge(ctx, env, dir, b, &res, abortStop, stderr)
 		if code == -1 {
 			return branchExitCodes.gitErr
@@ -147,8 +150,16 @@ func runBranch(ctx context.Context, args []string, stdout, stderr io.Writer) int
 func branchMerge(ctx context.Context, env branch.Env, dir string, b branch.Base, res *branchResult, abortStop bool, stderr io.Writer) int {
 	refusals, err := branch.Refusals(ctx, env, dir, res.Report, b)
 	if err != nil {
+		if ctx.Err() != nil {
+			fmt.Fprintf(stderr, "agentflow branch sync: interrupted: %v\n", err)
+			return branchExitCodes.interrupted
+		}
 		fmt.Fprintf(stderr, "agentflow branch sync: %v\n", err)
 		return -1
+	}
+	if ctx.Err() != nil {
+		fmt.Fprintln(stderr, "agentflow branch sync: interrupted before the merge started")
+		return branchExitCodes.interrupted
 	}
 	if len(refusals) > 0 {
 		res.Refusals = refusals
@@ -158,20 +169,32 @@ func branchMerge(ctx context.Context, env branch.Env, dir string, b branch.Base,
 		}
 		return branchExitCodes.refused
 	}
-	if ctx.Err() != nil {
-		fmt.Fprintln(stderr, "agentflow branch sync: interrupted before the merge started")
-		return branchExitCodes.interrupted
+	if res.UpToDate {
+		return branchExitCodes.ok
 	}
 	// Not cancellable: killing git mid-merge leaves index.lock and a half state.
 	m, err := branch.Merge(context.WithoutCancel(ctx), env, dir, res.Report, b, abortStop)
 	if err != nil {
+		if ctx.Err() != nil {
+			fmt.Fprintf(stderr, "agentflow branch sync: interrupted after git merge finished: %v\n", err)
+			return branchExitCodes.interrupted
+		}
 		fmt.Fprintf(stderr, "agentflow branch sync: %v\n", err)
 		return -1
 	}
 	res.Merge = &m
+	if ctx.Err() != nil {
+		fmt.Fprintln(stderr, "agentflow branch sync: interrupted after git merge finished; the merge result is reported")
+		return branchExitCodes.interrupted
+	}
 	switch m.Outcome {
 	case branch.Merged:
 		return branchExitCodes.ok
+	case branch.TrackedChanges:
+		res.Refusals = []string{"tracked files changed after the preflight check (git stopped before changing anything): commit or stash them first"}
+		res.Next = "commit or stash the tracked files git names in git_output, then rerun agentflow branch sync --merge"
+		fmt.Fprintf(stderr, "agentflow branch sync: refused: %s\n", res.Refusals[0])
+		return branchExitCodes.refused
 	case branch.Overwrite:
 		res.Refusals = []string{"the merge would overwrite untracked files (git stopped before changing anything): move them aside first"}
 		res.Next = "move or delete the untracked files git names in git_output, then rerun agentflow branch sync --merge"

@@ -598,7 +598,7 @@ safety refusal.
 ```sh
 agentflow branch sync                         # report only: ahead, behind, incoming, overlap
 agentflow branch sync --merge                 # merge the default branch in
-agentflow branch sync --merge --abort-on-conflict   # just learn whether it conflicts
+agentflow branch sync --merge --abort-on-conflict   # abort and report if it conflicts
 agentflow branch sync --base origin/release/2.1     # another base
 ```
 

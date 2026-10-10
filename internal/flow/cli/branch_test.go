@@ -1,12 +1,19 @@
 package cli
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+
+	"github.com/TysonLabs/agentctl/internal/flow/branch"
 )
 
 // syncFixture is a bare origin, a "seed" clone that plays the other
@@ -158,7 +165,7 @@ func TestBranchSyncCleanMerge(t *testing.T) {
 	f := newSyncFixture(t, "main")
 	ours := f.commit(f.repo, "ours", map[string]string{"b.txt": "b\n"})
 	theirs := f.upstream("theirs", map[string]string{"c.txt": "c\n"})
-	code, res, errOut := f.sync("--merge")
+	code, res, errOut := f.sync("--merge", "--abort-on-conflict")
 	if code != 0 || res.Merge == nil {
 		t.Fatalf("exit %d: %s", code, errOut)
 	}
@@ -288,6 +295,63 @@ func TestBranchSyncRefusesDirtyTree(t *testing.T) {
 	}
 }
 
+func TestBranchSyncRefusesDirtyTreeWhenUpToDate(t *testing.T) {
+	f := newSyncFixture(t, "main")
+	writeFile(t, f.repo, "a.txt", "local edit\n")
+	head := cliGit(t, f.repo, "rev-parse", "HEAD")
+
+	code, res, errOut := f.sync("--merge")
+	if code != 2 || len(res.Refusals) != 1 || !strings.Contains(res.Refusals[0], "a.txt") || res.Merge != nil {
+		t.Fatalf("exit %d refusals %q merge %+v: %s", code, res.Refusals, res.Merge, errOut)
+	}
+	if !res.UpToDate || res.Behind != 0 {
+		t.Errorf("report should still be up to date: %+v", res.Report)
+	}
+	if b, _ := os.ReadFile(filepath.Join(f.repo, "a.txt")); string(b) != "local edit\n" || cliGit(t, f.repo, "rev-parse", "HEAD") != head {
+		t.Error("refused merge changed the tree")
+	}
+}
+
+func TestBranchSyncRefusesSkipWorktreeTrackedChange(t *testing.T) {
+	f := newSyncFixture(t, "main")
+	f.upstream("theirs", map[string]string{"a.txt": "upstream\n"})
+	writeFile(t, f.repo, "a.txt", "local hidden edit\n")
+	cliGit(t, f.repo, "update-index", "--skip-worktree", "a.txt")
+	if got := cliGit(t, f.repo, "status", "--porcelain=v1", "--untracked-files=no"); got != "" {
+		t.Fatalf("fixture edit is not hidden from status: %q", got)
+	}
+	head := cliGit(t, f.repo, "rev-parse", "HEAD")
+
+	code, res, errOut := f.sync("--merge")
+	if code != 2 || len(res.Refusals) != 1 || !strings.Contains(res.Refusals[0], "a.txt") || res.Merge != nil {
+		t.Fatalf("exit %d refusals %q merge %+v: %s", code, res.Refusals, res.Merge, errOut)
+	}
+	if b, _ := os.ReadFile(filepath.Join(f.repo, "a.txt")); string(b) != "local hidden edit\n" || cliGit(t, f.repo, "rev-parse", "HEAD") != head {
+		t.Error("refused merge changed the hidden tracked edit")
+	}
+	if got := cliGit(t, f.repo, "ls-files", "-v", "a.txt"); got != "S a.txt" {
+		t.Errorf("refusal changed skip-worktree state: %q", got)
+	}
+}
+
+func TestBranchSyncMergeClassifiesLateTrackedChange(t *testing.T) {
+	f := newSyncFixture(t, "main")
+	f.upstream("theirs", map[string]string{"a.txt": "upstream\n"})
+	code, report, errOut := f.sync()
+	if code != 0 {
+		t.Fatalf("report exit %d: %s", code, errOut)
+	}
+	writeFile(t, f.repo, "a.txt", "late local edit\n")
+
+	result, err := branch.Merge(context.Background(), branch.Env{}, f.repo, report.Report, branch.Base{Remote: "origin", Branch: "main"}, false)
+	if err != nil || result.Outcome != branch.TrackedChanges || !strings.Contains(result.GitOutput, "a.txt") {
+		t.Fatalf("outcome %v error %v output %q, want tracked-change refusal", result.Outcome, err, result.GitOutput)
+	}
+	if b, _ := os.ReadFile(filepath.Join(f.repo, "a.txt")); string(b) != "late local edit\n" {
+		t.Errorf("late tracked edit changed: %q", b)
+	}
+}
+
 func TestBranchSyncRefusesOnBaseAndDetached(t *testing.T) {
 	f := newSyncFixture(t, "main")
 	f.upstream("theirs", map[string]string{"c.txt": "c\n"})
@@ -374,5 +438,71 @@ func TestBranchSyncUsageErrors(t *testing.T) {
 	}
 	if code, out, _ := run(t, "branch", "--help"); code != 0 || !strings.Contains(out, "never rebases") {
 		t.Errorf("help: exit %d", code)
+	}
+}
+
+func TestBranchSyncInterruptedDuringCheckoutCheck(t *testing.T) {
+	f := newSyncFixture(t, "main")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout, stderr bytes.Buffer
+
+	code := runBranch(ctx, []string{"sync", "--dir", f.repo}, &stdout, &stderr)
+	if code != 130 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "interrupted") {
+		t.Fatalf("exit %d stdout %q stderr %q, want interruption", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestBranchSyncInterruptedDuringRefusalChecks(t *testing.T) {
+	f := newSyncFixture(t, "main")
+	f.upstream("theirs", map[string]string{"c.txt": "c\n"})
+	code, report, errOut := f.sync()
+	if code != 0 {
+		t.Fatalf("report exit %d: %s", code, errOut)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	res := branchResult{Report: report.Report}
+	var stderr bytes.Buffer
+
+	code = branchMerge(ctx, branch.Env{}, f.repo, branch.Base{Remote: "origin", Branch: "main"}, &res, false, &stderr)
+	if code != 130 || !strings.Contains(stderr.String(), "interrupted") {
+		t.Fatalf("exit %d stderr %q, want interruption", code, stderr.String())
+	}
+}
+
+func TestBranchSyncInterruptedDuringMergeWaitsForGit(t *testing.T) {
+	f := newSyncFixture(t, "main")
+	theirs := f.upstream("theirs", map[string]string{"c.txt": "c\n"})
+	wrapper := filepath.Join(f.root, "git-wrapper")
+	script := `#!/bin/sh
+for arg in "$@"; do
+	if [ "$arg" = merge ]; then
+		kill -USR1 "$AGENTFLOW_TEST_PID"
+		sleep 0.1
+		break
+	fi
+done
+exec git "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENTFLOW_GIT", wrapper)
+	t.Setenv("AGENTFLOW_TEST_PID", strconv.Itoa(os.Getpid()))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGUSR1)
+	defer stop()
+	var stdout, stderr bytes.Buffer
+
+	code := runBranch(ctx, []string{"sync", "--dir", f.repo, "--merge"}, &stdout, &stderr)
+	var res branchResult
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		t.Fatalf("bad JSON %q: %v", stdout.String(), err)
+	}
+	if code != 130 || ctx.Err() == nil || res.Merge == nil || res.Merge.Commit != theirs || !res.Merge.FastForward {
+		t.Fatalf("exit %d canceled %v merge %+v stderr %q", code, ctx.Err(), res.Merge, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "interrupted") || f.mergeInProgress() {
+		t.Errorf("stderr %q merge-in-progress %v", stderr.String(), f.mergeInProgress())
 	}
 }
