@@ -48,8 +48,9 @@ Usage:
   agentflow worktree done <branch|path>        remove a merged, clean, unused worktree
   agentflow worktree sweep [--yes]             list (or remove) every such worktree
                                                (see: agentflow worktree --help)
-  agentflow lessons brief|bump|retire|stats    code-review lessons: brief section, counters,
-                                               retirement (see: agentflow lessons --help)
+  agentflow lessons <subcommand>               code-review lessons: brief, bump, add, seen,
+                                               search, triage, retire, stats
+                                               (see: agentflow lessons --help)
   agentflow version                           print agentflow's own version
 
 codex and claude flags:
