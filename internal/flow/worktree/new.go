@@ -118,15 +118,16 @@ func New(ctx context.Context, env Env, repoDir string, opt NewOptions) (Created,
 		return c, &RefusedError{refusals}
 	}
 
-	// The base must be fresh: fetch before resolving anything.
-	target, targetErr := DefaultTarget(ctx, env, main.Path, "")
+	// The base must be fresh: fetch before resolving anything, including
+	// origin/HEAD. DefaultTarget derives its answer from that fetched state.
 	remote := "origin"
-	if targetErr == nil {
-		remote = target.Remote
-	}
-	if _, err := run(ctx, main.Path, env.Git, "fetch", "--quiet", remote); err != nil {
+	// Fetch all heads explicitly: a single-branch clone's configured refspec
+	// would otherwise hide an existing origin/<new-branch> from the refusal.
+	refspec := "+refs/heads/*:refs/remotes/" + remote + "/*"
+	if _, err := run(ctx, main.Path, env.Git, "fetch", "--quiet", remote, refspec); err != nil {
 		return c, fmt.Errorf("fetch %s: %w", remote, err)
 	}
+	target, targetErr := DefaultTarget(ctx, env, main.Path, "")
 	c.Base = opt.From
 	if c.Base == "" {
 		if targetErr != nil {
@@ -168,24 +169,30 @@ func New(ctx context.Context, env Env, repoDir string, opt NewOptions) (Created,
 	if len(refusals) > 0 {
 		return c, &RefusedError{refusals}
 	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return c, err
+	if err := parentResolvesWithin(main.Path, c.Path); err != nil {
+		return c, &RefusedError{[]string{fmt.Sprintf("path %s resolves outside the main checkout: %v", c.Path, err)}}
 	}
 
 	if opt.Scratch {
-		// Locked at creation, so no other session's sweep can treat the new
-		// tree as an ordinary removable one before the marker exists.
-		reason := scratchLockPrefix + " created " + opt.Now.UTC().Format(time.RFC3339) + "; remove with: agentflow worktree done " + c.Path
-		if _, err := run(ctx, main.Path, env.Git, "worktree", "add", "--quiet", "--detach", "--lock", "--reason", reason, c.Path, sha); err != nil {
+		id, err := randomHex(16)
+		if err != nil {
 			return c, err
 		}
-		if err := writeScratchMarker(ctx, env, main.Path, c.Path, ScratchMarker{
-			Created: opt.Now.UTC(), PID: os.Getpid(), PPID: os.Getppid(), Base: c.Base, BaseSHA: sha,
-		}); err != nil {
-			// The tree was made a moment ago by this call and holds nothing.
-			_, rmErr := run(ctx, main.Path, env.Git, "worktree", "remove", "--force", "--force", c.Path)
-			if rmErr != nil {
-				return c, fmt.Errorf("write scratch marker: %v; and the unmarked worktree %s could not be removed: %v", err, c.Path, rmErr)
+		marker := ScratchMarker{
+			ID: id, Created: opt.Now.UTC(), PID: os.Getpid(), PPID: os.Getppid(), Base: c.Base, BaseSHA: sha,
+		}
+		// Locked at creation, so no other session's sweep can treat the new
+		// tree as an ordinary removable one before the marker exists.
+		reason := scratchLockReason(c.Path, marker)
+		if _, err := run(ctx, main.Path, env.Git, "worktree", "add", "--quiet", "--detach", "--lock", "--reason", reason, c.Path, sha); err != nil {
+			if cleanupErr := discardFresh(ctx, env, main.Path, c.Path, "", sha, reason); cleanupErr != nil {
+				return c, fmt.Errorf("%v; cleanup: %w", err, cleanupErr)
+			}
+			return c, err
+		}
+		if err := scratchMarkerWriter(ctx, env, main.Path, c.Path, marker); err != nil {
+			if cleanupErr := discardFresh(ctx, env, main.Path, c.Path, "", sha, reason); cleanupErr != nil {
+				return c, fmt.Errorf("write scratch marker: %v; cleanup: %w", err, cleanupErr)
 			}
 			return c, fmt.Errorf("write scratch marker: %w", err)
 		}
@@ -193,6 +200,9 @@ func New(ctx context.Context, env Env, repoDir string, opt NewOptions) (Created,
 		// --no-track: the base is usually origin/main, and an upstream of
 		// origin/main would make a bare `git push` target main.
 		if _, err := run(ctx, main.Path, env.Git, "worktree", "add", "--quiet", "--no-track", "-b", opt.Branch, c.Path, sha); err != nil {
+			if cleanupErr := discardFresh(ctx, env, main.Path, c.Path, opt.Branch, sha, ""); cleanupErr != nil {
+				return c, fmt.Errorf("%v; cleanup: %w", err, cleanupErr)
+			}
 			return c, err
 		}
 	}
@@ -211,6 +221,45 @@ func New(ctx context.Context, env Env, repoDir string, opt NewOptions) (Created,
 	return c, nil
 }
 
+// discardFresh undoes the worktree this call just created when a later
+// step failed (a failing checkout hook, a marker write). It never forces:
+// git's own remove refuses if anything modified or untracked appeared, and
+// then the tree is left in place and named in the error.
+func discardFresh(ctx context.Context, env Env, repoDir, path, branch, sha, ownLock string) error {
+	list, err := List(ctx, env, repoDir)
+	if err != nil {
+		return err
+	}
+	w, err := Find(list, repoDir, path)
+	if err != nil {
+		return nil // git registered nothing
+	}
+	if w.Locked && w.LockReason != ownLock {
+		return fmt.Errorf("%s is locked by someone else (%s); left in place", path, w.LockReason)
+	}
+	if contained, err := containedRefusals(ctx, env, path); err != nil {
+		return fmt.Errorf("%s left in place: %w", path, err)
+	} else if len(contained) > 0 {
+		return fmt.Errorf("%s left in place: %s", path, strings.Join(contained, "; "))
+	}
+	if w.Locked {
+		if _, err := run(ctx, repoDir, env.Git, "worktree", "unlock", path); err != nil {
+			return err
+		}
+	}
+	if _, err := run(ctx, repoDir, env.Git, "worktree", "remove", path); err != nil {
+		if w.Locked {
+			_, _ = run(ctx, repoDir, env.Git, "worktree", "lock", "--reason", ownLock, path)
+		}
+		return fmt.Errorf("%s left in place: %v", path, err)
+	}
+	if branch != "" {
+		// Only while the branch still points where this call created it.
+		_, _ = run(ctx, repoDir, env.Git, "update-ref", "--no-deref", "-d", "refs/heads/"+branch, sha)
+	}
+	return nil
+}
+
 func exists(ctx context.Context, env Env, dir, ref string) bool {
 	_, err := run(ctx, dir, env.Git, "rev-parse", "--verify", "--quiet", "--end-of-options", ref)
 	return err == nil
@@ -227,16 +276,52 @@ func ignored(ctx context.Context, env Env, dir, path string) bool {
 
 func scratchPath(root string) (string, error) {
 	for range 8 {
-		b := make([]byte, 4)
-		if _, err := rand.Read(b); err != nil {
+		suffix, err := randomHex(4)
+		if err != nil {
 			return "", err
 		}
-		p := filepath.Join(root, "scratch-"+hex.EncodeToString(b))
+		p := filepath.Join(root, "scratch-"+suffix)
 		if _, err := os.Lstat(p); errors.Is(err, fs.ErrNotExist) {
 			return p, nil
 		}
 	}
 	return "", errors.New("could not pick an unused scratch directory name")
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// parentResolvesWithin refuses a destination whose deepest existing parent
+// escapes root through a symlink. It must run before git creates any path.
+func parentResolvesWithin(root, path string) error {
+	existing := filepath.Dir(path)
+	for {
+		if _, err := os.Lstat(existing); err == nil {
+			break
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return errors.New("no existing parent")
+		}
+		existing = parent
+	}
+	resolved, err := filepath.EvalSymlinks(existing)
+	if err != nil {
+		return err
+	}
+	root = canonical(root)
+	resolved = canonical(resolved)
+	if resolved != root && !pathWithin(root, resolved) {
+		return fmt.Errorf("parent %s resolves to %s", existing, resolved)
+	}
+	return nil
 }
 
 // validCloneDir accepts a plain relative directory inside the checkout.
@@ -292,19 +377,9 @@ func cloneDir(ctx context.Context, main, wt, d string) string {
 		return err.Error()
 	}
 	// A tracked symlink on the way would put the clone (or the directories
-	// made for it) outside the worktree: resolve the deepest existing parent
-	// before creating anything.
-	existing := filepath.Dir(dst)
-	for {
-		if _, err := os.Lstat(existing); err == nil {
-			break
-		}
-		existing = filepath.Dir(existing)
-	}
-	if parent, err := filepath.EvalSymlinks(existing); err != nil {
-		return err.Error()
-	} else if root := canonical(wt); parent != root && !pathWithin(root, parent) {
-		return "its parent directory resolves outside the new worktree; not cloned"
+	// made for it) outside the worktree.
+	if err := parentResolvesWithin(wt, dst); err != nil {
+		return "its parent directory resolves outside the new worktree; not cloned (" + err.Error() + ")"
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err.Error()

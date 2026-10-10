@@ -31,6 +31,7 @@ const (
 
 // ScratchMarker is the content of the marker file.
 type ScratchMarker struct {
+	ID      string    `json:"id"`
 	Created time.Time `json:"created"`
 	PID     int       `json:"pid"`
 	PPID    int       `json:"ppid"`
@@ -87,11 +88,34 @@ func writeScratchMarker(ctx context.Context, env Env, repoDir, path string, m Sc
 		return err
 	}
 	tmp := filepath.Join(dir, scratchMarkerFile+".tmp")
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(dir, scratchMarkerFile))
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	// Linking publishes without overwriting a marker another actor created.
+	if err := os.Link(tmp, filepath.Join(dir, scratchMarkerFile)); err != nil {
+		return err
+	}
+	_ = os.Remove(tmp) // the published marker is authoritative; the temp is not
+	removeTmp = false
+	return nil
 }
+
+// scratchMarkerWriter is replaceable by tests that exercise creation failure.
+var scratchMarkerWriter = writeScratchMarker
 
 // ReadScratch returns the scratch marker of w, nil if it has none, or an
 // error if a marker exists but cannot be read (callers must refuse then).
@@ -113,10 +137,23 @@ func ReadScratch(ctx context.Context, env Env, repoDir string, w Worktree) (*Scr
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, fmt.Errorf("unreadable scratch marker: %v", err)
 	}
-	if m.Created.IsZero() {
-		return nil, errors.New("scratch marker has no creation time")
+	if len(m.ID) != 32 || !isHexOIDPart(m.ID) || m.Created.IsZero() || m.PID <= 0 || m.PPID < 0 || m.Base == "" || !isHexOID(m.BaseSHA) {
+		return nil, errors.New("invalid scratch marker: missing or malformed identity, creation, process, or base fields")
 	}
 	return &m, nil
+}
+
+func isHexOIDPart(s string) bool {
+	for _, r := range s {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+			return false
+		}
+	}
+	return s != ""
+}
+
+func scratchLockReason(path string, m ScratchMarker) string {
+	return scratchLockPrefix + " " + m.ID + " created " + m.Created.UTC().Format(time.RFC3339) + "; remove with: agentflow worktree done " + path
 }
 
 // ScratchCheck is the verdict on removing one scratch worktree.
@@ -131,6 +168,7 @@ type ScratchCheck struct {
 	OK         bool     `json:"ok"`
 	Refusals   []string `json:"refusals,omitempty"`
 	Prunable   bool     `json:"prunable,omitempty"`
+	markerID   string
 }
 
 // InspectScratch decides whether w can be removed as a scratch worktree:
@@ -155,10 +193,11 @@ func InspectScratch(ctx context.Context, env Env, repoDir string, w Worktree, no
 		return c, nil
 	}
 	c.Scratch = true
+	c.markerID = m.ID
 	c.Created = m.Created.UTC().Format(time.RFC3339)
 	age := now.Sub(m.Created)
 	c.Age = age.Round(time.Minute).String()
-	if w.Locked && !strings.HasPrefix(w.LockReason, scratchLockPrefix) {
+	if w.Locked && w.LockReason != scratchLockReason(w.Path, *m) {
 		refuse("locked by someone else (%s)%s", w.LockReason, lockOwnerState(w.LockReason))
 	}
 	if minAge > 0 && age < minAge {
@@ -228,6 +267,9 @@ func RemoveScratch(ctx context.Context, env Env, repoDir string, c ScratchCheck,
 	}
 	if !fresh.OK {
 		return r, fmt.Errorf("%w: safety changed after inspection: %s", ErrRefused, strings.Join(fresh.Refusals, "; "))
+	}
+	if fresh.markerID != c.markerID {
+		return r, fmt.Errorf("%w: scratch worktree identity changed after inspection", ErrRefused)
 	}
 	r.DiscardedHead, r.DiscardedDirtyFiles = fresh.Head, fresh.DirtyFiles
 	if fresh.Prunable {

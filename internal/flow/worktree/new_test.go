@@ -70,6 +70,72 @@ func TestNewFetchesAndBranchesFromDerivedDefault(t *testing.T) {
 	}
 }
 
+func TestNewFetchesBeforeResolvingDerivedDefault(t *testing.T) {
+	f := newFixture(t)
+	log := filepath.Join(f.root, "git-order.log")
+	wrapper := filepath.Join(f.root, "git-order")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"" + log + "\"\n" +
+		"if [ \"$1\" = symbolic-ref ] && ! grep -q '^fetch ' \"" + log + "\"; then exit 97; fi\n" +
+		"exec git \"$@\"\n"
+	writeFile(t, f.root, "git-order", script)
+	if err := os.Chmod(wrapper, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.env.Git = wrapper
+	if _, err := f.newWT(NewOptions{Branch: "feat/order"}); err != nil {
+		t.Fatalf("New resolved the default branch before fetching: %v", err)
+	}
+}
+
+func TestNewRefusesSymlinkedWorktreeRootOutsideMainCheckout(t *testing.T) {
+	f := newFixture(t)
+	outside := filepath.Join(f.root, "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(f.repo, ".claude")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := f.newWT(NewOptions{Branch: "feat/escape"})
+	if !refusedWith(err, "outside the main checkout") {
+		t.Fatalf("symlinked worktree root: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "worktrees")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("New wrote through .claude symlink: %v", err)
+	}
+}
+
+func TestNewCleansWorktreeLeftByFailingCheckoutHook(t *testing.T) {
+	for _, scratch := range []bool{false, true} {
+		name := "branch"
+		if scratch {
+			name = "scratch"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			hook := filepath.Join(f.repo, ".git", "hooks", "post-checkout")
+			if err := os.WriteFile(hook, []byte("#!/bin/sh\nexit 23\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			opt := NewOptions{Scratch: scratch, Branch: "feat/hook-failure"}
+			c, err := f.newWT(opt)
+			if err == nil {
+				t.Fatal("New succeeded despite failing post-checkout hook")
+			}
+			if _, statErr := os.Stat(c.Path); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("failed add left worktree %s: %v", c.Path, statErr)
+			}
+			if !scratch && localHas(f, opt.Branch) {
+				t.Fatalf("failed add left branch %s", opt.Branch)
+			}
+			if strings.Contains(git(t, f.repo, "worktree", "list", "--porcelain"), c.Path) {
+				t.Fatalf("failed add left registered worktree %s", c.Path)
+			}
+		})
+	}
+}
+
 func TestNewFromExplicitBaseAndFromLinkedWorktree(t *testing.T) {
 	f := newFixture(t)
 	base := git(t, f.repo, "rev-parse", "HEAD")
@@ -93,6 +159,8 @@ func TestNewRefusesExistingBranchRemoteBranchAndPath(t *testing.T) {
 		t.Fatalf("existing local branch: %v", err)
 	}
 	git(t, f.seed, "push", "-q", "origin", "HEAD:refs/heads/feat/theirs")
+	git(t, f.repo, "config", "--replace-all", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
+	git(t, f.repo, "update-ref", "-d", "refs/remotes/origin/feat/theirs")
 	_, err = f.newWT(NewOptions{Branch: "feat/theirs"})
 	if !refusedWith(err, "origin/feat/theirs already exists") {
 		t.Fatalf("existing remote branch: %v", err)
@@ -291,6 +359,90 @@ func TestScratchRemovalRefusesUnmarkedWorktrees(t *testing.T) {
 	}
 }
 
+func TestScratchRefusesForeignLockWithAgentflowPrefix(t *testing.T) {
+	f := newFixture(t)
+	c := f.scratch()
+	git(t, f.repo, "worktree", "unlock", c.Path)
+	git(t, f.repo, "worktree", "lock", "--reason", scratchLockPrefix+" foreign session", c.Path)
+	sc, err := InspectScratch(context.Background(), f.env, f.repo, f.find(c.Path), time.Now(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc.OK || !strings.Contains(strings.Join(sc.Refusals, ";"), "locked by someone else") {
+		t.Fatalf("foreign prefix lock accepted: %+v", sc)
+	}
+}
+
+func TestScratchRemovalRefusesReplacementAtSamePath(t *testing.T) {
+	f := newFixture(t)
+	c := f.scratch()
+	old, err := InspectScratch(context.Background(), f.env, f.repo, f.find(c.Path), time.Now(), 0)
+	if err != nil || !old.OK {
+		t.Fatalf("initial inspect: %+v %v", old, err)
+	}
+	git(t, f.repo, "worktree", "remove", "--force", "--force", c.Path)
+	created := time.Now().Add(time.Minute).UTC()
+	marker := ScratchMarker{ID: strings.Repeat("b", 32), Created: created, PID: os.Getpid(), PPID: os.Getppid(), Base: c.Base, BaseSHA: c.BaseSHA}
+	reason := scratchLockReason(c.Path, marker)
+	git(t, f.repo, "worktree", "add", "--quiet", "--detach", "--lock", "--reason", reason, c.Path, c.BaseSHA)
+	if err := writeScratchMarker(context.Background(), f.env, f.repo, c.Path, marker); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RemoveScratch(context.Background(), f.env, f.repo, old, time.Now().Add(2*time.Minute), 0); !errors.Is(err, ErrRefused) {
+		t.Fatalf("replacement removal error = %v, want ErrRefused", err)
+	}
+	if _, err := os.Stat(c.Path); err != nil {
+		t.Fatalf("replacement scratch was removed: %v", err)
+	}
+}
+
+func TestScratchMarkerFailurePreservesConcurrentWork(t *testing.T) {
+	f := newFixture(t)
+	old := scratchMarkerWriter
+	scratchMarkerWriter = func(_ context.Context, _ Env, _, path string, _ ScratchMarker) error {
+		writeFile(t, path, "valuable.txt", "do not delete\n")
+		return errors.New("marker storage failed")
+	}
+	defer func() { scratchMarkerWriter = old }()
+	c, err := f.newWT(NewOptions{Scratch: true})
+	if err == nil {
+		t.Fatal("New succeeded despite marker failure")
+	}
+	if b, readErr := os.ReadFile(filepath.Join(c.Path, "valuable.txt")); readErr != nil || string(b) != "do not delete\n" {
+		t.Fatalf("concurrent work was deleted after marker failure: %q, %v", b, readErr)
+	}
+}
+
+func TestScratchMarkerWriteRefusesPreexistingTempSymlink(t *testing.T) {
+	f := newFixture(t)
+	c := f.scratch()
+	w := f.find(c.Path)
+	m, err := ReadScratch(context.Background(), f.env, f.repo, w)
+	if err != nil || m == nil {
+		t.Fatalf("read marker: %+v %v", m, err)
+	}
+	dir, err := adminDir(context.Background(), f.env, f.repo, c.Path)
+	if err != nil || dir == "" {
+		t.Fatalf("admin dir: %q %v", dir, err)
+	}
+	if err := os.Remove(filepath.Join(dir, scratchMarkerFile)); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(f.root, "outside-marker-target")
+	if err := os.WriteFile(outside, []byte("keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, scratchMarkerFile+".tmp")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeScratchMarker(context.Background(), f.env, f.repo, c.Path, *m); err == nil {
+		t.Fatal("marker writer followed a preexisting temporary symlink")
+	}
+	if b, err := os.ReadFile(outside); err != nil || string(b) != "keep\n" {
+		t.Fatalf("marker writer changed symlink target: %q, %v", b, err)
+	}
+}
+
 func TestScratchUnusedChecksStillApply(t *testing.T) {
 	f := newFixture(t)
 	c := f.scratch()
@@ -345,6 +497,11 @@ func TestScratchMinAgeAndUnreadableMarker(t *testing.T) {
 	sc, _ = InspectScratch(context.Background(), f.env, f.repo, w, created.Add(25*time.Hour), 0)
 	if sc.OK || !strings.Contains(strings.Join(sc.Refusals, ";"), "unreadable") {
 		t.Fatalf("bad marker: %+v", sc)
+	}
+	writeFile(t, dir, scratchMarkerFile, `{"created":"`+created.UTC().Format(time.RFC3339Nano)+`"}`)
+	sc, _ = InspectScratch(context.Background(), f.env, f.repo, w, created.Add(25*time.Hour), 0)
+	if sc.OK || !strings.Contains(strings.Join(sc.Refusals, ";"), "invalid scratch marker") {
+		t.Fatalf("incomplete marker: %+v", sc)
 	}
 }
 

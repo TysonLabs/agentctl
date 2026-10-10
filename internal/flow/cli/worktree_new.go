@@ -61,7 +61,7 @@ func runWorktreeNew(ctx context.Context, args []string, stdout, stderr io.Writer
 	if !scratch {
 		opt.Branch = pos[0]
 	}
-	env := worktree.Env{Git: os.Getenv("AGENTFLOW_GIT")}
+	env := worktree.Env{Git: os.Getenv("AGENTFLOW_GIT"), GH: os.Getenv("AGENTFLOW_GH"), Lsof: os.Getenv("AGENTFLOW_LSOF")}
 	c, err := worktree.New(ctx, env, repo, opt)
 	if err != nil {
 		var refused *worktree.RefusedError
