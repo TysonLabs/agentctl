@@ -593,6 +593,45 @@ JSON result, and exits 3. Exit codes: 0 removed (or would be, or sweep finished)
 1 usage · 2 refused · 3 git/gh error. A missing or incomplete `lsof` check is a
 safety refusal.
 
+### `agentflow branch sync`: catch up with the default branch, never by rebase
+
+```sh
+agentflow branch sync                         # report only: ahead, behind, incoming, overlap
+agentflow branch sync --merge                 # merge the default branch in
+agentflow branch sync --merge --abort-on-conflict   # just learn whether it conflicts
+agentflow branch sync --base origin/release/2.1     # another base
+```
+
+Before a PR, and whenever the default branch moves, agents hand-roll the same chain:
+find the merge base, list the incoming commits, intersect the two sides' changed files,
+merge, then list the conflicted paths. They also tend to hard-code `main`. `sync` does
+it in one call:
+
+- **Base:** `--base` (`REMOTE/BRANCH` or `BRANCH`, origin assumed), else origin's
+  default branch as the remote reports it (`git ls-remote --symref origin HEAD`), else
+  `refs/remotes/origin/HEAD`. A clone's `origin/HEAD` is set once and goes stale when the
+  default branch is renamed, so the remote's answer wins. Only the base branch is fetched.
+- **Report (always, read-only):** `branch`, `head`, `base`, `base_source`, `base_sha`,
+  `merge_base`, `ahead`, `behind`, `incoming` (newest first, `--max-incoming`, default
+  20), `incoming_total`, `overlapping_files` (paths changed on both sides since the merge
+  base, renames counted as delete plus add) and `up_to_date`.
+- **`--merge`:** `git merge --no-edit --ff` of the fetched base commit, whatever your
+  `merge.ff` setting says. It never rebases, pushes or forces. It refuses, listing every
+  reason, when tracked files have uncommitted changes, a merge, rebase, cherry-pick or
+  revert is in progress, HEAD is detached, you are on the base branch itself, or the merge
+  would overwrite untracked files. Untracked files alone do not refuse: Git never
+  overwrites them in a merge, so a scratch brief in the worktree is safe.
+- **Conflicts:** the merge is left in progress and `merge.conflicts` lists each path
+  with its kind (`both modified`, `both added`, `both deleted`, `added by us`/`them`,
+  `deleted by us`/`them`); `next` says "resolve, git add, git commit (or git merge
+  --abort)". With `--abort-on-conflict` the merge is aborted instead, the tree is back
+  where it was, and you still get the list.
+
+JSON on stdout (`merge` holds `commit`, `fast_forward`, `conflicts`, `in_progress`,
+`aborted`, `git_output`; `refusals` and `next` appear when there is something to do).
+Exit codes: 0 up to date, merged cleanly, or report only · 1 usage · 2 refused or the
+merge stopped · 3 git error · 130 interrupted (an interrupt never kills a merge midway).
+
 ### `agentflow lessons`: feed past review findings back into the next review
 
 ```sh

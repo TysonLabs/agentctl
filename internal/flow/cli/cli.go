@@ -2,7 +2,8 @@
 // assigned in this package and nowhere else, one table per command
 // (exitCodes for codex, coderabbitExitCodes for coderabbit, shipExitCodes
 // for ship verify, prExitCodes for pr wait, replyExitCodes for pr reply,
-// prMergeExitCodes for pr merge, lessonsExitCodes for lessons). 0 is success, 1 a
+// prMergeExitCodes for pr merge, lessonsExitCodes for lessons, branchExitCodes
+// for branch sync). 0 is success, 1 a
 // usage or precondition error, 124 a timeout and 130 an interruption for
 // every command.
 package cli
@@ -48,6 +49,8 @@ Usage:
   agentflow worktree done <branch|path>        remove a merged, clean, unused worktree
   agentflow worktree sweep [--yes]             list (or remove) every such worktree
                                                (see: agentflow worktree --help)
+  agentflow branch sync [--base REF] [--merge] report ahead/behind/overlap vs the default
+                                               branch; merge it in (see: agentflow branch --help)
   agentflow lessons <subcommand>               code-review lessons: brief, bump, add, seen,
                                                search, triage, retire, stats
                                                (see: agentflow lessons --help)
@@ -146,6 +149,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return runPR(ctx, args[1:], stdout, stderr)
 	case "lessons":
 		return runLessons(args[1:], stdout, stderr)
+	case "branch":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runBranch(ctx, args[1:], stdout, stderr)
 	case "version", "--version":
 		fmt.Fprintln(stdout, "agentflow "+Version)
 		return 0
