@@ -2,7 +2,7 @@
 // assigned in this package and nowhere else, one table per command
 // (exitCodes for codex, coderabbitExitCodes for coderabbit, shipExitCodes
 // for ship verify, prExitCodes for pr wait, replyExitCodes for pr reply,
-// prMergeExitCodes for pr merge). 0 is success, 1 a
+// prMergeExitCodes for pr merge, lessonsExitCodes for lessons). 0 is success, 1 a
 // usage or precondition error, 124 a timeout and 130 an interruption for
 // every command.
 package cli
@@ -48,6 +48,8 @@ Usage:
   agentflow worktree done <branch|path>        remove a merged, clean, unused worktree
   agentflow worktree sweep [--yes]             list (or remove) every such worktree
                                                (see: agentflow worktree --help)
+  agentflow lessons brief|bump|retire|stats    code-review lessons: brief section, counters,
+                                               retirement (see: agentflow lessons --help)
   agentflow version                           print agentflow's own version
 
 codex and claude flags:
@@ -66,6 +68,12 @@ codex and claude flags:
                           and result.json (default: a new temp dir)
   --max-prompt-bytes N    refuse prompts over N bytes (default 80000)
   --max-budget-usd N      claude only: stop the run at this spend
+  --lessons TOPICS        append the learned-checks section for these lesson
+                          topics (comma-separated) to the prompt; needs a prompt
+                          for codex (claude's default brief counts)
+  --lessons-repo NAME     rank that repo's lessons first (default: the name of
+                          --dir's origin remote)
+  --lessons-dir DIR       the lessons folder (default: $AGENTFLOW_LESSONS_DIR)
 
   A scope with a prompt inlines the scoped diff under your prompt. A scope
   with no prompt runs codex's built-in reviewer (codex exec review); claude
@@ -127,6 +135,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		return runPR(ctx, args[1:], stdout, stderr)
+	case "lessons":
+		return runLessons(args[1:], stdout, stderr)
 	case "version", "--version":
 		fmt.Fprintln(stdout, "agentflow "+Version)
 		return 0
@@ -161,6 +171,9 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 		promptFile string
 		maxBytes   int
 		paths      pathList
+		lessonTops string
+		lessonRepo string
+		lessonDir  string
 	)
 	fs.StringVar(&o.Dir, "dir", "", "")
 	fs.StringVar(&prompt, "prompt", "", "")
@@ -175,6 +188,9 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 	fs.DurationVar(&o.Stall, "stall", 10*time.Minute, "")
 	fs.StringVar(&o.OutDir, "out", "", "")
 	fs.IntVar(&maxBytes, "max-prompt-bytes", 80000, "")
+	fs.StringVar(&lessonTops, "lessons", "", "")
+	fs.StringVar(&lessonRepo, "lessons-repo", "", "")
+	fs.StringVar(&lessonDir, "lessons-dir", "", "")
 	if b == agent.Claude {
 		fs.Float64Var(&o.MaxBudgetUSD, "max-budget-usd", 0, "")
 	}
@@ -252,6 +268,21 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 		return fail("--dir %s is not a directory", o.Dir)
 	}
 	o.Bin = os.Getenv("AGENTFLOW_" + strings.ToUpper(name))
+
+	if lessonTops == "" && (lessonRepo != "" || lessonDir != "") {
+		return fail("--lessons-repo and --lessons-dir need --lessons")
+	}
+	if lessonTops != "" {
+		if prompt == "" {
+			return fail("--lessons needs --prompt or --prompt-file (codex's built-in reviewer takes no extra instructions)")
+		}
+		section, err := lessonsSection(o.Dir, lessonDir, lessonTops, lessonRepo)
+		if err != nil {
+			return fail("--lessons: %v", err)
+		}
+		// Before BuildPrompt, so the diff stays last and the size cap counts the section.
+		prompt = strings.TrimRight(prompt, "\n") + "\n\n" + section
+	}
 
 	if prompt != "" {
 		built, err := agent.BuildPrompt(o.Dir, prompt, o.Scope, maxBytes)
