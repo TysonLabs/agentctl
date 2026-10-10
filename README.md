@@ -295,6 +295,8 @@ agentflow codex --base main --prompt-file brief.md           # your brief, with 
 agentflow codex --uncommitted --prompt-file brief.md --path internal/flow   # one area at a time
 agentflow codex --prompt-file plan-review.md --dir ~/src/repo                # any read-only task
 agentflow codex --base main --prompt-file fix.md --write     # fix mode (workspace-write)
+agentflow codex --base main --prompt-file brief.md --write --protocol fix --test-cmd 'go test ./internal/x'
+                                                             # fix mode with the built-in protocol
 ```
 
 What it guarantees, each one a way a hand-typed Codex invocation has failed:
@@ -367,6 +369,64 @@ Codex wrote can be reviewed by Claude. The differences:
   under `~/.claude/projects/` (or `$CLAUDE_CONFIG_DIR`).
 
 Set `AGENTFLOW_CLAUDE` to use a claude binary other than the one on `PATH`.
+
+### `--protocol fix|review`: the review rules and output format, built in
+
+```sh
+agentflow codex  --base main --prompt-file brief.md --write --protocol fix --test-cmd 'go test ./internal/x'
+agentflow claude --base main --prompt-file brief.md --protocol review
+agentflow codex  --base main --protocol review              # no brief: the protocol and the diff only
+```
+
+Without it, every review brief retypes the same rules. With it, the brief says only what
+changed and what it must guarantee. On `codex` and `claude`, `--protocol` wraps the
+brief, and the prompt is assembled in this order:
+
+1. the protocol: the reviewer's role and rules;
+2. your brief (optional when a scope is set);
+3. the output format;
+4. the learned-checks section, with `--lessons`;
+5. the scoped diff.
+
+`--max-prompt-bytes` counts all of it.
+
+- **`fix`** needs `--write`. The rules: fix each real defect in the working tree; don't
+  commit; edit only files in the repository; add no dependency the fix doesn't need;
+  add one test per fix that fails without it; run the targeted tests; list deliberate
+  non-fixes. It also says that tests binding loopback sockets fail in the sandbox, so the
+  reviewer names them and the caller runs them. `--test-cmd CMD` (repeatable, fix only)
+  names the targeted tests.
+- **`review`** must be read-only (no `--write`). The reviewer edits nothing and gives a
+  suggested fix and a test for each defect.
+- The mode is a separate flag, not implied by `--write`. A dropped `--write` is refused
+  and never turns a fix run into a review.
+
+The final message has a fixed shape:
+
+```text
+## Findings
+
+### F1 [Major] internal/x/a.go:42
+WHY: the failing scenario
+FIX: what changed (review: the suggested change)
+TEST: the test that fails without the fix
+
+## Not fixed
+
+- what was left, and why (or "None.")
+```
+
+Severity is `Blocker`, `Major` or `Minor`. With `--lessons`, a learned-check finding ends
+its heading with `[learned l<id>]`. A clean review writes `None.` under `## Findings`.
+agentflow parses `final.md` into the JSON result:
+`"protocol": "fix"` and `"findings": [{"id", "severity", "file", "line", "learned", "why",
+"fix", "test"}]`. `[]` means no findings. If the message does not follow the format,
+`findings` is `null` and `warnings` says why. One malformed block voids the whole list,
+so a partial list never passes for a complete one: ids must run F1, F2, … without
+gaps, fields must come in the order WHY, FIX, TEST, and the list must end at
+`## Not fixed`, so a cut-off answer does not parse. A failed run also has `findings: null`.
+Parsing never changes the status or the exit code. Without `--protocol`, neither key
+appears.
 
 ### `agentflow coderabbit`: run the CodeRabbit CLI's local review safely
 
@@ -578,6 +638,12 @@ export AGENTFLOW_LESSONS_DIR=~/notes/review-lessons   # or --lessons-dir on each
 agentflow codex --base main --prompt-file brief.md --write --lessons concurrency,database
 agentflow lessons brief --topics concurrency --repo myrepo   # print the section only
 agentflow lessons bump --used l12,l40 --misled l7 --fp-seen fp3
+agentflow lessons search lock check write                     # find a lesson before writing one
+agentflow lessons add --repo myrepo --ref "#123" --topics concurrency \
+  --title "..." --what "..." --why "..." --avoid "..."       # new Inbox lesson; prints duplicates
+agentflow lessons seen l12 --repo myrepo --ref "#123" --note "..."   # Also seen line + Used +1
+agentflow lessons triage                  # Inbox with duplicates and a suggested file
+agentflow lessons triage --apply plan.json
 agentflow lessons retire                  # list; --apply moves them to Archive.md
 agentflow lessons stats
 ```
@@ -600,13 +666,56 @@ one file per topic, each lesson a `### title` block with a tag line
   instructions. The prompt-size cap counts the section.
 - **`bump`** is the only safe way to change counters: it locks the folder, changes all
   ids or none (exit 2 names any id it could not find), and writes each file atomically.
+- **`search`** ranks lessons by word overlap with the terms: a word in the title counts
+  most, then in `Avoid by`, then in `What went wrong` or an `Also seen:` line, and rare
+  words count more than common ones. It is lexical and deterministic, not semantic, so
+  try a second wording before you conclude a habit is new.
+- **`add`** writes a lesson to `Inbox.md`. It takes the id from the Inbox's
+  `Next free id: l<N>` line and raises that line, both under the folder lock, so two
+  sessions never get the same id (if the counter is behind an id already in the folder,
+  it skips past it and says so in `counter_was`). The lesson goes to the top of the
+  section `## <date>, <repo> (<ref>)`, which is created newest first when absent, with
+  `Used: 0`. Topics must already be in use (`--new-topic` allows a new one), and
+  `--principle` must be a `## <name>` heading in the principles file. The JSON lists
+  candidate duplicates (search score at or above `--dup-threshold`, 0.35, archive
+  included). Read them: if one records the same habit, use `seen` on it instead.
+  `--if-no-duplicate` writes nothing and exits 3 when there is a candidate; `--dry-run`
+  writes nothing and prints the block.
+- **`seen ID`** adds `- **Also seen:** <date>, <repo> (<ref>): <note>` after the
+  lesson's last `Also seen:` line (or before its counters) and raises `Used` by one
+  (`--no-bump`: not), in one write. An archived lesson needs `--revive`, which moves it
+  back to the end of the topic file its `Retired:` line names and drops that line.
+- **`triage`** lists every Inbox lesson with its candidate duplicates and a suggested
+  topic file (the file holding most lessons with its first topic). Triage needs
+  judgment, so you (or your agent) write the plan, and `triage --apply plan.json`
+  carries it out, all or nothing:
+
+  ```json
+  [{"id": "l937", "action": "move", "file": "Concurrency.md"},
+   {"id": "l938", "action": "merge", "target": "l12", "note": "same race in the dialer"}]
+  ```
+
+  `move` appends the lesson to the end of the topic file (which must exist). `merge`
+  adds an `Also seen:` line to the target (the note defaults to the lesson's title; the
+  ref and date come from its Inbox section and tag line unless the step gives `ref` or
+  `date`), adds 1 plus the merged lesson's `Used` to the target's `Used`, and drops the
+  Inbox lesson. Sections the plan empties are removed; the Inbox header and its counter
+  stay. A plan that would leave an id in two files is refused. Lesson text is never
+  rewritten.
 - **`retire`** finds topic-file lessons with `Used 0` and no activity (date or
   `Also seen:`) for `--days` (90), or with `Misled > Used`. `--apply` moves them to
   `Archive.md` with a `Retired:` line, writing the archive first so an interrupted run
   never loses a lesson. Lessons that `Code Review Principles.md` links (`#^l<id>`) stay.
 
+Every command that writes takes the folder lock, checks the whole request first, and
+then writes each changed file atomically; bytes outside the lines it changes stay as
+they were. When a command changes two files, the file that receives a lesson is written
+before the one it leaves, so an interrupted run can leave a lesson in both, never in
+neither.
+
 A missing folder, a folder with no lessons and an unknown topic are errors, never an
-empty section. Exit codes: 0 ok · 1 usage or precondition · 2 an id was not found.
+empty section. Exit codes: 0 ok · 1 usage or precondition · 2 an id was not found
+(nothing written) · 3 `add --if-no-duplicate` found a candidate (nothing written).
 
 ## agentcfg (companion binary): edit the registry, keep tokens in the Keychain
 

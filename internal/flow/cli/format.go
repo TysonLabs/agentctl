@@ -314,3 +314,59 @@ func resultPath(outDir string) string {
 	}
 	return filepath.Join(outDir, "result.json")
 }
+
+func matchItems(t *render.Text, ms []lessons.Match) {
+	for _, m := range ms {
+		t.Item("%s %.2f %s (%s)", m.ID, m.Score, m.Title, m.File)
+	}
+}
+
+func addText(res lessons.AddResult, code int) string {
+	status := "ok"
+	if code == lessonsExitCodes.duplicate {
+		status = "duplicate"
+	}
+	t := render.New("lessons add", status, code)
+	t.Field("id", res.ID).Field("file", res.File).Field("section", res.Section).
+		Field("written", res.Written).Field("next_free_id", res.NextFreeID).Field("duplicates", len(res.Duplicates))
+	matchItems(t, res.Duplicates)
+	return t.String()
+}
+
+func seenText(res lessons.SeenResult) string {
+	t := render.New("lessons seen", "ok", lessonsExitCodes.ok)
+	t.Field("id", res.ID).Field("file", res.File)
+	if res.Used != nil {
+		t.Field("used", fmt.Sprintf("%d -> %d", res.Used.From, res.Used.To))
+	}
+	if res.Revived != "" {
+		t.Field("revived_from", res.Revived)
+	}
+	t.Item("%s", res.Line)
+	return t.String()
+}
+
+func searchText(q string, res []lessons.Match) string {
+	t := render.New("lessons search", "ok", lessonsExitCodes.ok)
+	t.Field("query", q).Field("results", len(res))
+	matchItems(t, res)
+	return t.String()
+}
+
+func triageText(rep lessons.TriageReport) string {
+	t := render.New("lessons triage", "ok", lessonsExitCodes.ok)
+	t.Field("next_free_id", rep.NextFreeID).Field("items", len(rep.Items))
+	for _, it := range rep.Items {
+		t.Item("%s -> %s: %s (duplicates: %d)", it.ID, it.Suggested, it.Title, len(it.Duplicates))
+	}
+	return t.String()
+}
+
+func triageApplyText(res lessons.TriageResult) string {
+	t := render.New("lessons triage --apply", "ok", lessonsExitCodes.ok)
+	t.Field("applied", len(res.Applied)).Field("dropped_sections", len(res.DroppedSections))
+	for _, d := range res.Applied {
+		t.Item("%s %s -> %s", d.ID, d.Action, d.File)
+	}
+	return t.String()
+}
