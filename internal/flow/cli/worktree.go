@@ -8,12 +8,41 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/TysonLabs/agentctl/internal/flow/worktree"
 )
 
-const worktreeUsage = `agentflow worktree done <branch|path> [flags]
+const worktreeUsage = `agentflow worktree new <branch> [--from REF] [--clone-dir DIR]... [--repo DIR]
+agentflow worktree new --scratch [--at REF] [--clone-dir DIR]... [--repo DIR]
+agentflow worktree done <branch|path> [flags]
 agentflow worktree sweep [flags]
+
+new fetches origin, then creates <main checkout>/.claude/worktrees/<slug> on
+a NEW branch (feat/x -> feat-x) from --from, else origin's default branch
+(origin/HEAD, e.g. origin/main). The branch gets no upstream, so a bare
+` + "`git push`" + ` can never target main. It refuses (listing every reason) if the
+branch exists locally or on origin, or the path exists. Its JSON is
+{path, branch, base, base_sha, cloned, clone_skipped, notes}.
+
+  --from REF / --at REF  the base commit (the same option; any ref or sha)
+  --clone-dir DIR        repeatable: copy-on-write clone this directory (e.g.
+                         target, node_modules) from the main checkout with
+                         cp -c -R so builds start warm. macOS (APFS) only;
+                         elsewhere, or if cloning fails, it is skipped with
+                         a reason and never copied in full.
+  --scratch              a detached throwaway worktree, .claude/worktrees/
+                         scratch-<random>, for probes and base comparisons.
+                         It is locked ("agentflow scratch ...") and marked in
+                         its git admin directory.
+
+done on a scratch worktree removes it WITHOUT the merged and clean checks
+(uncommitted files and commits in it are discarded; the JSON's
+discarded_head keeps the sha recoverable until git gc), but only when the
+scratch marker is present and the unused checks below pass. sweep lists
+scratch worktrees under "scratch"; with --yes it removes those older than
+--scratch-age (default 24h) that pass. Unmarked worktrees always get the
+full checks.
 
 done removes one finished worktree and its branch. It never forces, and it
 refuses (listing every reason) unless all of these hold:
@@ -40,12 +69,14 @@ had exactly that branch and head; being merged by ancestry alone keeps it.
                     origin/main); REMOTE/BRANCH or BRANCH (origin assumed)
   --dry-run         done: check only, change nothing
   --yes             sweep: remove the worktrees that pass (default: list only)
+  --scratch-age DUR sweep: minimum age of a scratch worktree to remove
+                    (default 24h)
   --keep-remote     don't delete the remote branch (by default it is deleted
                     when it still points at the merged head)
 
 Output: a JSON result on stdout. Sweep records per-worktree errors and keeps
-going. Exit codes: 0 removed (or would be, or sweep finished) · 1 usage ·
-2 refused · 3 git/gh error. An unavailable or incomplete lsof check is a
+going. Exit codes: 0 created/removed (or would be, or sweep finished) ·
+1 usage · 2 refused · 3 git/gh error. An unavailable or incomplete lsof check is a
 safety refusal, not an external-command error.
 `
 
@@ -55,6 +86,9 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		return 0
 	}
 	sub := args[0]
+	if sub == "new" {
+		return runWorktreeNew(ctx, args[1:], stdout, stderr)
+	}
 	if sub != "done" && sub != "sweep" {
 		fmt.Fprintf(stderr, "agentflow worktree: unknown subcommand %q\n\n%s", sub, worktreeUsage)
 		return 1
@@ -68,6 +102,7 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	var (
 		repo, into           string
 		dryRun, yes, keepRem bool
+		scratchAge           time.Duration
 	)
 	fs.StringVar(&repo, "repo", "", "")
 	fs.StringVar(&into, "into", "", "")
@@ -76,6 +111,7 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		fs.BoolVar(&dryRun, "dry-run", false, "")
 	} else {
 		fs.BoolVar(&yes, "yes", false, "")
+		fs.DurationVar(&scratchAge, "scratch-age", 24*time.Hour, "")
 	}
 	pos, err := parseInterleaved(fs, args[1:])
 	if err != nil {
@@ -102,6 +138,24 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	list, err := worktree.List(ctx, env, repo)
 	if err != nil {
 		return fail(3, "%v", err)
+	}
+	// Scratch worktrees (agentflow worktree new --scratch) skip the merge
+	// and clean checks; only their marker admits them to that path.
+	var scratch []worktree.Worktree
+	if sub == "done" {
+		if w, err := worktree.Find(list, repo, pos[0]); err == nil && isScratch(ctx, env, repo, w) {
+			return scratchDone(ctx, env, repo, w, dryRun, stdout, stderr)
+		}
+	} else {
+		var ordinary []worktree.Worktree
+		for _, w := range list {
+			if isScratch(ctx, env, repo, w) {
+				scratch = append(scratch, w)
+			} else {
+				ordinary = append(ordinary, w)
+			}
+		}
+		list = ordinary
 	}
 	target, err := worktree.DefaultTarget(ctx, env, repo, into)
 	if err != nil {
@@ -178,6 +232,16 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		entries = append(entries, e)
 	}
 
+	var scratchEntries []scratchEntry
+	scratchRemovable, scratchRemoved := 0, 0
+	if sub == "sweep" {
+		var sFreed int64
+		var sErr bool
+		scratchEntries, scratchRemovable, scratchRemoved, sFreed, sErr = sweepScratch(ctx, env, repo, scratch, scratchAge, yes)
+		freed += sFreed
+		hadError = hadError || sErr
+	}
+
 	pruned := 0
 	var sweepError string
 	if sub == "sweep" && yes {
@@ -204,14 +268,18 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		}{entries[0], target.Ref(), dryRun}, "", "  ")
 	} else {
 		out, _ = json.MarshalIndent(struct {
-			Into       string  `json:"into"`
-			Removable  int     `json:"removable"`
-			Removed    int     `json:"removed"`
-			Pruned     int     `json:"pruned_stale_records"`
-			FreedBytes int64   `json:"freed_bytes"`
-			Worktrees  []entry `json:"worktrees"`
-			Error      string  `json:"error,omitempty"`
-		}{target.Ref(), eligible, removed, pruned, freed, entries, sweepError}, "", "  ")
+			Into             string         `json:"into"`
+			Removable        int            `json:"removable"`
+			Removed          int            `json:"removed"`
+			Pruned           int            `json:"pruned_stale_records"`
+			FreedBytes       int64          `json:"freed_bytes"`
+			Worktrees        []entry        `json:"worktrees"`
+			ScratchAge       string         `json:"scratch_age"`
+			ScratchRemovable int            `json:"scratch_removable"`
+			ScratchRemoved   int            `json:"scratch_removed"`
+			Scratch          []scratchEntry `json:"scratch"`
+			Error            string         `json:"error,omitempty"`
+		}{target.Ref(), eligible, removed, pruned, freed, entries, scratchAge.String(), scratchRemovable, scratchRemoved, scratchEntries, sweepError}, "", "  ")
 	}
 	_, _ = stdout.Write(append(out, '\n'))
 	if sub == "done" && !entries[0].OK {

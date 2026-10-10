@@ -45,6 +45,7 @@ Usage:
                                                reply to a review thread, then resolve it
   agentflow pr merge <number> [--sync-branch B] merge a ready PR pinned to its head;
                                                report the merge sha
+  agentflow worktree new <branch>|--scratch    create a worktree under .claude/worktrees
   agentflow worktree done <branch|path>        remove a merged, clean, unused worktree
   agentflow worktree sweep [--yes]             list (or remove) every such worktree
                                                (see: agentflow worktree --help)
