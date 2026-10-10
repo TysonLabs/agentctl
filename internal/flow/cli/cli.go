@@ -75,6 +75,14 @@ codex and claude flags:
   --lessons-repo NAME     rank that repo's lessons first (default: the name of
                           --dir's origin remote)
   --lessons-dir DIR       the lessons folder (default: $AGENTFLOW_LESSONS_DIR)
+  --protocol fix|review   wrap the brief in the built-in review protocol: rules
+                          before it, the fixed output format after it. fix needs
+                          --write; review must be read-only. The brief is then
+                          optional with a scope. The JSON adds "findings",
+                          parsed from final.md (null plus a warning if it does
+                          not follow the format; the exit code is unchanged)
+  --test-cmd CMD          fix protocol: a targeted test command the reviewer
+                          runs after its fixes (repeatable)
 
   A scope with a prompt inlines the scoped diff under your prompt. A scope
   with no prompt runs codex's built-in reviewer (codex exec review); claude
@@ -175,6 +183,8 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 		lessonTops string
 		lessonRepo string
 		lessonDir  string
+		protoFlag  string
+		testCmds   pathList
 	)
 	fs.StringVar(&o.Dir, "dir", "", "")
 	fs.StringVar(&prompt, "prompt", "", "")
@@ -192,6 +202,8 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 	fs.StringVar(&lessonTops, "lessons", "", "")
 	fs.StringVar(&lessonRepo, "lessons-repo", "", "")
 	fs.StringVar(&lessonDir, "lessons-dir", "", "")
+	fs.StringVar(&protoFlag, "protocol", "", "")
+	fs.Var(&testCmds, "test-cmd", "")
 	if b == agent.Claude {
 		fs.Float64Var(&o.MaxBudgetUSD, "max-budget-usd", 0, "")
 	}
@@ -237,6 +249,15 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 	if prompt == "" && scopes == 0 {
 		return fail("give --prompt/--prompt-file, a review scope (--base, --commit, --uncommitted), or both")
 	}
+	proto, err := protocolFlags(protoFlag, testCmds, o.Write)
+	if err != nil {
+		return fail("%v", err)
+	}
+	if proto != agent.ProtocolNone {
+		// Protocol first, then the brief and the output format; the
+		// learned-checks section and the diff follow below.
+		prompt = agent.WrapBrief(agent.ProtocolPrompt{Mode: proto, TestCmds: testCmds, Lessons: lessonTops != ""}, prompt)
+	}
 	if prompt == "" && b == agent.Claude {
 		prompt = defaultReviewBrief
 		if o.Write {
@@ -275,7 +296,7 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 	}
 	if lessonTops != "" {
 		if prompt == "" {
-			return fail("--lessons needs --prompt or --prompt-file (codex's built-in reviewer takes no extra instructions)")
+			return fail("--lessons needs --prompt, --prompt-file or --protocol (codex's built-in reviewer takes no extra instructions)")
 		}
 		section, err := lessonsSection(o.Dir, lessonDir, lessonTops, lessonRepo)
 		if err != nil {
@@ -311,6 +332,7 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 	if err != nil {
 		return fail("%v", err)
 	}
+	res.SetFindings(proto)
 	out, _ := json.MarshalIndent(res, "", "  ")
 	out = append(out, '\n')
 	_ = os.WriteFile(filepath.Join(o.OutDir, "result.json"), out, 0o644)
@@ -324,6 +346,30 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 		return exitCodes[agent.StatusFailed]
 	}
 	return code
+}
+
+// protocolFlags checks --protocol and --test-cmd against --write. The mode is
+// explicit, not implied by --write, so a dropped --write is refused instead of
+// silently turning a fix run into a review.
+func protocolFlags(mode string, testCmds []string, write bool) (agent.Protocol, error) {
+	p, err := agent.ParseProtocol(mode)
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case p == agent.ProtocolFix && !write:
+		return "", errors.New("--protocol fix needs --write: the reviewer must be able to edit files")
+	case p == agent.ProtocolReview && write:
+		return "", errors.New("--protocol review is read-only: drop --write, or use --protocol fix")
+	case len(testCmds) > 0 && p != agent.ProtocolFix:
+		return "", errors.New("--test-cmd needs --protocol fix: a read-only reviewer runs no tests")
+	}
+	for _, c := range testCmds {
+		if strings.TrimSpace(c) == "" || strings.ContainsAny(c, "`\n\r") {
+			return "", fmt.Errorf("--test-cmd %q must be one non-empty line without backticks", c)
+		}
+	}
+	return p, nil
 }
 
 // lockOutDir prevents concurrent runs from truncating each other's event log
