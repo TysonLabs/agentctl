@@ -33,6 +33,8 @@ Wait until a deployed service runs REV, read through agentctl's /agent/version.
   --once             check once and exit (0 deployed, 2 not yet)
   --contains         also accept a running descendant of REV; use only for
                      forward deploys, not when verifying a rollback
+  --format json|text JSON (default) or a text summary; ship announce
+                     --verified needs the JSON, so save that, not the text
 
 A short SHA matches a full one. Transient fetch failures while the service
 restarts are retried; a version with no recognizable commit fails at once.
@@ -59,6 +61,7 @@ service.env and commit. The channel is an incoming webhook in services.toml:
   --force            post again although this commit was announced
   --config PATH      services.toml (default: $AGENTCTL_CONFIG, then
                      ~/.config/agentctl/services.toml)
+  --format json|text JSON result (default) or a text summary
 
 The body is scrubbed of secrets and Slack mentions. Exit codes: 0 posted
 (or dry run) · 1 usage error · 2 refused (no proof, env not enabled, bad
@@ -110,6 +113,7 @@ func runShip(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.DurationVar(&o.Interval, "interval", 30*time.Second, "")
 	fs.BoolVar(&o.Once, "once", false, "")
 	fs.BoolVar(&o.Contains, "contains", false, "")
+	format := formatFlag(fs)
 	pos, err := parseInterleaved(fs, args[1:])
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -172,11 +176,14 @@ func runShip(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	res := ship.Verify(ctx, o)
 	out, _ := json.MarshalIndent(res, "", "  ")
-	_, _ = stdout.Write(append(out, '\n'))
 	code, ok := shipExitCodes[res.Status]
 	if !ok {
+		code = 1
+	}
+	emit(stdout, *format, append(out, '\n'), func() string { return verifyText(res, code) })
+	if !ok {
 		fmt.Fprintf(stderr, "agentflow ship verify: unknown result status %q\n", res.Status)
-		return 1
+		return code
 	}
 	if code != 0 {
 		fmt.Fprintf(stderr, "agentflow ship verify: %s: %s\n", res.Status, res.Error)
@@ -203,6 +210,7 @@ func runAnnounce(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	fs.BoolVar(&o.DryRun, "dry-run", false, "")
 	fs.BoolVar(&o.Force, "force", false, "")
 	fs.StringVar(&config, "config", "", "")
+	format := formatFlag(fs)
 	pos, err := parseInterleaved(fs, args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -242,14 +250,21 @@ func runAnnounce(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		res.Error = "interrupted"
 	}
 	out, _ := json.MarshalIndent(res, "", "  ")
-	_, _ = stdout.Write(append(out, '\n'))
-	if ctx.Err() != nil && res.Status == ship.AnnounceSlackError {
-		return 130
-	}
+	interrupted := ctx.Err() != nil && res.Status == ship.AnnounceSlackError
 	code, ok := announceExitCodes[res.Status]
+	switch {
+	case interrupted:
+		code = 130
+	case !ok:
+		code = 1
+	}
+	emit(stdout, *format, append(out, '\n'), func() string { return announceText(res, code) })
+	if interrupted {
+		return code
+	}
 	if !ok {
 		fmt.Fprintf(stderr, "agentflow ship announce: unknown result status %q\n", res.Status)
-		return 1
+		return code
 	}
 	if res.Error != "" {
 		fmt.Fprintf(stderr, "agentflow ship announce: %s: %s\n", res.Status, res.Error)

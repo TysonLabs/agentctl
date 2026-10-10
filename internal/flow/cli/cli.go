@@ -41,6 +41,7 @@ Usage:
                                                (see: agentflow ship --help)
   agentflow pr wait <number> [--repo O/N]      wait for CodeRabbit's review of the PR head;
                                                list open threads (see: agentflow pr --help)
+  agentflow pr thread <thread-id> [--repo O/N] print one review thread's comments (read-only)
   agentflow pr reply <thread-id> --fixed SHA --note TEXT | --keep REASON
                                                reply to a review thread, then resolve it
   agentflow pr merge <number> [--sync-branch B] merge a ready PR pinned to its head;
@@ -53,6 +54,13 @@ Usage:
                                                search, triage, retire, stats
                                                (see: agentflow lessons --help)
   agentflow version                           print agentflow's own version
+
+Output: every command that prints a JSON result also takes --format json|text.
+json (the default) is the stable API. text is a short summary for reading:
+"<command>: <status> (exit N)", then one "key: value" per line, then lists as
+"- ..." lines. Exit codes are the same in both formats, and a command that
+saves its JSON (<out>/result.json) saves it in both. Text from reviews and
+other tools is printed with control characters escaped (\x1b, \u202e).
 
 codex and claude flags:
   --dir DIR               repository to work in (default: current directory)
@@ -76,6 +84,7 @@ codex and claude flags:
   --lessons-repo NAME     rank that repo's lessons first (default: the name of
                           --dir's origin remote)
   --lessons-dir DIR       the lessons folder (default: $AGENTFLOW_LESSONS_DIR)
+  --format json|text      result on stdout as JSON (default) or a text summary
   --protocol fix|review   wrap the brief in the built-in review protocol: rules
                           before it, the fixed output format after it. fix needs
                           --write; review must be read-only. The brief is then
@@ -96,8 +105,8 @@ codex and claude flags:
   under --dir, no network). Prompt-driven runs are told they are a sub-agent:
   do the task, report, stop, and start no other agents.
 
-Output: the JSON result on stdout (also saved as <out>/result.json); the
-review itself is in the file named by "final".
+Output: the JSON result on stdout (also saved as <out>/result.json, in both
+formats); the review itself is in the file named by "final".
 
 Exit codes: 0 ok · 1 usage/precondition · 3 agent failed · 4 no final answer
             5 rate/usage limited · 124 timeout · 125 stalled · 130 interrupted
@@ -203,6 +212,7 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 	fs.StringVar(&lessonTops, "lessons", "", "")
 	fs.StringVar(&lessonRepo, "lessons-repo", "", "")
 	fs.StringVar(&lessonDir, "lessons-dir", "", "")
+	format := formatFlag(fs)
 	fs.StringVar(&protoFlag, "protocol", "", "")
 	fs.Var(&testCmds, "test-cmd", "")
 	if b == agent.Claude {
@@ -337,14 +347,16 @@ func runAgent(ctx context.Context, name string, b agent.Backend, args []string, 
 	out, _ := json.MarshalIndent(res, "", "  ")
 	out = append(out, '\n')
 	_ = os.WriteFile(filepath.Join(o.OutDir, "result.json"), out, 0o644)
-	_, _ = stdout.Write(out)
+	code, ok := exitCodes[res.Status]
+	if !ok {
+		code = exitCodes[agent.StatusFailed]
+	}
+	emit(stdout, *format, out, func() string { return agentText(name, res, code, o.OutDir) })
 	if res.Status != agent.StatusOK {
 		fmt.Fprintf(stderr, "agentflow %s: %s: %s (logs: %s)\n", name, res.Status, res.Error, o.OutDir)
 	}
-	code, ok := exitCodes[res.Status]
 	if !ok {
 		fmt.Fprintf(stderr, "agentflow %s: unknown result status %q\n", name, res.Status)
-		return exitCodes[agent.StatusFailed]
 	}
 	return code
 }
