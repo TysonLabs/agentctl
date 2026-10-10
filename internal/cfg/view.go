@@ -46,10 +46,11 @@ type GateView struct {
 // AnnounceView is one [name.announce] table (agentflow's Slack settings).
 // It never holds the webhook, only its fingerprint.
 type AnnounceView struct {
-	Name    string    `json:"name"`
-	Channel string    `json:"channel"`
-	Envs    []string  `json:"envs"`
-	Webhook TokenView `json:"webhook"`
+	Name    string            `json:"name"`
+	Meta    map[string]string `json:"meta"`
+	Channel string            `json:"channel"`
+	Envs    []string          `json:"envs"`
+	Webhook TokenView         `json:"webhook"`
 }
 
 // ServiceView is one name.env.
@@ -179,7 +180,14 @@ func announceViews(data []byte) ([]AnnounceView, int) {
 		if !ok {
 			continue
 		}
-		v := AnnounceView{Name: name, Envs: []string{"prod"}}
+		v := AnnounceView{Name: name, Meta: map[string]string{}, Envs: []string{"prod"}}
+		if meta, ok := svc["meta"].(map[string]any); ok {
+			for k, mv := range meta {
+				if s, ok := mv.(string); ok {
+					v.Meta[k] = s
+				}
+			}
+		}
 		hook, isStr := tbl["webhook"].(string)
 		_, hasRef := tbl["webhook_ref"]
 		switch {

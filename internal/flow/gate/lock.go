@@ -74,8 +74,11 @@ func AcquireLock(ctx context.Context, name string, me LockHolder, onWait func(*L
 	}
 	waited = time.Since(start)
 	me.Since = time.Now().UTC().Format(time.RFC3339)
-	// The lock works without the holder file; waiters just see less.
-	_ = writeHolder(holderPath, me)
+	if err := writeHolder(holderPath, me); err != nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+		return nil, waited, fmt.Errorf("writing lock holder %s: %v", holderPath, err)
+	}
 	return func() {
 		_ = os.Remove(holderPath)
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)

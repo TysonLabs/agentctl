@@ -259,6 +259,30 @@ func TestBrowserCodeKeepsSecretsAndAddFormStable(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := string(js)
+	gateGroupsStart := strings.Index(source, "for (const gt of state.gates")
+	if gateGroupsStart < 0 {
+		t.Fatal("could not find gate grouping flow")
+	}
+	gateGroupsEnd := strings.Index(source[gateGroupsStart:], "return [...by.values()]")
+	if gateGroupsEnd < 0 {
+		t.Fatal("could not find end of gate grouping flow")
+	}
+	gateGroups := source[gateGroupsStart : gateGroupsStart+gateGroupsEnd]
+	if !strings.Contains(gateGroups, "group.meta = gt.meta || {}") {
+		t.Fatal("gate grouping does not merge metadata into a card already created by announce settings")
+	}
+	announceGroupsStart := strings.Index(source, "for (const an of state.announces")
+	if announceGroupsStart < 0 {
+		t.Fatal("could not find announce grouping flow")
+	}
+	announceGroupsEnd := strings.Index(source[announceGroupsStart:], "// A gate-only project")
+	if announceGroupsEnd < 0 {
+		t.Fatal("could not find end of announce grouping flow")
+	}
+	announceGroups := source[announceGroupsStart : announceGroupsStart+announceGroupsEnd]
+	if !strings.Contains(announceGroups, "meta: an.meta || {}") {
+		t.Fatal("announce-only project cards do not show their metadata")
+	}
 	if strings.Contains(source, `f-token").value.trim()`) {
 		t.Fatal("browser code trims a token instead of letting cfg.CheckToken reject whitespace")
 	}

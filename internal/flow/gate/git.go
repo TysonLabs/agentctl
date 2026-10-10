@@ -13,7 +13,7 @@ import (
 
 // gitEnvBlock are variables that point git at another repository or index.
 // They leak in from git hooks; neither our git calls nor the steps want them.
-var gitEnvBlock = []string{"GIT_DIR=", "GIT_WORK_TREE=", "GIT_INDEX_FILE=", "GIT_COMMON_DIR=", "GIT_OBJECT_DIRECTORY=", "GIT_PREFIX="}
+var gitEnvBlock = []string{"GIT_DIR=", "GIT_WORK_TREE=", "GIT_INDEX_FILE=", "GIT_COMMON_DIR=", "GIT_OBJECT_DIRECTORY=", "GIT_ALTERNATE_OBJECT_DIRECTORIES=", "GIT_PREFIX="}
 
 func cleanEnv(env []string) []string {
 	out := make([]string, 0, len(env))
@@ -84,6 +84,18 @@ type treeState struct {
 // The only write is content-addressed blobs in the object store, the same
 // ones `git add` would create.
 func workTree(ctx context.Context, root string) (treeState, error) {
+	return hashWorkTree(ctx, root, false)
+}
+
+// readOnlyWorkTree hashes the work tree without writing its uncommitted
+// blobs or trees into the repository's object database. Git writes any new
+// objects into the same temporary directory as the copied index and reads
+// existing objects through the real object database as an alternate.
+func readOnlyWorkTree(ctx context.Context, root string) (treeState, error) {
+	return hashWorkTree(ctx, root, true)
+}
+
+func hashWorkTree(ctx context.Context, root string, readOnly bool) (treeState, error) {
 	var ts treeState
 	// One call for the index path, HEAD and HEAD's tree; it fails in a repo
 	// with no commit yet, and then only the index path is asked for.
@@ -110,6 +122,17 @@ func workTree(ctx context.Context, root string) (treeState, error) {
 		return ts, fmt.Errorf("copying the git index: %v", err)
 	}
 	env := []string{"GIT_INDEX_FILE=" + tmpIndex}
+	if readOnly {
+		objects, err := git(ctx, root, nil, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+		if err != nil {
+			return ts, err
+		}
+		tmpObjects := filepath.Join(tmpDir, "objects")
+		if err := os.Mkdir(tmpObjects, 0o700); err != nil {
+			return ts, err
+		}
+		env = append(env, "GIT_OBJECT_DIRECTORY="+tmpObjects, "GIT_ALTERNATE_OBJECT_DIRECTORIES="+objects)
+	}
 	if _, err := git(ctx, root, env, "add", "--all", "--", ":/"); err != nil {
 		return ts, err
 	}

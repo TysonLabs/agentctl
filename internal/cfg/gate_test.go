@@ -1,6 +1,7 @@
 package cfg
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -251,5 +252,33 @@ func TestRemoveLastEnvKeepsMetaForGate(t *testing.T) {
 	svc := tree["pay"].(map[string]any)
 	if meta, _ := svc["meta"].(map[string]any); meta["repo"] != "~/src/pay" {
 		t.Fatalf("meta.repo dropped while the gate needs it:\n%s", read(t, s))
+	}
+}
+
+func TestRemoveGateKeepsMetaVisibleForAnnounceOnlyProject(t *testing.T) {
+	s := newStore(t, `[tool.meta]
+repo = "~/src/tool"
+
+[tool.announce]
+webhook = "`+testHook+`"
+channel = "#tool"
+
+[[tool.gate.steps]]
+name = "test"
+run = "make test"
+`)
+	if _, err := s.RemoveGate("", "tool"); err != nil {
+		t.Fatal(err)
+	}
+	st := s.State()
+	if st.Error != "" || len(st.Announces) != 1 {
+		t.Fatalf("state %+v", st)
+	}
+	b, err := json.Marshal(st.Announces[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"meta":{"repo":"~/src/tool"}`) {
+		t.Fatalf("announce-only project hides its preserved meta: %s", b)
 	}
 }

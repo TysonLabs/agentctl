@@ -115,11 +115,13 @@
       by.get(s.name).envs.push(s);
     }
     for (const an of state.announces || []) {
-      if (!by.has(an.name)) by.set(an.name, { name: an.name, meta: {}, envs: [] });
+      if (!by.has(an.name)) by.set(an.name, { name: an.name, meta: an.meta || {}, envs: [] });
     }
     // A gate-only project has meta and gate, and no env.
     for (const gt of state.gates || []) {
-      if (!by.has(gt.name)) by.set(gt.name, { name: gt.name, meta: gt.meta || {}, envs: [] });
+      if (!by.has(gt.name)) by.set(gt.name, { name: gt.name, meta: {}, envs: [] });
+      const group = by.get(gt.name);
+      group.meta = gt.meta || {};
     }
     return [...by.values()];
   }

@@ -25,11 +25,11 @@ type Receipt struct {
 }
 
 // receiptFile is <git-common-dir>/agentflow/gate/receipts.json:
-// project -> tree -> step -> receipt. The key is the work tree's content
-// hash, so every worktree of the repo shares it.
+// project -> tree -> step -> run hash -> receipt. The tree key is the work
+// tree's content hash, so every worktree of the repo shares it.
 type receiptFile struct {
-	Version  int                                      `json:"version"`
-	Projects map[string]map[string]map[string]Receipt `json:"projects"`
+	Version  int                                                 `json:"version"`
+	Projects map[string]map[string]map[string]map[string]Receipt `json:"projects"`
 }
 
 // keepTrees bounds how many trees per project keep receipts.
@@ -46,30 +46,81 @@ func runHash(run string) string {
 
 // readReceipts reads the receipt file. A missing file is empty.
 func readReceipts(path string) (*receiptFile, error) {
-	rf := &receiptFile{Version: 1, Projects: map[string]map[string]map[string]Receipt{}}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return rf, nil
+		return emptyReceipts(), nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(b, rf); err != nil || rf.Projects == nil {
+	rf := &receiptFile{}
+	if err := json.Unmarshal(b, rf); err != nil || !validReceipts(rf) {
 		return nil, fmt.Errorf("corrupt receipt file %s (remove it to start over)", path)
 	}
 	return rf, nil
 }
 
+func emptyReceipts() *receiptFile {
+	return &receiptFile{Version: 1, Projects: map[string]map[string]map[string]map[string]Receipt{}}
+}
+
+func validReceipts(rf *receiptFile) bool {
+	if rf.Version != 1 || rf.Projects == nil {
+		return false
+	}
+	for project, trees := range rf.Projects {
+		if project == "" || trees == nil {
+			return false
+		}
+		for tree, steps := range trees {
+			if !treeHashRe.MatchString(tree) || steps == nil {
+				return false
+			}
+			for step, runs := range steps {
+				if step == "" || runs == nil {
+					return false
+				}
+				for hash, r := range runs {
+					if len(hash) != sha256.Size*2 || hash != r.RunHash {
+						return false
+					}
+					if _, err := hex.DecodeString(hash); err != nil || r.At.IsZero() || r.Secs < 0 {
+						return false
+					}
+					if r.Status != StepPassed && r.Status != StepFailed && r.Status != StepTimeout {
+						return false
+					}
+					if r.OK != (r.Status == StepPassed) {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
 // lookup returns the receipt for project/tree/step.
-func (rf *receiptFile) lookup(project, tree, step string) (Receipt, bool) {
-	r, ok := rf.Projects[project][tree][step]
+func (rf *receiptFile) lookup(project, tree, step, hash string) (Receipt, bool) {
+	r, ok := rf.Projects[project][tree][step][hash]
 	return r, ok
+}
+
+func (rf *receiptFile) latest(project, tree, step string) (Receipt, bool) {
+	var latest Receipt
+	found := false
+	for _, r := range rf.Projects[project][tree][step] {
+		if !found || r.At.After(latest.At) {
+			latest, found = r, true
+		}
+	}
+	return latest, found
 }
 
 // passed reports a passing receipt for this exact run string.
 func (rf *receiptFile) passed(project, tree, step, run string) bool {
-	r, ok := rf.lookup(project, tree, step)
-	return ok && r.OK && r.RunHash == runHash(run)
+	r, ok := rf.lookup(project, tree, step, runHash(run))
+	return ok && r.OK
 }
 
 // recordReceipt adds one receipt under an exclusive lock (read, merge,
@@ -92,17 +143,20 @@ func recordReceipt(path, project, tree, step string, r Receipt) error {
 
 	rf, err := readReceipts(path)
 	if err != nil {
-		rf = &receiptFile{Version: 1, Projects: map[string]map[string]map[string]Receipt{}}
+		rf = emptyReceipts()
 	}
 	trees := rf.Projects[project]
 	if trees == nil {
-		trees = map[string]map[string]Receipt{}
+		trees = map[string]map[string]map[string]Receipt{}
 		rf.Projects[project] = trees
 	}
 	if trees[tree] == nil {
-		trees[tree] = map[string]Receipt{}
+		trees[tree] = map[string]map[string]Receipt{}
 	}
-	trees[tree][step] = r
+	if trees[tree][step] == nil {
+		trees[tree][step] = map[string]Receipt{}
+	}
+	trees[tree][step][r.RunHash] = r
 	prune(trees, tree)
 
 	b, err := json.MarshalIndent(rf, "", "  ")
@@ -125,7 +179,7 @@ func recordReceipt(path, project, tree, step string, r Receipt) error {
 }
 
 // prune keeps the keepTrees most recently used trees, always keeping keep.
-func prune(trees map[string]map[string]Receipt, keep string) {
+func prune(trees map[string]map[string]map[string]Receipt, keep string) {
 	if len(trees) <= keepTrees {
 		return
 	}
@@ -136,9 +190,11 @@ func prune(trees map[string]map[string]Receipt, keep string) {
 	var all []aged
 	for t, steps := range trees {
 		var latest time.Time
-		for _, r := range steps {
-			if r.At.After(latest) {
-				latest = r.At
+		for _, runs := range steps {
+			for _, r := range runs {
+				if r.At.After(latest) {
+					latest = r.At
+				}
 			}
 		}
 		all = append(all, aged{t, latest})

@@ -40,8 +40,18 @@ func Check(ctx context.Context, o Options, tree, rev string) *CheckResult {
 		res.Status, res.Error = StatusError, err.Error()
 		return res
 	}
+	interrupted := func() *CheckResult {
+		res.Status, res.Error = StatusInterrupted, "interrupted"
+		return res
+	}
+	if ctx.Err() != nil {
+		return interrupted()
+	}
 	t, err := resolve(ctx, o.ConfigPath, o.Project, o.Dir, o.DirGiven)
 	if err != nil {
+		if ctx.Err() != nil {
+			return interrupted()
+		}
 		return fail(err)
 	}
 	res.Project, res.Dir = t.project, t.root
@@ -54,14 +64,23 @@ func Check(ctx context.Context, o Options, tree, rev string) *CheckResult {
 		res.Tree = tree
 	case rev != "":
 		if res.Tree, err = revTree(ctx, t.root, rev); err != nil {
+			if ctx.Err() != nil {
+				return interrupted()
+			}
 			return fail(err)
 		}
 	default:
-		ts, err := workTree(ctx, t.root)
+		ts, err := readOnlyWorkTree(ctx, t.root)
 		if err != nil {
+			if ctx.Err() != nil {
+				return interrupted()
+			}
 			return fail(fmt.Errorf("hashing the work tree: %v", err))
 		}
 		res.Tree, res.Dirty = ts.tree, &ts.dirty
+	}
+	if ctx.Err() != nil {
+		return interrupted()
 	}
 	res.Receipts = receiptsPath(t.common)
 	rf, err := readReceipts(res.Receipts)
@@ -70,16 +89,16 @@ func Check(ctx context.Context, o Options, tree, rev string) *CheckResult {
 	}
 	for _, st := range t.spec.Steps {
 		cs := CheckStep{Name: st.Name, Status: "missing"}
-		if r, ok := rf.lookup(t.project, res.Tree, st.Name); ok {
+		if r, ok := rf.lookup(t.project, res.Tree, st.Name, runHash(st.Run)); ok {
 			cs.At = r.At.UTC().Format(time.RFC3339)
-			switch {
-			case r.RunHash != runHash(st.Run):
-				cs.Status = "stale"
-			case r.OK:
+			if r.OK {
 				cs.Status = "passed"
-			default:
+			} else {
 				cs.Status = "failed"
 			}
+		} else if r, ok := rf.latest(t.project, res.Tree, st.Name); ok {
+			cs.At = r.At.UTC().Format(time.RFC3339)
+			cs.Status = "stale"
 		}
 		if cs.Status != "passed" {
 			res.Missing = append(res.Missing, st.Name)

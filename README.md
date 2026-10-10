@@ -494,7 +494,8 @@ stop_on_fail = true              # skip the later steps if this one fails
 - **Which project.** `--project`, else the project whose `meta.repo` is this checkout or
   another worktree of the same repository (same git common dir; `~` and symlinks are
   resolved). No match, two matches, or no `[name.gate]` table exits 1 and says which
-  `agentcfg` command fixes it. With `--project` in a checkout of a different repo, it refuses.
+  `agentcfg` command fixes it. `--project` still needs the project's `meta.repo`, and in a
+  checkout of a different repo it refuses; outside any checkout it runs in `meta.repo`.
 - **Every step runs**, in the order written, so one run reports every failure. A failed or
   timed-out step with `stop_on_fail` skips the rest (`skipped`). stdin is `/dev/null`;
   stdout and stderr go to `<out>/<step>.log`. On a timeout or Ctrl-C the step's whole
@@ -508,7 +509,8 @@ stop_on_fail = true              # skip the later steps if this one fails
   it. A rerun on the same tree skips steps that passed with the same `run` (`cached`);
   `--force` reruns them. Steps that read anything outside the tree (env vars, ignored
   files, the toolchain) are not tracked: use `--force` when those change.
-- **`--check`** runs nothing and writes no receipt. It exits 0 only if every configured step
+- **`--check`** runs nothing and writes nothing: no receipt, and the work tree is hashed into
+  a throwaway object store (the repo's own objects are read as an alternate). It exits 0 only if every configured step
   has a passing receipt, with its current `run`, for the work tree, `--tree HASH` or
   `--rev REV`'s tree; `missing` lists the others (`stale` means the `run` changed).
 - **The lock** is `flock` on `$TMPDIR/agentflow-lock-<name>.lock`, the same convention as

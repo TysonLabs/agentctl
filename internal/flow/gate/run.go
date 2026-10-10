@@ -126,11 +126,21 @@ func Run(ctx context.Context, o Options) *Result {
 		res.Status, res.Error = StatusError, err.Error()
 		return res
 	}
+	interruptedResult := func(message string) *Result {
+		res.Status, res.Error = StatusInterrupted, message
+		return res
+	}
+	if ctx.Err() != nil {
+		return interruptedResult("interrupted")
+	}
 	if o.KillGrace <= 0 {
 		o.KillGrace = 5 * time.Second
 	}
 	t, err := resolve(ctx, o.ConfigPath, o.Project, o.Dir, o.DirGiven)
 	if err != nil {
+		if ctx.Err() != nil {
+			return interruptedResult("interrupted")
+		}
 		return fail(err)
 	}
 	res.Project, res.Dir, res.LogDir = t.project, t.root, o.OutDir
@@ -177,7 +187,7 @@ func Run(ctx context.Context, o Options) *Result {
 	if err != nil {
 		res.Warnings = append(res.Warnings, err.Error()+"; running every step")
 		o.logf("warning: %v; running every step", err)
-		rf = &receiptFile{Projects: map[string]map[string]map[string]Receipt{}}
+		rf = emptyReceipts()
 	}
 	if err := os.MkdirAll(o.OutDir, 0o700); err != nil {
 		return fail(err)
@@ -190,8 +200,11 @@ func Run(ctx context.Context, o Options) *Result {
 		switch {
 		case stopped:
 			sr.Status = StepSkipped
+		case ctx.Err() != nil:
+			sr.Status = StepInterrupted
+			interrupted, stopped = true, true
 		case !o.Force && rf.passed(t.project, ts.tree, st.Name, st.Run):
-			r, _ := rf.lookup(t.project, ts.tree, st.Name)
+			r, _ := rf.lookup(t.project, ts.tree, st.Name, runHash(st.Run))
 			sr.Status, sr.Secs, sr.Exit, sr.At = StepCached, r.Secs, r.Exit, r.At.UTC().Format(time.RFC3339)
 			o.logf("%s: cached (passed on this tree at %s)", st.Name, sr.At)
 		default:
@@ -279,20 +292,48 @@ func runStep(ctx context.Context, root string, st gatespec.Step, logPath string,
 	select {
 	case err := <-waitCh:
 		proc.CleanupGroup(pid, grace)
-		code := exitCode(err)
-		if err == nil {
-			return StepPassed, &code, nil
-		}
-		return StepFailed, &code, nil
+		status, exit := completedStep(err)
+		return status, exit, nil
 	case <-timer.C:
-		_, _ = proc.KillGroup(pid, grace, waitCh)
+		if status, exit, natural := stopStep(pid, grace, waitCh); natural {
+			return status, exit, nil
+		}
 		fmt.Fprintf(logf, "\nagentflow gate: timed out after %s; killed the process group\n", st.Timeout)
 		return StepTimeout, nil, nil
 	case <-ctx.Done():
-		_, _ = proc.KillGroup(pid, grace, waitCh)
+		if status, exit, natural := stopStep(pid, grace, waitCh); natural {
+			return status, exit, nil
+		}
 		fmt.Fprintf(logf, "\nagentflow gate: interrupted; killed the process group\n")
 		return StepInterrupted, nil, nil
 	}
+}
+
+// stopStep ends a process selected for timeout or interruption, preferring
+// a natural exit that won the boundary race. KillGroup repeats that check
+// immediately before signaling, closing the gap after the non-blocking read.
+func stopStep(pid int, grace time.Duration, waitCh <-chan error) (status string, exit *int, natural bool) {
+	select {
+	case err := <-waitCh:
+		proc.CleanupGroup(pid, grace)
+		status, exit = completedStep(err)
+		return status, exit, true
+	default:
+	}
+	natural, err := proc.KillGroup(pid, grace, waitCh)
+	if !natural {
+		return "", nil, false
+	}
+	status, exit = completedStep(err)
+	return status, exit, true
+}
+
+func completedStep(err error) (string, *int) {
+	code := exitCode(err)
+	if err == nil {
+		return StepPassed, &code
+	}
+	return StepFailed, &code
 }
 
 func exitCode(err error) int {

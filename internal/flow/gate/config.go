@@ -87,8 +87,11 @@ func resolve(ctx context.Context, configPath, projectName, dir string, dirGiven 
 		if p, ok = projects[projectName]; !ok {
 			return nil, fmt.Errorf("no project %q in %s — add its gate: agentcfg gate %s --add NAME --run CMD", projectName, configPath, projectName)
 		}
+		if strings.TrimSpace(p.repo) == "" {
+			return nil, fmt.Errorf("project %s has no string meta.repo — set it: agentcfg meta %s repo=PATH, then edit its gate with agentcfg gate %s", p.name, p.name, p.name)
+		}
 		// Outside any checkout, a named project runs in its own repo.
-		if !dirGiven && p.repo != "" {
+		if !dirGiven {
 			if _, _, err := gitDirs(ctx, dir); err != nil {
 				dir = expandHome(p.repo)
 			}
@@ -99,6 +102,8 @@ func resolve(ctx context.Context, configPath, projectName, dir string, dirGiven 
 		return nil, fmt.Errorf("%s is not inside a git work tree (use --dir): %v", dir, err)
 	}
 	if projectName == "" {
+		// Only a project with a gate can run, so a second project on the
+		// same repo without one is not ambiguous.
 		var withGate, without []string
 		for _, name := range sortedNames(projects) {
 			q := projects[name]
@@ -172,7 +177,7 @@ func repoMatches(ctx context.Context, repo, root, common string) bool {
 	if err != nil {
 		return false
 	}
-	if r == root {
+	if r == root || r == common {
 		return true
 	}
 	_, c, err := gitDirs(ctx, r)

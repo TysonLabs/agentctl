@@ -2,6 +2,7 @@ package gate
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -175,6 +176,15 @@ func TestTimeoutKillsTheProcessGroup(t *testing.T) {
 	}
 }
 
+func TestStopStepPrefersCompletedProcess(t *testing.T) {
+	waitCh := make(chan error, 1)
+	waitCh <- nil
+	status, exit, natural := stopStep(999999, time.Millisecond, waitCh)
+	if !natural || status != StepPassed || exit == nil || *exit != 0 {
+		t.Fatalf("natural=%v status=%s exit=%v, want a natural pass", natural, status, exit)
+	}
+}
+
 func TestStdinIsDevNull(t *testing.T) {
 	repo := newRepo(t)
 	r, w, err := os.Pipe()
@@ -225,7 +235,7 @@ func TestInterruptKillsStepAndRecordsNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := rf.lookup("p", res.Tree, "slow"); ok {
+	if _, ok := rf.lookup("p", res.Tree, "slow", runHash("touch "+started+"; sleep 30")); ok {
 		t.Fatal("an interrupted step left a receipt")
 	}
 }
@@ -308,6 +318,11 @@ func TestReceiptsCacheByTreeAndRunString(t *testing.T) {
 	writeConfig2 := writeConfig(t, repo, "", stepDef{name: "s", run: run + " # v2"})
 	o.ConfigPath = writeConfig2
 	gate(StepPassed, 8)
+	gate(StepCached, 8)
+
+	// The run hash is part of the receipt key, so reverting the command can
+	// reuse its earlier passing receipt for this exact tree.
+	o.ConfigPath = cfg
 	gate(StepCached, 8)
 }
 
@@ -393,6 +408,21 @@ func TestCheck(t *testing.T) {
 	}
 }
 
+func TestCheckWorkTreeDoesNotWriteGitObjects(t *testing.T) {
+	repo := newRepo(t)
+	cfg := writeConfig(t, repo, "", stepDef{name: "a", run: "true"})
+	writeFile(t, filepath.Join(repo, "untracked.txt"), "content unique to the work tree\n")
+	before := gitT(t, repo, "count-objects", "-v")
+
+	res := Check(context.Background(), opts(t, cfg, repo), "", "")
+	if res.Status != StatusMissing {
+		t.Fatalf("check status %s (%s), want missing", res.Status, res.Error)
+	}
+	if after := gitT(t, repo, "count-objects", "-v"); after != before {
+		t.Fatalf("--check wrote into the repository object database:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
 func TestCheckRefusesCorruptReceipts(t *testing.T) {
 	repo := newRepo(t)
 	cfg := writeConfig(t, repo, "", stepDef{name: "a", run: "true"})
@@ -409,6 +439,29 @@ func TestCheckRefusesCorruptReceipts(t *testing.T) {
 	}
 	if c := Check(context.Background(), o, "", ""); !c.OK {
 		t.Fatalf("after the rerun: %+v", c)
+	}
+	// Syntactically valid but contradictory receipt data must also fail closed.
+	b, err := os.ReadFile(res.Receipts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	projects := doc["projects"].(map[string]any)
+	trees := projects["p"].(map[string]any)
+	steps := trees[res.Tree].(map[string]any)
+	runs := steps["a"].(map[string]any)
+	receipt := runs[runHash("true")].(map[string]any)
+	receipt["status"] = StepFailed // leave ok=true: impossible for a receipt we wrote
+	b, err = json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, res.Receipts, string(b))
+	if c := Check(context.Background(), o, "", ""); c.Status != StatusError || c.OK {
+		t.Fatalf("contradictory receipt passed check: %+v", c)
 	}
 }
 
@@ -479,6 +532,21 @@ func TestLockReportsHolder(t *testing.T) {
 	r2()
 }
 
+func TestLockRequiresHolderFile(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	_, holderPath := LockPaths("blocked-holder")
+	if err := os.Mkdir(holderPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	release, _, err := AcquireLock(context.Background(), "blocked-holder", LockHolder{PID: 1}, nil)
+	if release != nil {
+		release()
+	}
+	if err == nil {
+		t.Fatal("lock succeeded without publishing its holder JSON")
+	}
+}
+
 func TestResolveProject(t *testing.T) {
 	ctx := context.Background()
 	repo := newRepo(t)
@@ -524,6 +592,12 @@ func TestResolveProject(t *testing.T) {
 	cfgHome := writeConfig(t, "~/proj", "", stepDef{name: "a", run: "true"})
 	if tg, err := resolve(ctx, cfgHome, "", wt, true); err != nil || tg.project != "p" {
 		t.Fatalf("~ meta.repo from a worktree: %v", err)
+	}
+
+	// A configured git common dir identifies every checkout of that repo too.
+	cfgCommon := writeConfig(t, wantCommon, "", stepDef{name: "a", run: "true"})
+	if tg, err := resolve(ctx, cfgCommon, "", wt, true); err != nil || tg.project != "p" {
+		t.Fatalf("git common-dir meta.repo from a worktree: %v", err)
 	}
 
 	// Another repo matches nothing.
@@ -583,6 +657,39 @@ func TestResolveRefusesBadConfig(t *testing.T) {
 	}
 	if tg, err := resolve(ctx, two, "q", repo, true); err != nil || tg.project != "q" {
 		t.Errorf("--project q: %v", err)
+	}
+	// A second project on the repo without a gate cannot run, so it does not
+	// make the one gated project ambiguous.
+	oneGate := write("[[p.gate.steps]]\nname = \"a\"\nrun = \"true\"\n" + fmt.Sprintf("[q.meta]\nrepo = %q\n", repo))
+	if tg, err := resolve(ctx, oneGate, "", repo, true); err != nil || tg.project != "p" {
+		t.Errorf("one gated project among two: %v", err)
+	}
+
+	// --project selects a config entry, not permission to run its commands in
+	// an arbitrary checkout: meta.repo must still establish the identity.
+	for name, meta := range map[string]string{
+		"missing":      "",
+		"not a string": "[p.meta]\nrepo = 42\n",
+	} {
+		path := filepath.Join(t.TempDir(), "services.toml")
+		writeFile(t, path, meta+"[[p.gate.steps]]\nname = \"a\"\nrun = \"true\"\n")
+		if _, err := resolve(ctx, path, "p", repo, true); err == nil || !strings.Contains(err.Error(), "meta.repo") {
+			t.Errorf("%s meta.repo: %v", name, err)
+		}
+	}
+}
+
+func TestCanceledContextIsInterrupted(t *testing.T) {
+	repo := newRepo(t)
+	cfg := writeConfig(t, repo, "", stepDef{name: "a", run: "true"})
+	o := opts(t, cfg, repo)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if res := Run(ctx, o); res.Status != StatusInterrupted {
+		t.Fatalf("run status %s (%s), want interrupted", res.Status, res.Error)
+	}
+	if res := Check(ctx, o, "", ""); res.Status != StatusInterrupted {
+		t.Fatalf("check status %s (%s), want interrupted", res.Status, res.Error)
 	}
 }
 
