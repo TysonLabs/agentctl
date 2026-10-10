@@ -42,6 +42,7 @@ had exactly that branch and head; being merged by ancestry alone keeps it.
   --yes             sweep: remove the worktrees that pass (default: list only)
   --keep-remote     don't delete the remote branch (by default it is deleted
                     when it still points at the merged head)
+  --format json|text  JSON result (default) or a text summary
 
 Output: a JSON result on stdout. Sweep records per-worktree errors and keeps
 going. Exit codes: 0 removed (or would be, or sweep finished) · 1 usage ·
@@ -72,6 +73,7 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	fs.StringVar(&repo, "repo", "", "")
 	fs.StringVar(&into, "into", "", "")
 	fs.BoolVar(&keepRem, "keep-remote", false, "")
+	format := formatFlag(fs)
 	if sub == "done" {
 		fs.BoolVar(&dryRun, "dry-run", false, "")
 	} else {
@@ -195,14 +197,30 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		}
 	}
 
+	code := 0
+	switch {
+	case sub == "done" && !entries[0].OK:
+		code = 2
+	case hadError:
+		code = 3
+	}
+	textEntries := make([]worktreeEntry, len(entries))
+	for i, e := range entries {
+		textEntries[i] = worktreeEntry{Check: e.Check, Removed: e.Removed, Error: e.Error}
+	}
 	var out []byte
+	var text func() string
 	if sub == "done" {
+		text = func() string { return worktreeDoneText(textEntries[0], target.Ref(), dryRun, code) }
 		out, _ = json.MarshalIndent(struct {
 			entry
 			Into   string `json:"into"`
 			DryRun bool   `json:"dry_run,omitempty"`
 		}{entries[0], target.Ref(), dryRun}, "", "  ")
 	} else {
+		text = func() string {
+			return worktreeSweepText(textEntries, target.Ref(), eligible, removed, pruned, freed, sweepError, yes, code)
+		}
 		out, _ = json.MarshalIndent(struct {
 			Into       string  `json:"into"`
 			Removable  int     `json:"removable"`
@@ -213,16 +231,13 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 			Error      string  `json:"error,omitempty"`
 		}{target.Ref(), eligible, removed, pruned, freed, entries, sweepError}, "", "  ")
 	}
-	_, _ = stdout.Write(append(out, '\n'))
-	if sub == "done" && !entries[0].OK {
+	emit(stdout, *format, append(out, '\n'), text)
+	if code == 2 {
 		for _, r := range entries[0].Refusals {
 			fmt.Fprintf(stderr, "agentflow worktree done: refused: %s\n", r)
 		}
-		return 2
-	}
-	if hadError {
+	} else if code == 3 {
 		fmt.Fprintln(stderr, "agentflow worktree sweep: one or more worktrees could not be processed")
-		return 3
 	}
-	return 0
+	return code
 }

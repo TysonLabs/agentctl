@@ -22,6 +22,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/TysonLabs/agentctl/internal/flow/render"
 )
 
 // Status is the outcome of one wait. Every wait ends in exactly one.
@@ -49,6 +51,7 @@ type Options struct {
 	Timeout  time.Duration // overall deadline (ignored with Once)
 	Interval time.Duration // delay between checks
 	Once     bool          // check once instead of waiting
+	Bodies   bool          // add each open thread's full first comment and reply count
 	GH       GH
 }
 
@@ -60,6 +63,12 @@ type Thread struct {
 	Line    int    `json:"line,omitempty"`
 	URL     string `json:"url,omitempty"`
 	Excerpt string `json:"excerpt"`
+	// Set only with Options.Bodies. Body is the first comment, sanitized
+	// (control characters escaped) and capped at MaxBodyRunes; Replies counts
+	// the comments after it.
+	Body          string `json:"body,omitempty"`
+	BodyTruncated bool   `json:"body_truncated,omitempty"`
+	Replies       *int   `json:"replies,omitempty"`
 }
 
 // Result is the machine-readable summary.
@@ -235,13 +244,13 @@ func read(ctx context.Context, o Options) (snapshot, error) {
 	if err != nil {
 		return snap, err
 	}
-	snap.threads, snap.threadsComplete, err = parseThreads(out)
+	snap.threads, snap.threadsComplete, err = parseThreads(out, o.Bodies)
 	return snap, err
 }
 
 const threadsQuery = `query($o:String!,$n:String!,$p:Int!,$endCursor:String){repository(owner:$o,name:$n){pullRequest(number:$p){` +
 	`reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved ` +
-	`comments(first:1){nodes{author{login} path line originalLine url body}}}}}}}`
+	`comments(first:1){totalCount nodes{author{login} path line originalLine url body}}}}}}}`
 
 // threadsPage is one page of the reviewThreads query.
 type threadsPage struct {
@@ -256,7 +265,8 @@ type threadsPage struct {
 						ID         string `json:"id"`
 						IsResolved bool   `json:"isResolved"`
 						Comments   struct {
-							Nodes []struct {
+							TotalCount int `json:"totalCount"`
+							Nodes      []struct {
 								Author struct {
 									Login string `json:"login"`
 								} `json:"author"`
@@ -279,7 +289,7 @@ type threadsPage struct {
 
 // parseThreads reads gh's slurped pages (a JSON array) or a single page,
 // and reports whether the last page says there are no more threads.
-func parseThreads(out []byte) ([]Thread, bool, error) {
+func parseThreads(out []byte, bodies bool) ([]Thread, bool, error) {
 	var pages []threadsPage
 	if trimmed := bytes.TrimSpace(out); len(trimmed) > 0 && trimmed[0] == '[' {
 		if err := json.Unmarshal(trimmed, &pages); err != nil {
@@ -322,6 +332,11 @@ func parseThreads(out []byte) ([]Thread, bool, error) {
 			} else if c.OriginalLine != nil {
 				t.Line = *c.OriginalLine // an outdated thread keeps its original line
 			}
+			if bodies {
+				t.Body, t.BodyTruncated = SafeBody(c.Body)
+				replies := max(n.Comments.TotalCount-1, 0)
+				t.Replies = &replies
+			}
 			threads = append(threads, t)
 		}
 		complete = !rt.PageInfo.HasNextPage
@@ -348,6 +363,16 @@ func excerpt(body string) string {
 		s = string(r[:240]) + "…"
 	}
 	return s
+}
+
+// MaxBodyRunes caps a comment body in agentflow's output (JSON and text).
+const MaxBodyRunes = 16000
+
+// SafeBody prepares untrusted comment text for output: control characters
+// and bidi overrides escaped (render.Block), then capped at MaxBodyRunes with
+// a note. It reports whether the body was cut.
+func SafeBody(body string) (string, bool) {
+	return render.Cap(render.Block(body), MaxBodyRunes)
 }
 
 // GHCLI returns a GH that runs the gh binary at bin.

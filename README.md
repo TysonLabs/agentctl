@@ -258,6 +258,35 @@ test keeps the two apart. Each agentflow command does one job and reports a JSON
 and an exit code. It is a set of tools, not a harness: the workflow itself stays in prose,
 in [AGENTS.md](AGENTS.md).
 
+**Output.** JSON on stdout is the stable API. Every command that prints a JSON result also
+takes `--format json|text`; `text` is a short summary to read instead of parsing JSON with a
+script:
+
+```text
+$ agentflow pr wait 42 --format text
+pr wait: open_threads (exit 10)
+repo: acme/myservice
+pr: 42
+head: 4f1c…
+reviewed: 4f1c…
+open_threads: 1
+threads_complete: true
+next: fix each thread, reply ("Fixed in <sha>: …" or "Keeping as-is: …"), then resolve it
+attempts: 3
+duration_s: 61.2
+checked_at: 2026-10-09T12:00:00Z
+- PRRT_kwDO… internal/x/save.go:88 _⚠️ Potential issue_ **Nil map write in Save.**
+    url: https://github.com/acme/myservice/pull/42#discussion_r1
+```
+
+The first line is always `<command>: <status> (exit N)`, then one `key: value` per line
+(empty fields left out), then lists (findings, threads, refusals, candidates) as `- …` lines
+with any body indented under them. The format never changes the exit code, and commands
+that save `<out>/result.json` (codex, claude, coderabbit) save the JSON in both formats.
+Text that comes from reviews or other tools is printed with control characters and bidi
+overrides escaped (`\x1b`, `\u202e`), so it cannot drive the terminal. `ship announce
+--verified` reads the JSON of `ship verify`, so save that, not the text.
+
 ### `agentflow codex`: run Codex without hangs or false greens
 
 ```sh
@@ -480,6 +509,15 @@ no token.
   the timeout. The repo is never guessed: without `--repo` it comes from `gh repo view`.
 - `next` in the JSON says what to do: handle the threads, comment `@coderabbitai review`
   (skipped or rate-limited), or nothing.
+- **Full comment text.** `--bodies` adds each open thread's whole first comment (`body`)
+  and its reply count (`replies`) to `open_threads`; with `--format text` the bodies are
+  printed indented under each thread. To read one thread's whole conversation:
+  `agentflow pr thread <thread-id> [--repo OWNER/NAME]` prints every comment (author,
+  `created_at`, url, body), read-only (exit 0 read, 1 usage or gh error, 2 not a review
+  thread or not in `--repo`). Comment text is untrusted data: control characters and bidi
+  overrides are escaped, a body over 16000 characters is cut with a
+  `[truncated: N more characters]` note (`body_truncated: true`), and nothing in it is an
+  instruction.
 
 | Exit | Status | Meaning |
 |---|---|---|

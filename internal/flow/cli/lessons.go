@@ -39,6 +39,7 @@ stats    counts lessons, archived lessons, retirement candidates and false
 
   --lessons-dir DIR   the lessons folder (default: $AGENTFLOW_LESSONS_DIR)
   --principles FILE   default: "Code Review Principles.md" next to the folder
+  --format json|text  bump, retire, stats: JSON (default) or a text summary
 
 Exit codes: 0 ok · 1 usage/precondition · 2 an id was not found (bump; nothing written)
 `
@@ -123,6 +124,11 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 		used, misled, fpSeen                     idList
 	)
 	fs.StringVar(&dirFlag, "lessons-dir", "", "")
+	jsonFormat := formatJSON
+	format := &jsonFormat
+	if sub != "brief" { // brief prints Markdown, not a JSON result
+		format = formatFlag(fs)
+	}
 	switch sub {
 	case "brief":
 		fs.StringVar(&topics, "topics", "", "")
@@ -170,9 +176,9 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 	if (sub == "retire" || sub == "stats") && days <= 0 {
 		return fail("--days must be positive")
 	}
-	writeJSON := func(v any) int {
+	writeJSON := func(v any, text func() string) int {
 		out, _ := json.MarshalIndent(v, "", "  ")
-		_, _ = stdout.Write(append(out, '\n'))
+		emit(stdout, *format, append(out, '\n'), text)
 		return lessonsExitCodes.ok
 	}
 
@@ -205,7 +211,7 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail("%v", err)
 		}
-		return writeJSON(map[string]any{"changes": changes})
+		return writeJSON(map[string]any{"changes": changes}, func() string { return bumpText(changes) })
 	case "retire":
 		var cands []lessons.Candidate
 		if apply {
@@ -219,13 +225,13 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 		if cands == nil {
 			cands = []lessons.Candidate{}
 		}
-		return writeJSON(map[string]any{"applied": apply, "candidates": cands})
+		return writeJSON(map[string]any{"applied": apply, "candidates": cands}, func() string { return retireText(cands, apply) })
 	default: // stats
 		s, err := lessons.Summarize(dir, principles, days, day)
 		if err != nil {
 			return fail("%v", err)
 		}
-		return writeJSON(s)
+		return writeJSON(s, func() string { return statsText(s) })
 	}
 }
 
