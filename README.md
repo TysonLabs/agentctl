@@ -553,6 +553,40 @@ no token.
 | 124 | `timeout` | never reviewed before `--timeout`: request a review once, then ask a human |
 | 130 | `interrupted` | interrupted |
 
+### `agentflow worktree new`: start from a fresh base, in one place
+
+```sh
+agentflow worktree new feat/my-change                     # .claude/worktrees/feat-my-change
+agentflow worktree new feat/my-change --from origin/release --clone-dir target
+agentflow worktree new --scratch                          # detached throwaway probe
+agentflow worktree new --scratch --at <sha>
+```
+
+Hand-made worktrees end up in varying places, branch from a stale ref because nobody
+fetched, and get an upstream of `origin/main`. `new` fetches origin first, then
+creates `<main checkout>/.claude/worktrees/<slug>` on a new branch from `--from`, or
+from origin's default branch (`origin/HEAD`; never hard-coded). The branch gets no
+upstream, so a bare `git push` cannot target main. It refuses, listing every reason,
+if the branch exists locally or on origin, or the path exists. `--clone-dir DIR`
+(repeatable) copies a build directory such as `target` or `node_modules` from the main
+checkout with a copy-on-write clone (`cp -c -R`, macOS/APFS), so the first build is
+warm and costs no disk until files change. Elsewhere, or if cloning fails, it is
+skipped with a reason; it never falls back to a full copy. If `.claude/worktrees/` is
+not ignored, `notes` says so.
+
+`--scratch` makes a detached worktree, `.claude/worktrees/scratch-<random>`, for
+red/green checks and base comparisons. It is locked (reason `agentflow scratch …`), so
+the ordinary checks and a plain `git worktree remove` refuse it, and it is marked by a
+file in its Git admin directory, outside the tree. `agentflow worktree done <path>`
+removes a marked scratch worktree without the merged and clean checks (uncommitted
+files are expected and discarded; `discarded_head` keeps any commits recoverable until
+`git gc`), but still only when nothing is nested in it and no process works inside it.
+An unmarked worktree never takes this path.
+
+JSON on stdout: `path`, `branch`, `scratch`, `base`, `base_sha`, `cloned`,
+`clone_skipped`, `notes`; on a refusal, `refusals`. Exit codes: 0 created · 1 usage ·
+2 refused · 3 git error.
+
 ### `agentflow worktree done` / `sweep`: remove finished worktrees, never by force
 
 ```sh
@@ -584,6 +618,8 @@ repository had exactly that branch and head. Long-lived branches (the target, `m
 `master`, `develop`, `development`, `staging`, `production`, `release/*`, `hotfix/*`)
 are never deleted. `sweep` runs the same checks on every worktree; with `--yes` it
 removes those that pass and prunes the records of worktrees whose directories are gone.
+Scratch worktrees are listed apart, under `scratch`; with `--yes`, sweep removes those
+older than `--scratch-age` (default `24h`) that pass the scratch checks.
 `--keep-remote` leaves remote branches alone.
 
 JSON on stdout (per worktree: `ok`, `merged_via`, `refusals`, `keep_branch`, and after
