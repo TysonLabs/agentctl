@@ -195,6 +195,7 @@ func Run(ctx context.Context, o Options) *Result {
 
 	env := append(cleanEnv(os.Environ()), "AGENTFLOW_GATE_PROJECT="+t.project)
 	stopped, interrupted, anyFailed, anyTimeout := false, false, false, false
+	unproven := false // the tree may differ from ts.tree: write no more receipts
 	for _, st := range steps {
 		sr := StepResult{Name: st.Name}
 		switch {
@@ -220,13 +221,18 @@ func Run(ctx context.Context, o Options) *Result {
 			// A receipt claims the step ran on ts.tree. If this step (or an
 			// earlier one) changed the work tree, or the tree cannot be read
 			// again, that claim is unproven and no receipt is written.
-			if status != StepInterrupted && !res.TreeChanged {
-				after, err := workTree(ctx, t.root)
+			if status != StepInterrupted && !unproven {
+				after, err := rehash(ctx, t.root)
 				switch {
+				case err != nil && ctx.Err() != nil:
+					unproven, interrupted, stopped = true, true, true
 				case err != nil:
-					res.Warnings = append(res.Warnings, "re-hashing the work tree after "+st.Name+": "+err.Error()+"; no receipt recorded")
-					o.logf("warning: re-hashing the work tree after %s: %v; no receipt recorded", st.Name, err)
+					// Unknown is not unchanged: no later step may claim ts.tree.
+					unproven = true
+					res.Warnings = append(res.Warnings, "re-hashing the work tree after "+st.Name+": "+err.Error()+"; no receipt recorded for it or later steps")
+					o.logf("warning: re-hashing the work tree after %s: %v; no receipt recorded for it or later steps", st.Name, err)
 				case after.tree != ts.tree:
+					unproven = true
 					res.TreeChanged = true
 					res.Warnings = append(res.Warnings, st.Name+" changed the work tree; no receipt recorded for it or later steps")
 					o.logf("warning: %s changed the work tree; no receipt recorded for it or later steps", st.Name)
@@ -264,6 +270,9 @@ func Run(ctx context.Context, o Options) *Result {
 	}
 	return res
 }
+
+// rehash reads the work tree after a step; a variable so tests can fail it.
+var rehash = workTree
 
 func secs(d time.Duration) float64 { return math.Round(d.Seconds()*10) / 10 }
 

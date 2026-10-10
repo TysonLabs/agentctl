@@ -736,3 +736,45 @@ func TestStepThatChangesTheTreeLeavesNoReceipt(t *testing.T) {
 		t.Fatalf("HEAD's tree passed --check although a step rewrote it: %+v", c)
 	}
 }
+
+func TestRehashErrorStopsReceiptsAndCancelIsInterrupted(t *testing.T) {
+	repo := newRepo(t)
+	cfg := writeConfig(t, repo, "", stepDef{name: "a", run: "true"}, stepDef{name: "b", run: "true"})
+	o := opts(t, cfg, repo)
+	orig := rehash
+	t.Cleanup(func() { rehash = orig })
+
+	// The first re-hash fails, the second would match: b must still get no
+	// receipt, because nothing proves it ran on the starting tree.
+	calls := 0
+	rehash = func(ctx context.Context, root string) (treeState, error) {
+		calls++
+		if calls == 1 {
+			return treeState{}, fmt.Errorf("index locked")
+		}
+		return orig(ctx, root)
+	}
+	res := Run(context.Background(), o)
+	if res.Status != StatusPassed || len(res.Warnings) == 0 {
+		t.Fatalf("status %s warnings %v", res.Status, res.Warnings)
+	}
+	rf, err := readReceipts(res.Receipts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rf.Projects["p"][res.Tree]) != 0 {
+		t.Fatalf("receipts written after an unreadable tree: %+v", rf.Projects["p"][res.Tree])
+	}
+
+	// A cancel that lands during the re-hash is an interrupt, not a pass.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rehash = func(context.Context, string) (treeState, error) {
+		cancel()
+		return treeState{}, context.Canceled
+	}
+	o.Force = true
+	if res := Run(ctx, o); res.Status != StatusInterrupted || statuses(res) != "a=passed b=skipped" {
+		t.Fatalf("status %s steps %s, want interrupted with b skipped", res.Status, statuses(res))
+	}
+}
