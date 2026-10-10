@@ -41,9 +41,39 @@ agentctl is what curl looks like after you delete everything an agent could misu
 
 ## Install
 
+Three binaries; install all three (Go 1.26+, macOS for the Keychain):
+
 ```sh
-go install github.com/TysonLabs/agentctl@latest
+go install github.com/TysonLabs/agentctl@latest              # read-only /agent client (agents use it)
+go install github.com/TysonLabs/agentctl/cmd/agentflow@latest # workflow commands (agents use it)
+go install github.com/TysonLabs/agentctl/cmd/agentcfg@latest  # registry + Keychain editor (people use it)
 ```
+
+`go install` puts them in `$(go env GOPATH)/bin` (usually `~/go/bin`); make sure that is on
+your `PATH`. To update, run the same three commands again.
+
+### Set up with Claude
+
+Paste this into Claude Code:
+
+> Set up agentctl for me by following the "Setup steps for an agent" section of
+> https://github.com/TysonLabs/agentctl/blob/main/README.md
+
+#### Setup steps for an agent
+
+1. Install the three binaries with the `go install` commands above. Check that
+   `agentctl version`, `agentflow version` and `agentcfg version` all run; if not, add
+   `$(go env GOPATH)/bin` to `PATH` in the user's shell profile.
+2. Ask the user to run `agentcfg ui` themselves and add each service (name, env, base URL)
+   with its `/agent` token. **Do not run agentcfg or handle tokens yourself:** it writes
+   credentials, and tokens must never pass through the conversation.
+3. Run `agentctl ls` and confirm every service the user expects shows `wired`.
+4. Add the snippet from [For agents](#for-agents-claudemd-snippet) to `~/.claude/CLAUDE.md`
+   (create the file if needed; append, never replace existing content).
+5. Add `"Bash(agentctl:*)"` and `"Bash(agentflow:*)"` to `permissions.allow` in
+   `~/.claude/settings.json`, so the read-only client and the workflow commands run without
+   prompts. Do not allow `agentcfg`.
+6. Report what you installed, which services are wired, and anything the user still has to do.
 
 ## Quick start
 
@@ -220,12 +250,25 @@ output scrubbing, host+path-pinned redirects, timeouts, and a response size cap.
 ## For agents (CLAUDE.md snippet)
 
 ```markdown
-## Observability via agentctl
-- `agentctl ls` — services you can query; only "wired" ones are callable.
-- `agentctl endpoints <svc.env>` — discover what a service exposes.
-- `agentctl get <svc.env> <path>` — read-only GET under /agent; pretty JSON on stdout.
-- `agentctl status` — quick fleet health; exit 0 = all good, 2 = HTTP errors, 3 = unreachable.
-- It cannot mutate anything: GET-only, /agent-only, registered hosts only.
+## Services: agentctl and agentflow
+- `agentctl` is the only way to read a service's `/agent` surface. Never curl it.
+  It is read-only (GET, /agent, registered hosts), so it is always safe to run.
+  - `agentctl ls`: the services you can query; only "wired" ones are callable.
+  - `agentctl endpoints <svc.env>`: what a service exposes. Start here.
+  - `agentctl get <svc.env> <path>`: one read, JSON on stdout.
+  - `agentctl logs <svc.env> --q <text> --since 30m`: readable log lines; no parsing script.
+  - `agentctl status`: fleet health (0 ok, 2 HTTP errors, 3 unreachable).
+- Waiting on something: run it with `run_in_background` and keep working; never a
+  `sleep` loop. `agentctl logs <svc.env> --q <text> --wait 20m` exits 0 when it appears.
+- Shipping follows https://github.com/TysonLabs/agentctl/blob/main/AGENTS.md, with:
+  - `agentflow codex|claude --base main --prompt-file brief.md [--write]`: a review by
+    the other agent; trust its exit code and `final.md`, then audit each fix.
+  - `agentflow pr wait <pr>` (background): CodeRabbit has reviewed the PR head.
+  - `agentflow ship verify <svc.env> --sha <merge-sha>` (background): the deploy is live.
+    Never say "deployed" without it.
+  - `agentflow ship announce <svc.env> --verified verify.json ...`: post it to Slack.
+  - `agentflow worktree done <branch>`: remove a merged worktree; never force.
+- Never run `agentcfg` or handle tokens: a person edits the registry with it.
 ```
 
 ## Building a /agent surface in your service

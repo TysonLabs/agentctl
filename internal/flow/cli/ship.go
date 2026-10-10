@@ -42,12 +42,15 @@ error · 2 not deployed (--once) · 3 version unreadable · 124 timeout
 · 130 interrupted.
 
 announce: post a verified deploy to the service's Slack channel, once per
-service.env and commit. The channel is an incoming webhook in services.toml:
+service.env and commit. The channel is an incoming webhook, set up once with
+agentcfg (a person runs it; it keeps the webhook in the Keychain):
+
+  pbpaste | agentcfg announce myservice --channel "#myservice-releases" --webhook
 
   [myservice.announce]
-  webhook = "https://hooks.slack.com/services/..."   # a secret, never printed
-  channel = "#myservice-releases"                     # label for output
-  envs    = ["prod"]                                  # default ["prod"]
+  webhook_ref = "keychain:myservice.announce"  # or, legacy, webhook = "https://hooks.slack.com/..."
+  channel     = "#myservice-releases"          # label for output
+  envs        = ["prod"]                       # default ["prod"]
 
   --verified FILE    the JSON from ship verify for this deploy (required);
                      it must say deployed, for this service, within --max-age
