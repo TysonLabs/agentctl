@@ -78,7 +78,7 @@ stay as they were.
 
   --lessons-dir DIR   the lessons folder (default: $AGENTFLOW_LESSONS_DIR)
   --principles FILE   default: "Code Review Principles.md" next to the folder
-  --format json|text  bump, retire, stats: JSON (default) or a text summary
+  --format json|text  every subcommand but brief: JSON (default) or a text summary
 
 Exit codes: 0 ok · 1 usage/precondition · 2 an id was not found (nothing
 written) · 3 add --if-no-duplicate found a candidate duplicate (nothing written)
