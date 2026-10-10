@@ -175,7 +175,7 @@ func TestPRThread(t *testing.T) {
 	fakeGH(t, cliThreads, cliThread)
 	code, out, errOut := run(t, "pr", "thread", "PRRT_a", "--format", "text")
 	want := "pr thread: ok (exit 0)\nthread: PRRT_a\nrepo: o/r\npr: 7\npath: a.go:3\nresolved: false\noutdated: false\n" +
-		"comments: 1\ncomments_complete: true\n- coderabbitai 2026-10-01T10:00:00Z\n    **Nil map.**\n    Use make.\\u202e\n"
+		"comments: 1\ncomments_complete: true\n- coderabbitai 2026-10-01T10:00:00Z\n    url: https://x/1\n    **Nil map.**\n    Use make.\\u202e\n"
 	if code != 0 || out != want {
 		t.Fatalf("exit %d stderr %q\ngot:\n%s\nwant:\n%s", code, errOut, out, want)
 	}
@@ -221,6 +221,7 @@ func TestTextRenderers(t *testing.T) {
 	zero, two := 0, 2
 	cost := 0.25
 	done := true
+	body := "b"
 	cases := []struct {
 		name, got, want string
 	}{
@@ -265,7 +266,7 @@ func TestTextRenderers(t *testing.T) {
 			"lessons retire: ok (exit 0)\napplied: false\ncandidates: 1\n- l2 T: unused (X.md) [kept: linked from principles]\n"},
 		{"lessons stats", statsText(lessons.Stats{Lessons: 5, Inbox: 2}),
 			"lessons stats: ok (exit 0)\nlessons: 5\ninbox: 2\narchived: 0\nused_zero: 0\nmisled_nonzero: 0\nretire_candidates: 0\nretire_kept_linked: 0\nfalse_positives: 0\n"},
-		{"thread replies", waitText(pr.Result{Status: pr.StatusClean, OpenThreads: []pr.Thread{{ID: "PRRT_2", Path: "p", Replies: &two, Body: "b"}}}, 0),
+		{"thread replies", waitText(pr.Result{Status: pr.StatusClean, OpenThreads: []pr.Thread{{ID: "PRRT_2", Path: "p", Replies: &two, Body: &body}}}, 0),
 			"pr wait: clean (exit 0)\npr: 0\nopen_threads: 1\nattempts: 0\nduration_s: 0\n- PRRT_2 p\n    replies: 2\n    b\n"},
 	}
 	for _, c := range cases {

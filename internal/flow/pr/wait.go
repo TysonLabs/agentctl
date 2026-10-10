@@ -66,9 +66,9 @@ type Thread struct {
 	// Set only with Options.Bodies. Body is the first comment, sanitized
 	// (control characters escaped) and capped at MaxBodyRunes; Replies counts
 	// the comments after it.
-	Body          string `json:"body,omitempty"`
-	BodyTruncated bool   `json:"body_truncated,omitempty"`
-	Replies       *int   `json:"replies,omitempty"`
+	Body          *string `json:"body,omitempty"`
+	BodyTruncated bool    `json:"body_truncated,omitempty"`
+	Replies       *int    `json:"replies,omitempty"`
 }
 
 // Result is the machine-readable summary.
@@ -333,7 +333,8 @@ func parseThreads(out []byte, bodies bool) ([]Thread, bool, error) {
 				t.Line = *c.OriginalLine // an outdated thread keeps its original line
 			}
 			if bodies {
-				t.Body, t.BodyTruncated = SafeBody(c.Body)
+				body, truncated := SafeBody(c.Body)
+				t.Body, t.BodyTruncated = &body, truncated
 				replies := max(n.Comments.TotalCount-1, 0)
 				t.Replies = &replies
 			}

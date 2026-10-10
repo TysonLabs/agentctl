@@ -118,6 +118,8 @@ func Line(s string) string {
 }
 
 // Block is Line for multi-line text: LF and tab are kept, CRLF becomes LF.
+// A tab is layout, not a terminal command, and review suggestions carry
+// code indented with tabs.
 func Block(s string) string {
 	return clean(s, true)
 }

@@ -10,7 +10,7 @@ import (
 )
 
 const bodyThreads = `{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":[
- {"id":"PRRT_open","isResolved":false,"comments":{"totalCount":3,"nodes":[{"author":{"login":"coderabbitai"},"path":"a.go","line":12,"url":"https://x/1","body":"**Title.**\r\nred \u001b[31mtext\u001b[0m and ‮evil"}]}}
+ {"id":"PRRT_open","isResolved":false,"comments":{"totalCount":3,"nodes":[{"author":{"login":"coderabbitai"},"path":"a.go","line":12,"url":"https://x/1","body":"**Title.**\r\nred \u001b[31mtext\u001b[0m and \u202eevil"}]}}
 ]}}}}}`
 
 func TestWaitBodiesAddsSanitizedBodyAndReplies(t *testing.T) {
@@ -20,16 +20,28 @@ func TestWaitBodiesAddsSanitizedBodyAndReplies(t *testing.T) {
 	}
 	th := r.OpenThreads[0]
 	want := "**Title.**\nred \\x1b[31mtext\\x1b[0m and \\u202eevil"
-	if th.Body != want || th.BodyTruncated || th.Replies == nil || *th.Replies != 2 {
-		t.Errorf("body %q replies %v truncated %v; want %q, 2", th.Body, th.Replies, th.BodyTruncated, want)
+	if th.Body == nil || *th.Body != want || th.BodyTruncated || th.Replies == nil || *th.Replies != 2 {
+		t.Errorf("body %v replies %v truncated %v; want %q, 2", th.Body, th.Replies, th.BodyTruncated, want)
 	}
 }
 
 func TestWaitWithoutBodiesKeepsTheJSONShape(t *testing.T) {
 	r := Wait(context.Background(), Options{Repo: "o/r", PR: 7, Once: true, GH: (&fake{summary: covered(head), threads: bodyThreads}).gh})
 	b, _ := json.Marshal(r.OpenThreads[0])
-	if string(b) != `{"id":"PRRT_open","path":"a.go","line":12,"url":"https://x/1","excerpt":"**Title.** red \u001b[31mtext\u001b[0m and `+"‮"+`evil"}` {
+	if string(b) != `{"id":"PRRT_open","path":"a.go","line":12,"url":"https://x/1","excerpt":"**Title.** red \u001b[31mtext\u001b[0m and `+"\u202e"+`evil"}` {
 		t.Errorf("thread JSON changed without --bodies: %s", b)
+	}
+}
+
+func TestWaitBodiesIncludesEmptyBody(t *testing.T) {
+	threads := strings.Replace(bodyThreads, `"body":"**Title.**\r\nred \u001b[31mtext\u001b[0m and \u202eevil"`, `"body":""`, 1)
+	r := Wait(context.Background(), Options{Repo: "o/r", PR: 7, Once: true, Bodies: true, GH: (&fake{summary: covered(head), threads: threads}).gh})
+	if r.Status != StatusOpenThreads || len(r.OpenThreads) != 1 {
+		t.Fatalf("got %+v", r)
+	}
+	b, _ := json.Marshal(r.OpenThreads[0])
+	if !strings.Contains(string(b), `"body":""`) {
+		t.Errorf("--bodies omitted an empty body: %s", b)
 	}
 }
 

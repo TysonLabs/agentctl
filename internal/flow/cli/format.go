@@ -150,7 +150,9 @@ func waitText(res pr.Result, code int) string {
 			t.Field("    replies", *th.Replies)
 		}
 		t.Field("    url", th.URL)
-		t.Indent("    ", th.Body)
+		if th.Body != nil {
+			t.Indent("    ", *th.Body)
+		}
 	}
 	return t.String()
 }
@@ -173,6 +175,7 @@ func threadText(res pr.ThreadResult, code int) string {
 	t.Field("error", res.Error)
 	for _, c := range res.Comments {
 		t.Item("%s %s", c.Author, c.CreatedAt)
+		t.Field("    url", c.URL)
 		t.Indent("    ", c.Body)
 	}
 	return t.String()
