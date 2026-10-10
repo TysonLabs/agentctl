@@ -120,6 +120,39 @@ type Result struct {
 	CostUSD   *float64 `json:"cost_usd,omitempty"` // Claude reports it
 	Error     string   `json:"error,omitempty"`
 	Args      []string `json:"args"`
+
+	// Protocol is the built-in protocol the prompt used ("fix" or "review").
+	// With one, "findings" is always present: the parsed final message, or
+	// null when the run failed or the message did not follow the format (a
+	// warning then says why). Without one, both are omitted.
+	Protocol string     `json:"protocol,omitempty"`
+	Findings *[]Finding `json:"findings,omitempty"`
+	Warnings []string   `json:"warnings,omitempty"`
+}
+
+// SetFindings fills Protocol and Findings from the final answer of a run
+// that used protocol p. It never changes Status: a final message that does
+// not parse is a warning, not a failed run.
+func (r *Result) SetFindings(p Protocol) {
+	if p == ProtocolNone {
+		return
+	}
+	r.Protocol = string(p)
+	r.Findings = new([]Finding) // points at a nil slice: renders as null
+	if r.Status != StatusOK {
+		return
+	}
+	text, err := os.ReadFile(r.Final)
+	if err != nil {
+		r.Warnings = append(r.Warnings, "findings not parsed: "+err.Error())
+		return
+	}
+	list, err := ParseFindings(string(text))
+	if err != nil {
+		r.Warnings = append(r.Warnings, "findings not parsed: the final message does not follow the protocol format: "+err.Error())
+		return
+	}
+	r.Findings = &list
 }
 
 // MarshalJSON adds the agent's exit code as "codex_exit" or "claude_exit".

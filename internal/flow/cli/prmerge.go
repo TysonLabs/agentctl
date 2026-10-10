@@ -44,6 +44,7 @@ func runPRMerge(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	fs.StringVar(&o.Head, "head", "", "")
 	fs.BoolVar(&o.Admin, "admin", false, "")
 	fs.StringVar(&o.SyncBranch, "sync-branch", "", "")
+	format := formatFlag(fs)
 	pos, err := parseInterleaved(fs, args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -104,11 +105,14 @@ func runPRMerge(ctx context.Context, args []string, stdout, stderr io.Writer) in
 
 	res := pr.Merge(ctx, o)
 	out, _ := json.MarshalIndent(res, "", "  ")
-	_, _ = stdout.Write(append(out, '\n'))
 	code, ok := prMergeExitCodes[res.Status]
 	if !ok {
+		code = 1
+	}
+	emit(stdout, *format, append(out, '\n'), func() string { return mergeText(res, code) })
+	if !ok {
 		fmt.Fprintf(stderr, "agentflow pr merge: unknown result status %q\n", res.Status)
-		return 1
+		return code
 	}
 	if code != 0 {
 		msg := res.Next
