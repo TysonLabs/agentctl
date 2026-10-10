@@ -493,7 +493,7 @@ JSON: `status`, `number`, `url`, `base`, `default_branch`, `head` (the branch), 
 | Exit | Status | Meaning |
 |---|---|---|
 | 0 | `created` / `existing` / `retargeted` | the PR is open on the base at the pushed commit |
-| 1 | — | usage error, or the repository could not be resolved |
+| 1 | — | usage error |
 | 2 | `refused` | a precondition failed; nothing was pushed or changed |
 | 3 | `error` | git or gh failed (`error` says which step; the branch may be pushed) |
 | 4 | `unverified` | the PR exists, but its read-back or the review request failed |

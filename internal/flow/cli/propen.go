@@ -134,6 +134,9 @@ func runPROpen(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	if o.Base != "" && !pr.ValidBranch(o.Base) {
 		return fail("--base %q is not a plain branch name", o.Base)
 	}
+	if o.Repo != "" && !validPRRepo(o.Repo) {
+		return fail("--repo %q is not OWNER/NAME", o.Repo)
+	}
 	if noReview && set["reviewer-mention"] {
 		return fail("--no-review-request and --reviewer-mention are mutually exclusive")
 	}
@@ -150,25 +153,42 @@ func runPROpen(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	}
 	gitBin, err := exec.LookPath("git")
 	if err != nil {
-		return fail("git not found on PATH")
+		return writePROpenResult(pr.OpenResult{Status: pr.OpenError, Repo: o.Repo, Reasons: []string{},
+			Next: "install git, then run it again", Error: "git not found on PATH"}, stdout, stderr)
 	}
 	ghBin := os.Getenv("AGENTFLOW_GH")
 	if ghBin == "" {
 		if ghBin, err = exec.LookPath("gh"); err != nil {
-			return fail("gh not found: put it on PATH or set AGENTFLOW_GH")
+			return writePROpenResult(pr.OpenResult{Status: pr.OpenError, Repo: o.Repo, Reasons: []string{},
+				Next: "install gh or set AGENTFLOW_GH, then run it again", Error: "gh not found on PATH"}, stdout, stderr)
 		}
 	}
 	o.GH = pr.GHCLIIn(ghBin, dir, 60*time.Second)
 	// A push can take a while; every other git call is local or a small fetch.
 	o.Git = pr.GitCLI(gitBin, dir, 5*time.Minute)
 
-	repo, code := resolvePRRepo(ctx, "agentflow pr open", o.GH, o.Repo, stderr)
-	if code >= 0 {
-		return code
+	repo, err := resolvePRRepo(ctx, o.GH, o.Repo)
+	if err != nil {
+		if ctx.Err() != nil {
+			return writePROpenResult(pr.OpenResult{Status: pr.OpenInterrupted, Repo: o.Repo, Reasons: []string{},
+				Next: "nothing was pushed; run it again", Error: "interrupted"}, stdout, stderr)
+		}
+		return writePROpenResult(pr.OpenResult{Status: pr.OpenError, Repo: o.Repo, Reasons: []string{},
+			Next: "fix the error, then run it again", Error: err.Error()}, stdout, stderr)
 	}
 	o.Repo = repo
 
 	res := pr.Open(ctx, o)
+	return writePROpenResult(res, stdout, stderr)
+}
+
+func writePROpenResult(res pr.OpenResult, stdout, stderr io.Writer) int {
+	if res.Reasons == nil {
+		res.Reasons = []string{}
+	}
+	if res.CheckedAt == "" {
+		res.CheckedAt = time.Now().UTC().Format(time.RFC3339)
+	}
 	out, _ := json.MarshalIndent(res, "", "  ")
 	_, _ = stdout.Write(append(out, '\n'))
 	code, ok := prOpenExitCodes[res.Status]
@@ -187,33 +207,33 @@ func runPROpen(ctx context.Context, args []string, stdout, stderr io.Writer) int
 }
 
 // resolvePRRepo returns --repo, or the directory's repository from gh, and
-// validates it as OWNER/NAME. It never guesses. code is -1 on success, else
-// the exit code to return (1 usage or gh error, 130 interrupted).
+// validates a derived repository as OWNER/NAME. It never guesses. An explicit
+// repository was already validated with the other command-line arguments.
 // TODO(#33): pr wait and pr merge still carry their own copies; point them here.
-func resolvePRRepo(ctx context.Context, cmd string, gh pr.GH, repo string, stderr io.Writer) (string, int) {
+func resolvePRRepo(ctx context.Context, gh pr.GH, repo string) (string, error) {
 	if repo == "" {
 		out, err := gh(ctx, "repo", "view", "--json", "nameWithOwner")
 		if err != nil {
-			if ctx.Err() != nil {
-				fmt.Fprintf(stderr, "%s: interrupted\n", cmd)
-				return "", 130
-			}
-			fmt.Fprintf(stderr, "%s: no --repo and the directory has no GitHub repo: %v\n", cmd, err)
-			return "", 1
+			return "", fmt.Errorf("no --repo and the directory has no GitHub repo: %w", err)
 		}
 		var rv struct {
 			NameWithOwner string `json:"nameWithOwner"`
 		}
-		if json.Unmarshal(out, &rv) != nil || rv.NameWithOwner == "" {
-			fmt.Fprintf(stderr, "%s: no --repo and gh repo view gave no name\n", cmd)
-			return "", 1
+		if err := json.Unmarshal(out, &rv); err != nil {
+			return "", fmt.Errorf("no --repo and gh repo view returned invalid JSON: %w", err)
+		}
+		if rv.NameWithOwner == "" {
+			return "", errors.New("no --repo and gh repo view gave no name")
 		}
 		repo = rv.NameWithOwner
 	}
-	owner, name, _ := strings.Cut(repo, "/")
-	if !repoRe.MatchString(repo) || owner == "." || owner == ".." || name == "." || name == ".." {
-		fmt.Fprintf(stderr, "%s: --repo %q is not OWNER/NAME\n", cmd, repo)
-		return "", 1
+	if !validPRRepo(repo) {
+		return "", fmt.Errorf("gh repo view gave invalid repository %q", repo)
 	}
-	return repo, -1
+	return repo, nil
+}
+
+func validPRRepo(repo string) bool {
+	owner, name, _ := strings.Cut(repo, "/")
+	return repoRe.MatchString(repo) && owner != "." && owner != ".." && name != "." && name != ".."
 }

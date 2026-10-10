@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,5 +81,21 @@ func TestPROpenExitCodesCoverEveryStatus(t *testing.T) {
 		if prOpenExitCodes[s] != want {
 			t.Errorf("%s exits %d, want %d", s, prOpenExitCodes[s], want)
 		}
+	}
+}
+
+func TestPROpenRepoLookupFailureIsJSONError(t *testing.T) {
+	t.Setenv("AGENTFLOW_GH", filepath.Join(t.TempDir(), "missing-gh"))
+	var out, errb bytes.Buffer
+	code := Run([]string{"pr", "open", "--title", "t", "--body", "b", "--dir", t.TempDir()}, &out, &errb)
+	if code != 3 {
+		t.Fatalf("exit %d, want 3; stderr %q", code, errb.String())
+	}
+	var res pr.OpenResult
+	if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+		t.Fatalf("stdout is not an OpenResult: %q: %v", out.String(), err)
+	}
+	if res.Status != pr.OpenError || !strings.Contains(res.Error, "no --repo") {
+		t.Errorf("result %+v", res)
 	}
 }

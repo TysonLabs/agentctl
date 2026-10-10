@@ -150,9 +150,10 @@ func Open(ctx context.Context, o OpenOptions) OpenResult {
 			return fail(ctx.Err())
 		}
 		res.Reasons = append(res.Reasons, "HEAD is detached: check out a branch first")
-		return finish(OpenRefused, "fix the reasons listed, then run it again", "")
+		branch = ""
+	} else {
+		res.Head = branch
 	}
-	res.Head = branch
 	status, err := o.Git(ctx, "status", "--porcelain", "--untracked-files=no")
 	if err != nil {
 		return fail(err)
@@ -173,14 +174,16 @@ func Open(ctx context.Context, o OpenOptions) OpenResult {
 	if strings.TrimSpace(status) != "" {
 		res.Reasons = append(res.Reasons, "the working tree has uncommitted changes to tracked files (they would not be in the PR): commit or stash them")
 	}
-	switch {
-	case branch == base:
-		res.Reasons = append(res.Reasons, fmt.Sprintf("the current branch %q is the base: create a feature branch", branch))
-	case branch == def || longLivedBranches[strings.ToLower(branch)]:
-		res.Reasons = append(res.Reasons, fmt.Sprintf("the current branch %q is a long-lived branch: create a feature branch", branch))
-	}
-	if !ValidBranch(branch) {
-		res.Reasons = append(res.Reasons, fmt.Sprintf("the branch name %q is not a plain branch name", branch))
+	if branch != "" {
+		switch {
+		case branch == base:
+			res.Reasons = append(res.Reasons, fmt.Sprintf("the current branch %q is the base: create a feature branch", branch))
+		case branch == def || longLivedBranches[strings.ToLower(branch)]:
+			res.Reasons = append(res.Reasons, fmt.Sprintf("the current branch %q is a long-lived branch: create a feature branch", branch))
+		}
+		if !ValidBranch(branch) {
+			res.Reasons = append(res.Reasons, fmt.Sprintf("the branch name %q is not a plain branch name", branch))
+		}
 	}
 	if strings.TrimSpace(o.Title) == "" {
 		res.Reasons = append(res.Reasons, "the title is empty")
@@ -202,7 +205,7 @@ func Open(ctx context.Context, o OpenOptions) OpenResult {
 		res.Reasons = append(res.Reasons, fmt.Sprintf("the base branch %q does not exist on origin", base))
 	} else {
 		if _, err := o.Git(ctx, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "origin",
-			"+refs/heads/"+base+":refs/remotes/origin/"+base); err != nil {
+			baseSHA); err != nil {
 			return fail(err)
 		}
 		n, err := o.Git(ctx, "rev-list", "--count", baseSHA+"..HEAD")
@@ -213,27 +216,32 @@ func Open(ctx context.Context, o OpenOptions) OpenResult {
 			res.Reasons = append(res.Reasons, fmt.Sprintf("the branch has no commits that are not in %s", base))
 		}
 	}
-	branchSHA, err := remoteBranchSHA(ctx, o.Git, branch)
-	if err != nil {
-		return fail(err)
-	}
-	if branchSHA != "" && branchSHA != head {
-		if _, err := o.Git(ctx, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "origin",
-			"+refs/heads/"+branch+":refs/remotes/origin/"+branch); err != nil {
+	if branch != "" {
+		branchSHA, err := remoteBranchSHA(ctx, o.Git, branch)
+		if err != nil {
 			return fail(err)
 		}
-		if _, err := o.Git(ctx, "merge-base", "--is-ancestor", branchSHA, "HEAD"); err != nil {
-			if ctx.Err() != nil {
-				return fail(ctx.Err())
+		if branchSHA != "" && branchSHA != head {
+			if _, err := o.Git(ctx, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "origin",
+				branchSHA); err != nil {
+				return fail(err)
 			}
-			res.Reasons = append(res.Reasons, fmt.Sprintf("origin/%s has commits this branch does not (behind or diverged): pull or rebase; pr open never force-pushes", branch))
+			if _, err := o.Git(ctx, "merge-base", "--is-ancestor", branchSHA, "HEAD"); err != nil {
+				if ctx.Err() != nil {
+					return fail(ctx.Err())
+				}
+				res.Reasons = append(res.Reasons, fmt.Sprintf("origin/%s has commits this branch does not (behind or diverged): pull or rebase; pr open never force-pushes", branch))
+			}
 		}
 	}
 
 	// 4. An open PR for this branch already?
-	prs, err := openPRsForBranch(ctx, o, branch)
-	if err != nil {
-		return fail(err)
+	var prs []existingPR
+	if branch != "" {
+		prs, err = openPRsForBranch(ctx, o, branch)
+		if err != nil {
+			return fail(err)
+		}
 	}
 	var existing *existingPR
 	switch len(prs) {
@@ -261,6 +269,18 @@ func Open(ctx context.Context, o OpenOptions) OpenResult {
 
 	// 5. Push. A plain push: git refuses anything but a fast-forward.
 	if _, err := o.Git(ctx, "push", "--quiet", "-u", "origin", "HEAD:refs/heads/"+branch); err != nil {
+		if ctx.Err() != nil {
+			dctx := context.WithoutCancel(ctx)
+			pushedSHA, checkErr := remoteBranchSHA(dctx, o.Git, branch)
+			switch {
+			case checkErr != nil:
+				return finish(OpenError, fmt.Sprintf("the push outcome is unknown; inspect origin/%s, then run it again", branch),
+					"push was interrupted and its outcome could not be verified: "+checkErr.Error())
+			case pushedSHA == head:
+				return finish(OpenError, "the branch was pushed to the intended commit; run it again to open or find the PR",
+					fmt.Sprintf("push was interrupted after origin/%s reached %s", branch, head))
+			}
+		}
 		return fail(err)
 	}
 

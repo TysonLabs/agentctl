@@ -340,6 +340,30 @@ func TestOpenRefusesDetachedHead(t *testing.T) {
 	}
 }
 
+func TestOpenDetachedHeadStillListsIndependentRefusals(t *testing.T) {
+	f := newOpenFixture(t)
+	runGit(t, f.repo, "checkout", "-q", "--detach")
+	if err := os.WriteFile(filepath.Join(f.repo, "a.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g := &openFake{f: f}
+	o := f.opts(g)
+	o.Title, o.Body = " ", "\n"
+	res := Open(context.Background(), o)
+	if res.Status != OpenRefused {
+		t.Fatalf("status %s, want refused", res.Status)
+	}
+	all := strings.Join(res.Reasons, "\n")
+	for _, want := range []string{"detached", "uncommitted changes", "title is empty", "body is empty"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("reasons %q lack %q", all, want)
+		}
+	}
+	if len(f.pushes()) != 0 || g.count("api") != 0 {
+		t.Errorf("changed something on refusal: pushes %v, calls %v", f.pushes(), g.calls)
+	}
+}
+
 func TestOpenRefusesMissingBase(t *testing.T) {
 	f := newOpenFixture(t)
 	o := f.opts(&openFake{f: f})
@@ -368,6 +392,25 @@ func TestOpenRefusesBranchBehindOrigin(t *testing.T) {
 	}
 	if len(f.pushes()) != 0 || f.originSHA("feat/x") != theirs {
 		t.Errorf("origin changed: pushes %v", f.pushes())
+	}
+}
+
+func TestOpenRefusalDoesNotMoveRemoteTrackingRefs(t *testing.T) {
+	f := newOpenFixture(t)
+	before := runGit(t, f.repo, "rev-parse", "refs/remotes/origin/main")
+	commitFile(t, f.seed, "remote.txt", "remote\n", "advance base")
+	runGit(t, f.seed, "push", "-q", "origin", "main")
+	if got := f.originSHA("main"); got == before {
+		t.Fatal("test setup did not advance origin/main")
+	}
+	o := f.opts(&openFake{f: f})
+	o.Title = " "
+	res := Open(context.Background(), o)
+	if res.Status != OpenRefused || !strings.Contains(strings.Join(res.Reasons, ""), "title is empty") {
+		t.Fatalf("result %+v", res)
+	}
+	if after := runGit(t, f.repo, "rev-parse", "refs/remotes/origin/main"); after != before {
+		t.Errorf("refusal moved refs/remotes/origin/main from %s to %s", before, after)
 	}
 }
 
@@ -506,6 +549,34 @@ func TestOpenCreateErrorAfterPushIsError(t *testing.T) {
 	res := Open(context.Background(), f.opts(g))
 	if res.Status != OpenError || !strings.Contains(res.Error, "422") || !strings.Contains(res.Next, "pushed") {
 		t.Fatalf("result %+v", res)
+	}
+}
+
+func TestOpenInterruptedPushThatLandedReportsPush(t *testing.T) {
+	f := newOpenFixture(t)
+	g := &openFake{f: f}
+	o := f.opts(g)
+	realGit := o.Git
+	ctx, cancel := context.WithCancel(context.Background())
+	o.Git = func(ctx context.Context, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "push" {
+			if _, err := realGit(context.WithoutCancel(ctx), args...); err != nil {
+				return "", err
+			}
+			cancel()
+			return "", context.Canceled
+		}
+		return realGit(ctx, args...)
+	}
+	res := Open(ctx, o)
+	if res.Status != OpenError || !strings.Contains(res.Next, "pushed") || !strings.Contains(res.Error, "interrupted") {
+		t.Fatalf("result %+v", res)
+	}
+	if got := f.originSHA("feat/x"); got != f.head() {
+		t.Errorf("origin feat/x = %s, want pushed head %s", got, f.head())
+	}
+	if g.created != nil {
+		t.Error("created a PR after the caller interrupted the push")
 	}
 }
 
