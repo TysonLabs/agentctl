@@ -39,8 +39,11 @@ background and keep working; your harness tells you when it exits. Never wait in
    default branch. If it fails, fix it and rerun the failing part. To merge the default
    branch in, run `agentflow branch sync --merge`: it reports what came in and which
    files both sides touched, and lists any conflicts it leaves for you to resolve.
-6. **Push and open a PR** whose body says what changed, how it was verified, and any
-   review fix you did not take as written, with the reason.
+6. **Push and open a PR** with `agentflow pr open --title ... --body-file pr.md`: it
+   derives the base from the default branch (never type `main`), never force-pushes,
+   returns the existing PR on a rerun, and requests the CodeRabbit review on a
+   non-default base. The body says what changed, how it was verified, and any review fix
+   you did not take as written, with the reason.
 7. **Handle every PR review thread.** If the repo uses CodeRabbit, run
    `agentflow pr wait <number>` in the background after each push that needs a review:
    exit 0 means the head is reviewed and clean, 10 lists the open threads (with ids) in

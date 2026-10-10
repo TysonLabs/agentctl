@@ -17,7 +17,12 @@ import (
 	"github.com/TysonLabs/agentctl/internal/flow/pr"
 )
 
-const prUsage = `agentflow pr wait <number> [flags]
+const prUsage = `agentflow pr open --title T --body-file F [--base B] [flags]
+
+Push the current branch (never forced) and open a PR against the derived
+base, or return the open PR for the branch. See: agentflow pr open --help.
+
+agentflow pr wait <number> [flags]
 
 Wait until CodeRabbit has reviewed the pull request's CURRENT head commit,
 then report the CodeRabbit review threads that are still open. Run it in the
@@ -141,6 +146,8 @@ func runPR(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return runPRReply(ctx, args[1:], stdout, stderr)
 	case "merge":
 		return runPRMerge(ctx, args[1:], stdout, stderr)
+	case "open":
+		return runPROpen(ctx, args[1:], stdout, stderr)
 	case "thread":
 		return runPRThread(ctx, args[1:], stdout, stderr)
 	default:

@@ -542,6 +542,52 @@ agentflow adds the header line (service, env, short SHA, PR link, verify time) a
 | 4 | `slack_error` | Slack or the network rejected the post; nothing is recorded, so a rerun retries |
 | 130 | — | interrupted |
 
+### `agentflow pr open`: push the branch and open a PR against the derived base
+
+```sh
+agentflow pr open --title "Add retry budget" --body-file pr.md            # base: the default branch
+agentflow pr open --title "Stacked step 2" --body-file pr.md --base feat/step-1
+agentflow pr open --title "..." --body-file pr.md --draft --dir ../my-worktree
+```
+
+- **The base is read, never typed.** Without `--base`, the base is the repository's
+  default branch, read from GitHub. Hard-coding `main` or `master` is how PRs land on the
+  wrong base.
+- **Refuses before it pushes.** Every precondition is checked first, and a refusal (exit 2)
+  lists every failed one: HEAD is a branch that is not the base, the default branch or
+  another long-lived branch (`main`, `master`, `development`, ...); no uncommitted changes
+  to tracked files (they would not be in the PR); the branch has commits that are not in
+  the base; the branch on `origin`, if any, is an ancestor of HEAD; the title and body are
+  not empty; origin is the repository itself (no fork PRs).
+- **Never force-pushes.** It runs a plain `git push -u origin HEAD:refs/heads/<branch>`.
+  A branch that is behind or diverged from origin is refused.
+- **Idempotent.** If an open PR already has the branch as its head, it pushes and
+  returns that PR (`existing`) instead of opening another; its title and body are not
+  changed. If that PR has another base, it refuses unless `--retarget` moves it.
+- **Strings stay strings.** The PR is created with `gh api` and every string passed with
+  `-f` (raw); `-F` is used for the draft flag only, so a numeric title or a body that starts
+  with `@` arrives as typed.
+- **Read back.** After the create, the PR is read back: it must be open, on the base, at
+  the pushed commit, and carry the body that was sent (line endings and surrounding
+  whitespace aside). An empty body from a failed pipe is caught here (exit 4).
+- **Review request on a non-default base.** CodeRabbit skips PRs whose base is not the
+  default branch, so pr open comments `@coderabbitai review` there, once: a rerun finds
+  the comment and does not post it again. `--reviewer-mention TEXT` changes the text;
+  `--no-review-request` posts none.
+
+JSON: `status`, `number`, `url`, `base`, `default_branch`, `head` (the branch), `head_sha`,
+`previous_base` (after `--retarget`), `review_requested`, `reasons`, `next` (for example
+`agentflow pr wait <number>`), `error`.
+
+| Exit | Status | Meaning |
+|---|---|---|
+| 0 | `created` / `existing` / `retargeted` | the PR is open on the base at the pushed commit |
+| 1 | — | usage error |
+| 2 | `refused` | a precondition failed; nothing was pushed or changed |
+| 3 | `error` | git or gh failed (`error` says which step; the branch may be pushed) |
+| 4 | `unverified` | the PR exists, but its read-back or the review request failed |
+| 130 | `interrupted` | interrupted before the push |
+
 ### `agentflow pr wait`: wait for CodeRabbit's review of the PR head
 
 ```sh
@@ -584,7 +630,7 @@ no token.
 | 0 | `clean` | the head is reviewed and no CodeRabbit thread is open |
 | 1 | `gh_error` / — | usage error, or gh failed on the first check |
 | 2 | `waiting` | `--once` only: the head is not reviewed yet |
-| 3 | `skipped` | review skipped (draft, non-default base, paused): comment `@coderabbitai review` |
+| 3 | `skipped` | review skipped (draft, non-default base, paused): comment `@coderabbitai review` (`pr open` already did for a non-default base; check the comment is there) |
 | 4 | `rate_limited` | wait the time in CodeRabbit's comment, then `@coderabbitai review` |
 | 5 | `closed` | the PR is closed or merged and its head was never reviewed |
 | 10 | `open_threads` | the head is reviewed; fix, reply, then resolve each thread |
