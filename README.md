@@ -266,6 +266,8 @@ agentflow codex --base main --prompt-file brief.md           # your brief, with 
 agentflow codex --uncommitted --prompt-file brief.md --path internal/flow   # one area at a time
 agentflow codex --prompt-file plan-review.md --dir ~/src/repo                # any read-only task
 agentflow codex --base main --prompt-file fix.md --write     # fix mode (workspace-write)
+agentflow codex --base main --prompt-file brief.md --write --protocol fix --test-cmd 'go test ./internal/x'
+                                                             # fix mode with the built-in protocol
 ```
 
 What it guarantees, each one a way a hand-typed Codex invocation has failed:
@@ -338,6 +340,62 @@ Codex wrote can be reviewed by Claude. The differences:
   under `~/.claude/projects/` (or `$CLAUDE_CONFIG_DIR`).
 
 Set `AGENTFLOW_CLAUDE` to use a claude binary other than the one on `PATH`.
+
+### `--protocol fix|review`: the review rules and output format, built in
+
+```sh
+agentflow codex  --base main --prompt-file brief.md --write --protocol fix --test-cmd 'go test ./internal/x'
+agentflow claude --base main --prompt-file brief.md --protocol review
+agentflow codex  --base main --protocol review              # no brief: the protocol and the diff only
+```
+
+Without it, every review brief retypes the same rules. With it, the brief says only what
+changed and what it must guarantee. On `codex` and `claude`, `--protocol` wraps the
+brief, and the prompt is assembled in this order:
+
+1. the protocol: the reviewer's role and rules;
+2. your brief (optional when a scope is set);
+3. the output format;
+4. the learned-checks section, with `--lessons`;
+5. the scoped diff.
+
+`--max-prompt-bytes` counts all of it.
+
+- **`fix`** needs `--write`. The rules: fix each real defect in the working tree; don't
+  commit; edit only files in the repository; add no dependency the fix doesn't need;
+  add one test per fix that fails without it; run the targeted tests; list deliberate
+  non-fixes. It also says that tests binding loopback sockets fail in the sandbox, so the
+  reviewer names them and the caller runs them. `--test-cmd CMD` (repeatable, fix only)
+  names the targeted tests.
+- **`review`** must be read-only (no `--write`). The reviewer edits nothing and gives a
+  suggested fix and a test for each defect.
+- The mode is a separate flag, not implied by `--write`. A dropped `--write` is refused
+  and never turns a fix run into a review.
+
+The final message has a fixed shape:
+
+```text
+## Findings
+
+### F1 [Major] internal/x/a.go:42
+WHY: the failing scenario
+FIX: what changed (review: the suggested change)
+TEST: the test that fails without the fix
+
+## Not fixed
+
+- what was left, and why (or "None.")
+```
+
+Severity is `Blocker`, `Major` or `Minor`. With `--lessons`, a learned-check finding ends
+its heading with `[learned l<id>]`. A clean review writes `None.` under `## Findings`.
+agentflow parses `final.md` into the JSON result:
+`"protocol": "fix"` and `"findings": [{"id", "severity", "file", "line", "learned", "why",
+"fix", "test"}]`. `[]` means no findings. If the message does not follow the format,
+`findings` is `null` and `warnings` says why. One malformed block voids the whole list,
+so a partial list never passes for a complete one. A failed run also has `findings: null`.
+Parsing never changes the status or the exit code. Without `--protocol`, neither key
+appears.
 
 ### `agentflow coderabbit`: run the CodeRabbit CLI's local review safely
 
