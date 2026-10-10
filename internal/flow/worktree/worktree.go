@@ -35,6 +35,7 @@ type Worktree struct {
 	Locked     bool
 	LockReason string
 	Main       bool // the repository's main working tree
+	Bare       bool // a bare repository's entry: no working tree
 }
 
 // Env holds the external commands, so tests can substitute them.
@@ -94,6 +95,10 @@ func List(ctx context.Context, env Env, dir string) ([]Worktree, error) {
 		case "branch":
 			if cur != nil {
 				cur.Branch = strings.TrimPrefix(val, "refs/heads/")
+			}
+		case "bare":
+			if cur != nil {
+				cur.Bare = true
 			}
 		case "locked":
 			if cur != nil {
@@ -237,27 +242,11 @@ func Inspect(ctx context.Context, env Env, w Worktree, t Target) (Check, error) 
 	if lines := nonEmptyLines(dirty); len(lines) > 0 {
 		refuse("%d modified or untracked file(s) would be lost, e.g. %s", len(lines), strings.TrimSpace(lines[0]))
 	}
-	nested, err := nestedWorktrees(ctx, env, w.Path)
+	contained, err := containedRefusals(ctx, env, w.Path)
 	if err != nil {
 		return c, err
 	}
-	if len(nested) > 0 {
-		refuse("contains registered worktree(s) that would be deleted: %s", strings.Join(nested, ", "))
-	}
-	subs, err := initializedSubmodules(ctx, env, w.Path)
-	if err != nil {
-		return c, err
-	}
-	if len(subs) > 0 {
-		refuse("contains initialized submodule(s), which git cannot remove without --force: %s", strings.Join(subs, ", "))
-	}
-	repos, err := nestedRepositories(w.Path, append(append([]string(nil), nested...), subs...))
-	if err != nil {
-		return c, err
-	}
-	if len(repos) > 0 {
-		refuse("contains nested Git repository/repositories that would be deleted: %s", strings.Join(repos, ", "))
-	}
+	c.Refusals = append(c.Refusals, contained...)
 
 	targetHead, err := resolveCommit(ctx, env, w.Path, t.Ref())
 	if err != nil {
@@ -274,18 +263,57 @@ func Inspect(ctx context.Context, env Env, w Worktree, t Target) (Check, error) 
 
 	// Keep this last so Remove's second Inspect leaves the smallest possible
 	// window for another process to enter after the in-use check.
-	users, err := cwdUsers(ctx, env, w.Path)
-	if err != nil {
-		refuse("cannot check whether a process is using it (%v)", err)
-	} else if len(users) > 0 {
-		verb := "has its working directory"
-		if len(users) > 1 {
-			verb = "have their working directories"
-		}
-		refuse("in use: %s %s inside", strings.Join(users, ", "), verb)
+	if users := inUseRefusal(ctx, env, w.Path); users != "" {
+		refuse("%s", users)
 	}
 	c.OK = len(c.Refusals) == 0
 	return c, nil
+}
+
+// containedRefusals lists what removing the tree at path would delete that
+// its git status does not show: registered worktrees, initialized
+// submodules and other Git repositories nested beneath it.
+func containedRefusals(ctx context.Context, env Env, path string) ([]string, error) {
+	var refusals []string
+	nested, err := nestedWorktrees(ctx, env, path)
+	if err != nil {
+		return nil, err
+	}
+	if len(nested) > 0 {
+		refusals = append(refusals, "contains registered worktree(s) that would be deleted: "+strings.Join(nested, ", "))
+	}
+	subs, err := initializedSubmodules(ctx, env, path)
+	if err != nil {
+		return nil, err
+	}
+	if len(subs) > 0 {
+		refusals = append(refusals, "contains initialized submodule(s), which git cannot remove without --force: "+strings.Join(subs, ", "))
+	}
+	repos, err := nestedRepositories(path, append(append([]string(nil), nested...), subs...))
+	if err != nil {
+		return nil, err
+	}
+	if len(repos) > 0 {
+		refusals = append(refusals, "contains nested Git repository/repositories that would be deleted: "+strings.Join(repos, ", "))
+	}
+	return refusals, nil
+}
+
+// inUseRefusal returns a refusal when a process has its working directory
+// inside path, or when that cannot be checked (fail closed).
+func inUseRefusal(ctx context.Context, env Env, path string) string {
+	users, err := cwdUsers(ctx, env, path)
+	if err != nil {
+		return fmt.Sprintf("cannot check whether a process is using it (%v)", err)
+	}
+	if len(users) == 0 {
+		return ""
+	}
+	verb := "has its working directory"
+	if len(users) > 1 {
+		verb = "have their working directories"
+	}
+	return fmt.Sprintf("in use: %s %s inside", strings.Join(users, ", "), verb)
 }
 
 func nestedWorktrees(ctx context.Context, env Env, root string) ([]string, error) {

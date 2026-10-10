@@ -78,6 +78,7 @@ stay as they were.
 
   --lessons-dir DIR   the lessons folder (default: $AGENTFLOW_LESSONS_DIR)
   --principles FILE   default: "Code Review Principles.md" next to the folder
+  --format json|text  every subcommand but brief: JSON (default) or a text summary
 
 Exit codes: 0 ok · 1 usage/precondition · 2 an id was not found (nothing
 written) · 3 add --if-no-duplicate found a candidate duplicate (nothing written)
@@ -168,6 +169,11 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 		dupThreshold                             float64
 	)
 	fs.StringVar(&dirFlag, "lessons-dir", "", "")
+	jsonFormat := formatJSON
+	format := &jsonFormat
+	if sub != "brief" { // brief prints Markdown, not a JSON result
+		format = formatFlag(fs)
+	}
 	switch sub {
 	case "brief":
 		fs.StringVar(&topics, "topics", "", "")
@@ -250,11 +256,13 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 	if (sub == "retire" || sub == "stats") && days <= 0 {
 		return fail("--days must be positive")
 	}
-	writeJSON := func(v any) int {
-		enc := json.NewEncoder(stdout)
+	writeJSON := func(v any, text func() string) int {
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
 		enc.SetEscapeHTML(false) // file names such as "Tooling & CI.md" stay readable
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(v)
+		emit(stdout, *format, buf.Bytes(), text)
 		return lessonsExitCodes.ok
 	}
 
@@ -287,7 +295,7 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail("%v", err)
 		}
-		return writeJSON(map[string]any{"changes": changes})
+		return writeJSON(map[string]any{"changes": changes}, func() string { return bumpText(changes) })
 	case "add":
 		req := lessons.AddRequest{Repo: repo, Ref: ref, Title: title, What: what, Why: why, Avoid: avoid,
 			Principle: principle, Date: date, Topics: splitTopics(topics), NewTopic: newTopic,
@@ -297,14 +305,14 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 		}
 		res, err := lessons.Add(dir, principles, req)
 		if errors.Is(err, lessons.ErrDuplicate) {
-			writeJSON(res)
+			writeJSON(res, func() string { return addText(res, lessonsExitCodes.duplicate) })
 			fmt.Fprintf(stderr, "agentflow lessons add: %v\n", err)
 			return lessonsExitCodes.duplicate
 		}
 		if err != nil {
 			return fail("%v", err)
 		}
-		return writeJSON(res)
+		return writeJSON(res, func() string { return addText(res, lessonsExitCodes.ok) })
 	case "seen":
 		if len(pos) != 1 {
 			return fail("want exactly one lesson id, got %d", len(pos))
@@ -318,7 +326,7 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail("%v", err)
 		}
-		return writeJSON(res)
+		return writeJSON(res, func() string { return seenText(res) })
 	case "search":
 		if len(pos) == 0 {
 			return fail("give at least one search term")
@@ -362,7 +370,7 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 		if res == nil {
 			res = []lessons.Match{}
 		}
-		return writeJSON(map[string]any{"query": q, "results": res})
+		return writeJSON(map[string]any{"query": q, "results": res}, func() string { return searchText(q, res) })
 	case "triage":
 		if math.IsNaN(dupThreshold) || dupThreshold <= 0 || dupThreshold > 1 {
 			return fail("--dup-threshold must be in (0, 1]")
@@ -372,7 +380,7 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 			if err != nil {
 				return fail("%v", err)
 			}
-			return writeJSON(rep)
+			return writeJSON(rep, func() string { return triageText(rep) })
 		}
 		raw, err := os.ReadFile(planFile)
 		if err != nil {
@@ -397,7 +405,7 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail("%v", err)
 		}
-		return writeJSON(res)
+		return writeJSON(res, func() string { return triageApplyText(res) })
 	case "retire":
 		var cands []lessons.Candidate
 		if apply {
@@ -411,13 +419,13 @@ func runLessons(args []string, stdout, stderr io.Writer) int {
 		if cands == nil {
 			cands = []lessons.Candidate{}
 		}
-		return writeJSON(map[string]any{"applied": apply, "candidates": cands})
+		return writeJSON(map[string]any{"applied": apply, "candidates": cands}, func() string { return retireText(cands, apply) })
 	default: // stats
 		s, err := lessons.Summarize(dir, principles, days, day)
 		if err != nil {
 			return fail("%v", err)
 		}
-		return writeJSON(s)
+		return writeJSON(s, func() string { return statsText(s) })
 	}
 }
 
