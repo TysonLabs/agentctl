@@ -86,7 +86,6 @@ func (h Holder) same(o Holder) bool {
 
 // Lock is a held lock. Release it exactly once; extra calls are no-ops.
 type Lock struct {
-	name     string
 	f        *os.File
 	infoPath string
 	info     Info
@@ -95,16 +94,8 @@ type Lock struct {
 // ErrBusy is returned by TryAcquire when another holder has the lock.
 var ErrBusy = errors.New("lock is held")
 
-func open(name string) (*os.File, string, error) {
-	if err := ValidateName(name); err != nil {
-		return nil, "", err
-	}
-	lp, ip := Paths(name)
-	f, err := os.OpenFile(lp, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
-	if err != nil {
-		return nil, "", err
-	}
-	return f, ip, nil
+func openLock(lockPath string) (*os.File, error) {
+	return os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 }
 
 func flock(f *os.File, how int) error {
@@ -119,7 +110,17 @@ func flock(f *os.File, how int) error {
 // TryAcquire takes the lock without waiting. It returns ErrBusy if the lock
 // is held.
 func TryAcquire(name string, info Info) (*Lock, error) {
-	f, ip, err := open(name)
+	if err := ValidateName(name); err != nil {
+		return nil, err
+	}
+	lp, ip := Paths(name)
+	return TryAcquireAt(lp, ip, info)
+}
+
+// TryAcquireAt is TryAcquire for a lock at an explicit path, with its
+// holder record at infoPath. Every convention of a named lock applies.
+func TryAcquireAt(lockPath, infoPath string, info Info) (*Lock, error) {
+	f, err := openLock(lockPath)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +131,7 @@ func TryAcquire(name string, info Info) (*Lock, error) {
 		}
 		return nil, err
 	}
-	return held(name, f, ip, info), nil
+	return held(f, infoPath, info), nil
 }
 
 // Acquire takes the lock, waiting until it is free or ctx ends. While it
@@ -141,10 +142,17 @@ func Acquire(ctx context.Context, name string, info Info, onHolder func(Holder))
 	if err := ValidateName(name); err != nil {
 		return nil, err
 	}
+	lp, ip := Paths(name)
+	return AcquireAt(ctx, lp, ip, info, onHolder)
+}
+
+// AcquireAt is Acquire for a lock at an explicit path, with its holder
+// record at infoPath. Every convention of a named lock applies.
+func AcquireAt(ctx context.Context, lockPath, infoPath string, info Info, onHolder func(Holder)) (*Lock, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	l, err := TryAcquire(name, info)
+	l, err := TryAcquireAt(lockPath, infoPath, info)
 	if !errors.Is(err, ErrBusy) {
 		if err == nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -154,7 +162,7 @@ func Acquire(ctx context.Context, name string, info Info, onHolder func(Holder))
 		}
 		return l, err
 	}
-	f, ip, err := open(name)
+	f, err := openLock(lockPath)
 	if err != nil {
 		return nil, err
 	}
@@ -167,7 +175,7 @@ func Acquire(ctx context.Context, name string, info Info, onHolder func(Holder))
 		if onHolder == nil {
 			return
 		}
-		h := ReadHolder(name)
+		h := ReadHolderAt(infoPath)
 		// A holder writes its file just after it acquires: give it one
 		// interval before reporting an unknown holder.
 		if h.Info == nil && last == nil && misses == 0 {
@@ -198,7 +206,7 @@ func Acquire(ctx context.Context, name string, info Info, onHolder func(Holder))
 				f.Close()
 				return nil, ctxErr
 			}
-			return held(name, f, ip, info), nil
+			return held(f, infoPath, info), nil
 		case <-tick.C:
 			report()
 		case <-ctx.Done():
@@ -216,8 +224,8 @@ func Acquire(ctx context.Context, name string, info Info, onHolder func(Holder))
 	}
 }
 
-func held(name string, f *os.File, infoPath string, info Info) *Lock {
-	l := &Lock{name: name, f: f, infoPath: infoPath, info: info}
+func held(f *os.File, infoPath string, info Info) *Lock {
+	l := &Lock{f: f, infoPath: infoPath, info: info}
 	_ = writeInfo(infoPath, info) // advisory: a failed write never blocks the work
 	return l
 }
@@ -283,7 +291,13 @@ func readInfo(path string) (Info, error) {
 // ReadHolder reads name's advisory holder file. It does not test the lock.
 func ReadHolder(name string) Holder {
 	_, ip := Paths(name)
-	info, err := readInfo(ip)
+	return ReadHolderAt(ip)
+}
+
+// ReadHolderAt reads the advisory holder file at infoPath. It does not test
+// the lock.
+func ReadHolderAt(infoPath string) Holder {
+	info, err := readInfo(infoPath)
 	if err != nil {
 		return Holder{}
 	}
