@@ -119,7 +119,7 @@ type Result struct {
 	// RateLimitWait is the last rate-limit event's waitTime, verbatim, and
 	// RetryAfterS its parsed value (null when absent or unparseable).
 	RateLimitWait string   `json:"rate_limit_wait_time,omitempty"`
-	RetryAfterS   *float64 `json:"retry_after_s,omitempty"`
+	RetryAfterS   *float64 `json:"retry_after_s"`
 	// RateLimitGuidance is the CLI's policyGuidance text (untrusted data). It
 	// says, for example, that the repository is not connected to the
 	// organization plan.

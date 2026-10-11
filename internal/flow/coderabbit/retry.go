@@ -63,12 +63,41 @@ func RunRetrying(ctx context.Context, o Options, r Retry) (Result, error) {
 		log = func(string) {}
 	}
 	var waited time.Duration
+	var lastRateLimit struct {
+		wait       string
+		retryAfter *float64
+		guidance   string
+		set        bool
+	}
+	applyLastRateLimit := func(res *Result) {
+		if !lastRateLimit.set || res.Status == StatusRateLimited {
+			return
+		}
+		res.RateLimitWait = lastRateLimit.wait
+		res.RetryAfterS = lastRateLimit.retryAfter
+		res.RateLimitGuidance = lastRateLimit.guidance
+	}
 	for attempt := 1; ; attempt++ {
 		res, err := Run(ctx, o)
-		res.Attempts = attempt
 		res.RateLimitWaitS = waited.Seconds()
-		if err != nil || res.Status != StatusRateLimited || attempt > r.Retries {
+		if err != nil {
+			// Run returns an error only when CodeRabbit never started, so this
+			// failed start is not an attempt.
+			res.Attempts = attempt - 1
+			applyLastRateLimit(&res)
 			return res, err
+		}
+		res.Attempts = attempt
+		if res.Status != StatusRateLimited {
+			applyLastRateLimit(&res)
+			return res, nil
+		}
+		lastRateLimit.wait = res.RateLimitWait
+		lastRateLimit.retryAfter = res.RetryAfterS
+		lastRateLimit.guidance = res.RateLimitGuidance
+		lastRateLimit.set = true
+		if attempt > r.Retries {
+			return res, nil
 		}
 		wait, ok := ParseWait(res.RateLimitWait)
 		if !ok {

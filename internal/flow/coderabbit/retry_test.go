@@ -94,6 +94,9 @@ func TestRateLimitWaitsTheStatedTimeThenRetries(t *testing.T) {
 	if res.RateLimitWaitS != want.Seconds() {
 		t.Fatalf("rate_limit_wait_s = %v, want %v", res.RateLimitWaitS, want.Seconds())
 	}
+	if res.RateLimitWait != "12 minutes and 13 seconds" || res.RetryAfterS == nil || *res.RetryAfterS != 733 || res.RateLimitGuidance != "connect the repository" {
+		t.Fatalf("last rate-limit fields were lost after success: %q %v %q", res.RateLimitWait, res.RetryAfterS, res.RateLimitGuidance)
+	}
 	if len(logs) != 1 || !strings.Contains(logs[0], "12 minutes and 13 seconds") || !strings.Contains(logs[0], "12m20s") {
 		t.Fatalf("logs %q", logs)
 	}
@@ -166,6 +169,15 @@ func TestOtherFailuresAreNotRetried(t *testing.T) {
 	res, _ := retryRun(t, "fail", Retry{Retries: 3, MaxWait: time.Hour, DefaultWait: time.Minute, Sleep: fs.sleep}, nil)
 	if res.Status != StatusFailed || res.Attempts != 1 || len(fs.waits) != 0 {
 		t.Fatalf("status %s, attempts %d, waits %v", res.Status, res.Attempts, fs.waits)
+	}
+}
+
+func TestStartFailureIsNotCountedAsAnAttempt(t *testing.T) {
+	o := Options{Bin: filepath.Join(t.TempDir(), "missing-coderabbit"), Dir: t.TempDir(), Scope: Scope{Base: "origin/main"},
+		Timeout: time.Second, OutDir: t.TempDir()}
+	res, err := RunRetrying(context.Background(), o, Retry{Retries: 3, MaxWait: time.Hour, DefaultWait: time.Minute})
+	if err == nil || res.Attempts != 0 {
+		t.Fatalf("error = %v, attempts = %d; want a start error and zero attempts", err, res.Attempts)
 	}
 }
 

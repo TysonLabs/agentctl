@@ -235,7 +235,7 @@ func TestTextRenderers(t *testing.T) {
 		{"coderabbit", coderabbitText(coderabbit.Result{Status: coderabbit.StatusFindings, Base: "origin/main", Out: "/o",
 			ReviewedFiles: []string{"a.go"}, Severities: map[string]int{"minor": 1, "major": 1},
 			Findings: []coderabbit.Finding{{Severity: "major", File: "a.go", Text: "Bug.\nDetail \x1b[1m"}, {File: "b.go", Text: "Nit."}}}, 10),
-			"coderabbit: findings (exit 10)\nbase: origin/main\nfindings: 2 (major 1, minor 1)\nreviewed_files: 1\nduration_s: 0\njson: /o/result.json\n" +
+			"coderabbit: findings (exit 10)\nbase: origin/main\nfindings: 2 (major 1, minor 1)\nreviewed_files: 1\nduration_s: 0\nattempts: 0\nwaited_s: 0\njson: /o/result.json\n" +
 				"- [major] a.go\n    Bug.\n    Detail \\x1b[1m\n- [unknown] b.go\n    Nit.\n"},
 		{"ship verify", verifyText(ship.Result{Status: ship.StatusTimeout, Service: "s.prod", Expected: "abc", Running: "def", Attempts: 3, DurationS: 90, CheckedAt: "T", Error: "timed out"}, 124),
 			"ship verify: timeout (exit 124)\nservice: s.prod\nexpected: abc\nrunning: def\nattempts: 3\nduration_s: 90\nchecked_at: T\nerror: timed out\n"},

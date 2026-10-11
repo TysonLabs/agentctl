@@ -313,6 +313,27 @@ func TestCodeRabbitUseCreditsPassthrough(t *testing.T) {
 	}
 }
 
+func TestCodeRabbitStartFailureWritesResult(t *testing.T) {
+	repo, _ := crRepo(t)
+	t.Setenv("AGENTFLOW_CODERABBIT", filepath.Join(t.TempDir(), "missing-coderabbit"))
+	outDir := filepath.Join(t.TempDir(), "out")
+	var out, errb bytes.Buffer
+	if code := Run([]string{"coderabbit", "--dir", repo, "--out", outDir}, &out, &errb); code != 3 {
+		t.Fatalf("exit %d, stderr %q; want failed exit 3", code, errb.String())
+	}
+	res := readResult(t, out.Bytes())
+	if res.Status != coderabbit.StatusFailed || res.Attempts != 0 || !strings.Contains(res.Error, "starting") {
+		t.Fatalf("result %+v", res)
+	}
+	if !strings.Contains(out.String(), `"retry_after_s": null`) {
+		t.Fatalf("result omits null retry_after_s: %s", out.String())
+	}
+	saved, err := os.ReadFile(filepath.Join(outDir, "result.json"))
+	if err != nil || readResult(t, saved).Status != coderabbit.StatusFailed {
+		t.Fatalf("result.json: %v", err)
+	}
+}
+
 func TestCodeRabbitRateLimitRetriedThroughCLI(t *testing.T) {
 	repo, rec := crRepo(t)
 	// Replace the fake: the first run is rate-limited, the second is clean.
@@ -365,22 +386,41 @@ func TestCodeRabbitCancellationInterruptsDefaultBranchLookup(t *testing.T) {
 	if out, err := exec.Command("git", "-C", repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD").CombinedOutput(); err != nil {
 		t.Fatalf("delete origin/HEAD: %v %s", err, out)
 	}
-	gh := filepath.Join(t.TempDir(), "gh")
-	if err := os.WriteFile(gh, []byte("#!/bin/sh\nexec sleep 2\n"), 0o755); err != nil {
+	ghDir := t.TempDir()
+	gh, started := filepath.Join(ghDir, "gh"), filepath.Join(ghDir, "started")
+	if err := os.WriteFile(gh, []byte("#!/bin/sh\ntouch \""+started+"\"\nexec sleep 2\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENTFLOW_GH", gh)
 
+	// Cancel once the gh lookup has started, not on a timer: a timer can
+	// fire during the lock wait on a loaded machine.
 	ctx, cancel := context.WithCancel(context.Background())
-	time.AfterFunc(50*time.Millisecond, cancel)
+	defer cancel()
+	go func() {
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+			if _, err := os.Stat(started); err == nil {
+				break
+			}
+		}
+		cancel()
+	}()
 	start := time.Now()
 	var out, errb bytes.Buffer
-	code := runCodeRabbit(ctx, []string{"--dir", repo, "--out", filepath.Join(t.TempDir(), "out")}, &out, &errb)
-	if elapsed := time.Since(start); elapsed > time.Second {
+	outDir := filepath.Join(t.TempDir(), "out")
+	code := runCodeRabbit(ctx, []string{"--dir", repo, "--out", outDir}, &out, &errb)
+	if elapsed := time.Since(start); elapsed > 1900*time.Millisecond {
 		t.Fatalf("cancellation took %s; gh lookup did not use the command context", elapsed)
 	}
 	if code != coderabbitExitCodes[coderabbit.StatusInterrupted] {
 		t.Fatalf("exit %d, stderr %q; want interrupted exit %d", code, errb.String(), coderabbitExitCodes[coderabbit.StatusInterrupted])
+	}
+	res := readResult(t, out.Bytes())
+	if res.Status != coderabbit.StatusInterrupted || res.Attempts != 0 || !strings.Contains(res.Error, "default branch") {
+		t.Fatalf("result %+v", res)
+	}
+	if saved, err := os.ReadFile(filepath.Join(outDir, "result.json")); err != nil || readResult(t, saved).Status != coderabbit.StatusInterrupted {
+		t.Fatalf("result.json: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(rec, "args.txt")); !os.IsNotExist(err) {
 		t.Fatalf("coderabbit ran after cancellation; stat error = %v", err)

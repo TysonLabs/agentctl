@@ -126,7 +126,7 @@ func fakeCodeRabbit(mode string) int {
 		// The first run is rate-limited, every later one is clean.
 		n := countRun(rec)
 		if n == 1 {
-			emit(`{"type":"error","errorType":"rate_limit","message":"Rate limit exceeded","recoverable":true,"metadata":{"waitTime":"12 minutes and 13 seconds"}}`)
+			emit(`{"type":"error","errorType":"rate_limit","message":"Rate limit exceeded","recoverable":true,"metadata":{"waitTime":"12 minutes and 13 seconds","policyGuidance":"connect the repository"}}`)
 			return 1
 		}
 		emit(complete(0))
