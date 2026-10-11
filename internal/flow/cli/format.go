@@ -82,6 +82,10 @@ func coderabbitText(res coderabbit.Result, code int) string {
 	t.Field("base", res.Base).Field("base_commit", res.BaseCommit).Field("review_type", res.ReviewType)
 	t.Field("findings", findingsSummary(res))
 	t.Field("reviewed_files", len(res.ReviewedFiles)).Field("duration_s", res.DurationS)
+	t.Field("attempts", res.Attempts).Field("waited_s", res.WaitedS).Field("rate_limit_wait_time", res.RateLimitWait)
+	if h := res.LockHolder; h != nil {
+		t.Field("lock_holder", fmt.Sprintf("pid %d since %s in %s", h.PID, h.Since, h.Dir))
+	}
 	t.Field("error", res.Error).Field("stderr", res.Stderr).Field("json", resultPath(res.Out))
 	for _, f := range res.Findings {
 		sev := f.Severity

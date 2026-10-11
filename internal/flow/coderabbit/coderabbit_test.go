@@ -118,11 +118,43 @@ func fakeCodeRabbit(mode string) int {
 		time.Sleep(time.Hour)
 	case "stderr-holder":
 		time.Sleep(time.Hour)
+	case "ratelimit-meta":
+		emit(`{"type":"error","errorType":"rate_limit","message":"Rate limit exceeded","recoverable":true,"details":{},"metadata":{"isProUser":false,"waitTime":"` + os.Getenv("FAKE_CR_WAIT") + `","policyGuidance":"connect the repository"}}`)
+		fmt.Fprintln(os.Stderr, "Error: Rate limit exceeded")
+		return 1
+	case "ratelimit-then-clean":
+		// The first run is rate-limited, every later one is clean.
+		n := countRun(rec)
+		if n == 1 {
+			emit(`{"type":"error","errorType":"rate_limit","message":"Rate limit exceeded","recoverable":true,"metadata":{"waitTime":"12 minutes and 13 seconds"}}`)
+			return 1
+		}
+		emit(complete(0))
+	case "hold-lock":
+		// Not a coderabbit run: take the repository lock and hold it.
+		unlock, _, err := LockRepo(os.Getenv("FAKE_CR_DIR"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 98
+		}
+		defer unlock()
+		_ = os.WriteFile(filepath.Join(rec, "locked"), []byte("1"), 0o644)
+		time.Sleep(time.Hour)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown fake mode "+mode)
 		return 99
 	}
 	return 0
+}
+
+// countRun bumps and returns the run counter in rec.
+func countRun(rec string) int {
+	path := filepath.Join(rec, "runs")
+	b, _ := os.ReadFile(path)
+	n, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	n++
+	_ = os.WriteFile(path, []byte(strconv.Itoa(n)), 0o644)
+	return n
 }
 
 func run(t *testing.T, mode string, tweak func(*Options)) (Result, string) {
@@ -362,6 +394,7 @@ func TestArgs(t *testing.T) {
 		{Options{Scope: Scope{Base: "origin/main"}}, "review --agent --committed --base origin/main"},
 		{Options{Deep: true, Scope: Scope{BaseCommit: "abc1234"}}, "review --agent --deep --committed --base-commit abc1234"},
 		{Options{Scope: Scope{Uncommitted: true}, Configs: []string{"/a/AGENTS.md", "/b/x.md"}}, "review --agent --uncommitted -c /a/AGENTS.md /b/x.md"},
+		{Options{Deep: true, UseCredits: true, Scope: Scope{Base: "origin/main"}}, "review --agent --deep --use-credits --committed --base origin/main"},
 	}
 	for _, c := range cases {
 		if got := strings.Join(Args(c.o), " "); got != c.want {

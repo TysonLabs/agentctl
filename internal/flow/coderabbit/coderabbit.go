@@ -7,7 +7,10 @@
 //   - a hard timeout and a stall detector kill the whole process group. The
 //     CLI prints heartbeat lines while it reviews, so silence means a hang.
 //   - one run per repository at a time: stale runs that stack up starve later
-//     ones at the "connecting" phase.
+//     ones at the "connecting" phase. A second run queues on the lock (see
+//     WaitRepo) instead of starting next to the first.
+//   - a rate-limited run is retried after the wait CodeRabbit names (see
+//     RunRetrying), so callers do not each invent their own retry loop.
 //   - success needs the stream's "complete" event, and its findings count
 //     must match the findings actually read. Anything else is not "clean".
 //
@@ -33,6 +36,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/TysonLabs/agentctl/internal/flow/namedlock"
 	"github.com/TysonLabs/agentctl/internal/flow/proc"
 )
 
@@ -48,6 +52,9 @@ const (
 	StatusTimeout     Status = "timeout"      // killed: the run exceeded Options.Timeout
 	StatusStalled     Status = "stalled"      // killed: no output for Options.Stall
 	StatusInterrupted Status = "interrupted"  // killed: the caller's context was cancelled
+	// The two lock statuses mean CodeRabbit never ran.
+	StatusLockTimeout Status = "lock_timeout" // the repository lock stayed held past the lock timeout
+	StatusLockBusy    Status = "lock_busy"    // --no-wait-lock and the repository lock was held
 )
 
 // Scope selects what to review. Exactly one of Base, BaseCommit and
@@ -60,16 +67,19 @@ type Scope struct {
 
 // Options configures one run.
 type Options struct {
-	Bin     string        // coderabbit executable (default "coderabbit")
-	Dir     string        // repository working tree
-	Scope   Scope         //
-	Deep    bool          // use the full pull request review policy
-	Configs []string      // absolute paths passed with -c
-	Timeout time.Duration // hard cap on the whole run
-	Stall   time.Duration // kill after this long without output (0 disables)
-	OutDir  string        // artifacts directory (created if missing)
-	Poll    time.Duration // watch interval (default 2s)
-	Grace   time.Duration // SIGTERM → SIGKILL delay (default 5s)
+	Bin   string // coderabbit executable (default "coderabbit")
+	Dir   string // repository working tree
+	Scope Scope  //
+	Deep  bool   // use the full pull request review policy
+	// UseCredits passes --use-credits: CodeRabbit may bill usage credits when
+	// the review exceeds the included limits.
+	UseCredits bool
+	Configs    []string      // absolute paths passed with -c
+	Timeout    time.Duration // hard cap on the whole run
+	Stall      time.Duration // kill after this long without output (0 disables)
+	OutDir     string        // artifacts directory (created if missing)
+	Poll       time.Duration // watch interval (default 2s)
+	Grace      time.Duration // SIGTERM → SIGKILL delay (default 5s)
 }
 
 // Finding is one review finding. Text is untrusted data.
@@ -98,6 +108,25 @@ type Result struct {
 	Stderr        string         `json:"stderr"`
 	Error         string         `json:"error,omitempty"`
 	Args          []string       `json:"args"`
+	// Attempts is how many times coderabbit ran (0: it never ran, for
+	// example on a lock status).
+	Attempts int `json:"attempts"`
+	// WaitedS is the total time spent waiting, not reviewing: the lock wait
+	// plus every rate-limit wait.
+	WaitedS        float64 `json:"waited_s"`
+	LockWaitS      float64 `json:"lock_wait_s"`
+	RateLimitWaitS float64 `json:"rate_limit_wait_s"`
+	// RateLimitWait is the last rate-limit event's waitTime, verbatim, and
+	// RetryAfterS its parsed value (null when absent or unparseable).
+	RateLimitWait string   `json:"rate_limit_wait_time,omitempty"`
+	RetryAfterS   *float64 `json:"retry_after_s,omitempty"`
+	// RateLimitGuidance is the CLI's policyGuidance text (untrusted data). It
+	// says, for example, that the repository is not connected to the
+	// organization plan.
+	RateLimitGuidance string `json:"rate_limit_guidance,omitempty"`
+	// LockHolder describes the holder of the repository lock for a lock
+	// status.
+	LockHolder *namedlock.Info `json:"lock_holder,omitempty"`
 }
 
 var rateLimitRe = regexp.MustCompile(`(?i)usage limit|rate limit|too many requests|\b429\b|exceeds? (the )?included|out of (review )?credits`)
@@ -109,6 +138,9 @@ func Args(o Options) []string {
 	args := []string{"review", "--agent"}
 	if o.Deep {
 		args = append(args, "--deep")
+	}
+	if o.UseCredits {
+		args = append(args, "--use-credits")
 	}
 	switch {
 	case o.Scope.Uncommitted:
@@ -125,31 +157,69 @@ func Args(o Options) []string {
 	return args
 }
 
-// LockRepo takes the per-repository run lock. It lives in the repository's
-// common git dir, so every worktree of one repository shares it. The
-// returned func releases it.
-func LockRepo(dir string) (func(), string, error) {
+// ErrRepoBusy is returned by LockRepo when another run holds the lock.
+var ErrRepoBusy = errors.New("another agentflow coderabbit run is reviewing this repository")
+
+// RepoLockPaths returns the per-repository run lock and its holder record.
+// They live in the repository's common git dir, so every worktree of one
+// repository shares them. The lock follows the namedlock conventions: a
+// kernel flock (released when the holder dies, even on SIGKILL), and an
+// advisory holder record.
+func RepoLockPaths(dir string) (lockPath, infoPath string, err error) {
 	out, err := exec.Command("git", "-C", dir, "rev-parse", "--git-common-dir").Output()
 	if err != nil {
-		return nil, "", fmt.Errorf("%s is not inside a git repository", dir)
+		return "", "", fmt.Errorf("%s is not inside a git repository", dir)
 	}
 	common := strings.TrimSpace(string(out))
 	if !filepath.IsAbs(common) {
 		common = filepath.Join(dir, common)
 	}
-	path := filepath.Join(common, "agentflow-coderabbit.lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	return filepath.Join(common, "agentflow-coderabbit.lock"), filepath.Join(common, "agentflow-coderabbit.holder.json"), nil
+}
+
+// LockRepo takes the per-repository run lock without waiting. It returns an
+// error wrapping ErrRepoBusy when another run holds it. The returned func
+// releases it.
+func LockRepo(dir string) (func(), string, error) {
+	return lockRepo(context.Background(), dir, namedlock.NewInfo("agentflow coderabbit", dir), false, nil)
+}
+
+// WaitRepo takes the per-repository run lock, waiting until it is free or
+// ctx ends (ctx's error is returned then). A holder that died released the
+// lock with its process, so a stale holder record never blocks. onHolder
+// is called with the current holder when the wait starts and each time the
+// holder changes.
+func WaitRepo(ctx context.Context, dir string, info namedlock.Info, onHolder func(namedlock.Holder)) (func(), string, error) {
+	return lockRepo(ctx, dir, info, true, onHolder)
+}
+
+// RepoHolder reads the repository lock's advisory holder record.
+func RepoHolder(dir string) namedlock.Holder {
+	_, ip, err := RepoLockPaths(dir)
 	if err != nil {
-		return nil, path, err
+		return namedlock.Holder{}
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		f.Close()
-		return nil, path, fmt.Errorf("another agentflow coderabbit run is reviewing this repository (lock %s)", path)
+	return namedlock.ReadHolderAt(ip)
+}
+
+func lockRepo(ctx context.Context, dir string, info namedlock.Info, wait bool, onHolder func(namedlock.Holder)) (func(), string, error) {
+	lp, ip, err := RepoLockPaths(dir)
+	if err != nil {
+		return nil, "", err
 	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, path, nil
+	var l *namedlock.Lock
+	if wait {
+		l, err = namedlock.AcquireAt(ctx, lp, ip, info, onHolder)
+	} else {
+		l, err = namedlock.TryAcquireAt(lp, ip, info)
+		if errors.Is(err, namedlock.ErrBusy) {
+			return nil, lp, fmt.Errorf("%w (lock %s)", ErrRepoBusy, lp)
+		}
+	}
+	if err != nil {
+		return nil, lp, err
+	}
+	return func() { _ = l.Release() }, lp, nil
 }
 
 // DefaultBase returns the remote-tracking ref of the repository's default
@@ -414,6 +484,15 @@ type event struct {
 	Findings      *int            `json:"findings"`
 	ReviewedFiles []string        `json:"reviewedFiles"`
 	Outcome       string          `json:"outcome"`
+	// Metadata is decoded on its own (see rateMetadata), so an unexpected
+	// shape can never make the whole line unreadable.
+	Metadata json.RawMessage `json:"metadata"`
+}
+
+// rateMetadata is the metadata of a rate_limit error event.
+type rateMetadata struct {
+	WaitTime       string `json:"waitTime"`
+	PolicyGuidance string `json:"policyGuidance"`
 }
 
 // stream accumulates what the reader goroutine parsed.
@@ -429,6 +508,8 @@ type stream struct {
 	// run only when no valid result follows (a nonzero exit or no complete).
 	recoverableMsg string
 	rateLimited    bool   // an error event typed rate_limit, whatever its message says
+	waitTime       string // the last rate-limit event's metadata.waitTime
+	guidance       string // the last rate-limit event's metadata.policyGuidance
 	messages       string // every status/complete/error message, for rate-limit detection
 }
 
@@ -476,6 +557,10 @@ func (s *stream) handle(line []byte) {
 		}
 		if ev.ErrorType == "rate_limit" {
 			s.rateLimited = true
+			var md rateMetadata
+			if len(ev.Metadata) > 0 && json.Unmarshal(ev.Metadata, &md) == nil {
+				s.waitTime, s.guidance = md.WaitTime, md.PolicyGuidance
+			}
 		}
 		if ev.Recoverable != nil && *ev.Recoverable {
 			s.recoverableMsg = msg
@@ -493,6 +578,11 @@ func (s *stream) fill(res *Result) {
 		res.ReviewType, res.Base, res.BaseCommit = s.context.ReviewType, s.context.BaseBranch, s.context.BaseCommit
 	}
 	res.Findings = append(res.Findings, s.findings...)
+	res.RateLimitWait, res.RateLimitGuidance = s.waitTime, s.guidance
+	if d, ok := ParseWait(s.waitTime); ok {
+		secs := d.Seconds()
+		res.RetryAfterS = &secs
+	}
 	for _, f := range s.findings {
 		sev := f.Severity
 		if sev == "" {
