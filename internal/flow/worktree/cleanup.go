@@ -146,8 +146,8 @@ func RunCleanup(ctx context.Context, dir string, commands []string, vars map[str
 	return results
 }
 
-func runCleanupCommand(ctx context.Context, dir string, argv []string, vars map[string]string, timeout time.Duration) CleanupResult {
-	r := CleanupResult{Command: argv, ExitCode: -1}
+func runCleanupCommand(ctx context.Context, dir string, argv []string, vars map[string]string, timeout time.Duration) (r CleanupResult) {
+	r = CleanupResult{Command: argv, ExitCode: -1}
 	start := time.Now()
 	defer func() { r.DurationMS = time.Since(start).Milliseconds() }()
 	bin := argv[0]

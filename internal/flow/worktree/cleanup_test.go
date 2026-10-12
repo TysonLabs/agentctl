@@ -41,19 +41,22 @@ func TestRunCleanupSuccessFailureTimeoutAndNoWordSplitting(t *testing.T) {
 	}
 	// A branch value with shell metacharacters stays one argument.
 	vars := CleanupVars("/x/.claude/worktrees/feat-a", "feat/a;rm")
-	start := time.Now()
+	// Generous bound for the commands that must finish; a short one only
+	// for the command that must time out (a busy -race run is slow).
 	res := RunCleanup(context.Background(), dir, []string{
 		"./rec.sh {branch} paytiva_{slug_snake}_test {dir}",
 		"./fail.sh",
-		"./hang.sh",
 		"'unterminated",
-	}, vars, 500*time.Millisecond)
-	if time.Since(start) > 10*time.Second {
+	}, vars, 30*time.Second)
+	start := time.Now()
+	hung := RunCleanup(context.Background(), dir, []string{"./hang.sh"}, vars, 300*time.Millisecond)
+	if time.Since(start) > 15*time.Second {
 		t.Fatalf("cleanup was not bounded: %s", time.Since(start))
 	}
-	if len(res) != 4 {
-		t.Fatalf("results: %+v", res)
+	if len(res) != 3 || len(hung) != 1 {
+		t.Fatalf("results: %+v %+v", res, hung)
 	}
+	res = []CleanupResult{res[0], res[1], hung[0], res[2]}
 	if !res[0].OK || res[0].ExitCode != 0 {
 		t.Fatalf("success: %+v", res[0])
 	}
@@ -64,7 +67,7 @@ func TestRunCleanupSuccessFailureTimeoutAndNoWordSplitting(t *testing.T) {
 	if res[1].OK || res[1].ExitCode != 4 || !strings.Contains(res[1].Output, "db busy") {
 		t.Fatalf("failure: %+v", res[1])
 	}
-	if res[2].OK || !res[2].TimedOut || res[2].ExitCode != -1 {
+	if res[2].OK || !res[2].TimedOut || res[2].ExitCode != -1 || res[2].DurationMS < 300 {
 		t.Fatalf("timeout: %+v", res[2])
 	}
 	if res[3].OK || !strings.Contains(res[3].Error, "not run") {
