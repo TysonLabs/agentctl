@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -413,6 +415,8 @@ func TestCodeRabbitRequiresScope(t *testing.T) {
 			"--base is required; the open PR #123 targets development: pass --base origin/development", ""},
 		{"stacked PR names the feature branch", `{"baseRefName":"feat/parent","number":7,"state":"OPEN"}`, 0,
 			"the open PR #7 targets feat/parent: pass --base origin/feat/parent", ""},
+		{"shell metacharacters are quoted", `{"baseRefName":"development;touch${IFS}/tmp/pwn","number":8,"state":"OPEN"}`, 0,
+			"the open PR #8 targets development;touch${IFS}/tmp/pwn: pass --base 'origin/development;touch${IFS}/tmp/pwn'", "pass --base origin/development;touch${IFS}/tmp/pwn"},
 		{"closed PR gives no hint", `{"baseRefName":"development","number":9,"state":"CLOSED"}`, 0,
 			"a review scope is required", "#9"},
 		{"merged PR gives no hint", `{"baseRefName":"development","number":9,"state":"MERGED"}`, 0,
@@ -459,13 +463,14 @@ func TestCodeRabbitRequiresScopeWhenGHMissing(t *testing.T) {
 func TestCodeRabbitRequiresScopeWhenGHHangs(t *testing.T) {
 	repo, _ := crRepo(t)
 	d := t.TempDir()
-	gh := filepath.Join(d, "gh")
-	if err := os.WriteFile(gh, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+	gh, childPID := filepath.Join(d, "gh"), filepath.Join(d, "child.pid")
+	script := "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' \"$!\" > \"" + childPID + "\"\nwait\n"
+	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENTFLOW_GH", gh)
 	old := ghPRTimeout
-	ghPRTimeout = 200 * time.Millisecond
+	ghPRTimeout = time.Second
 	defer func() { ghPRTimeout = old }()
 	start := time.Now()
 	var out, errb bytes.Buffer
@@ -476,6 +481,31 @@ func TestCodeRabbitRequiresScopeWhenGHHangs(t *testing.T) {
 	if code != 1 || !strings.Contains(errb.String(), "a review scope is required") {
 		t.Fatalf("exit %d, stderr %q", code, errb.String())
 	}
+	b, err := os.ReadFile(childPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Kill(pid, syscall.SIGKILL) // clean up if the assertion fails
+	assertProcessDead(t, pid)
+}
+
+func assertProcessDead(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return
+		}
+		if out, _ := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output(); strings.HasPrefix(strings.TrimSpace(string(out)), "Z") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("gh helper pid %d survived the lookup timeout", pid)
 }
 
 // An explicit --base that names no commit refuses before the lock; it is

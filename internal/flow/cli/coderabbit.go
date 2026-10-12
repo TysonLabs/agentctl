@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/TysonLabs/agentctl/internal/flow/coderabbit"
@@ -232,7 +233,8 @@ func runCodeRabbit(ctx context.Context, args []string, stdout, stderr io.Writer)
 	if scopes == 0 {
 		msg := "a review scope is required: pass --base REF (or --base-commit SHA, or --uncommitted); the default branch is never assumed"
 		if pr, ok := ghOpenPR(ctx, o.Dir); ok {
-			msg = fmt.Sprintf("--base is required; the open PR #%d targets %s: pass --base origin/%s", pr.Number, pr.BaseRefName, pr.BaseRefName)
+			base := "origin/" + pr.BaseRefName
+			msg = fmt.Sprintf("--base is required; the open PR #%d targets %s: pass --base %s", pr.Number, pr.BaseRefName, shellHintArg(base))
 		}
 		return fail("%s", msg)
 	}
@@ -375,8 +377,21 @@ func ghOpenPR(ctx context.Context, dir string) (prInfo, bool) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "pr", "view", "--json", "baseRefName,number,state")
 	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
 	cmd.WaitDelay = time.Second
 	out, err := cmd.Output()
+	// A successful helper should not survive this hint-only lookup either.
+	// WaitDelay still bounds an escaped helper that leaves an output pipe open.
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	if err != nil {
 		return prInfo{}, false
 	}
@@ -385,4 +400,13 @@ func ghOpenPR(ctx context.Context, dir string) (prInfo, bool) {
 		return prInfo{}, false
 	}
 	return pr, true
+}
+
+// shellHintArg renders one argument so the suggested command is safe to
+// paste even when a valid Git branch contains shell metacharacters.
+func shellHintArg(arg string) string {
+	if arg != "" && !strings.ContainsAny(arg, " \t\n'\"\\$`;&|<>()*?[]{}~#!") {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
 }
