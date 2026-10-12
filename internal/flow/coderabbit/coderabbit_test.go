@@ -2,7 +2,6 @@ package coderabbit
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -418,31 +417,22 @@ func gitRepo(t *testing.T) string {
 	return dir
 }
 
-func TestDefaultBaseFromOriginHEAD(t *testing.T) {
+func TestRefExists(t *testing.T) {
 	dir := gitRepo(t)
-	if out, err := exec.Command("git", "-C", dir, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk").CombinedOutput(); err != nil {
-		t.Fatalf("%v %s", err, out)
+	for ref, want := range map[string]bool{
+		"origin/trunk":       true,
+		"trunk":              true,
+		"HEAD":               true,
+		"origin/development": false,
+		"":                   false,
+		"--all":              false,
+	} {
+		if got := RefExists(dir, ref); got != want {
+			t.Errorf("RefExists(%q) = %v, want %v", ref, got, want)
+		}
 	}
-	got, err := DefaultBase(dir, func(string) (string, error) { return "", errors.New("must not be asked") })
-	if err != nil || got != "origin/trunk" {
-		t.Fatalf("got %q, %v", got, err)
-	}
-}
-
-func TestDefaultBaseFallsBackToLookup(t *testing.T) {
-	dir := gitRepo(t)
-	got, err := DefaultBase(dir, func(string) (string, error) { return "trunk", nil })
-	if err != nil || got != "origin/trunk" {
-		t.Fatalf("got %q, %v", got, err)
-	}
-	if _, err := DefaultBase(dir, func(string) (string, error) { return "", errors.New("no gh") }); err == nil {
-		t.Fatal("a failed lookup must refuse, not guess")
-	}
-	if _, err := DefaultBase(dir, func(string) (string, error) { return "develop", nil }); err == nil || !strings.Contains(err.Error(), "no local or origin ref") {
-		t.Fatalf("missing ref: err = %v", err)
-	}
-	if _, err := DefaultBase(dir, nil); err == nil {
-		t.Fatal("no origin/HEAD and no lookup must refuse")
+	if RefExists(t.TempDir(), "HEAD") {
+		t.Error("a directory outside any repository has no refs")
 	}
 }
 

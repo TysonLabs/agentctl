@@ -222,29 +222,12 @@ func lockRepo(ctx context.Context, dir string, info namedlock.Info, wait bool, o
 	return func() { _ = l.Release() }, lp, nil
 }
 
-// DefaultBase returns the remote-tracking ref of the repository's default
-// branch (for example "origin/main"). It reads origin/HEAD, then asks
-// lookup (gh) for the default branch name. It never guesses a name.
-func DefaultBase(dir string, lookup func(dir string) (string, error)) (string, error) {
-	out, err := exec.Command("git", "-C", dir, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD").Output()
-	if err == nil {
-		if ref := strings.TrimSpace(string(out)); strings.HasPrefix(ref, "refs/remotes/") {
-			return strings.TrimPrefix(ref, "refs/remotes/"), nil
-		}
+// RefExists reports whether ref names a commit in the repository at dir.
+func RefExists(dir, ref string) bool {
+	if ref == "" || strings.HasPrefix(ref, "-") {
+		return false
 	}
-	if lookup == nil {
-		return "", errors.New("origin/HEAD is not set: pass --base (or run `git remote set-head origin --auto`)")
-	}
-	name, err := lookup(dir)
-	if err != nil || name == "" {
-		return "", fmt.Errorf("cannot derive the default branch (origin/HEAD is not set and gh gave none): pass --base")
-	}
-	for _, ref := range []string{"origin/" + name, name} {
-		if exec.Command("git", "-C", dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}").Run() == nil {
-			return ref, nil
-		}
-	}
-	return "", fmt.Errorf("default branch %q has no local or origin ref: fetch it or pass --base", name)
+	return exec.Command("git", "-C", dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}").Run() == nil
 }
 
 func withDefaults(o Options) Options {
@@ -264,7 +247,8 @@ func withDefaults(o Options) Options {
 // started. The error is non-nil only when the run could not start at all.
 func Run(ctx context.Context, o Options) (Result, error) {
 	o = withDefaults(o)
-	res := Result{Dir: o.Dir, Out: o.OutDir, ReviewedFiles: []string{}, Findings: []Finding{}, Severities: map[string]int{}}
+	res := Result{Dir: o.Dir, Out: o.OutDir, Base: o.Scope.Base, BaseCommit: o.Scope.BaseCommit,
+		ReviewedFiles: []string{}, Findings: []Finding{}, Severities: map[string]int{}}
 	if err := os.MkdirAll(o.OutDir, 0o755); err != nil {
 		return res, err
 	}
@@ -575,7 +559,15 @@ func (s *stream) fill(res *Result) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.context != nil {
-		res.ReviewType, res.Base, res.BaseCommit = s.context.ReviewType, s.context.BaseBranch, s.context.BaseCommit
+		// CodeRabbit's own report wins; the requested scope stays when it
+		// names none.
+		res.ReviewType = s.context.ReviewType
+		if s.context.BaseBranch != "" {
+			res.Base = s.context.BaseBranch
+		}
+		if s.context.BaseCommit != "" {
+			res.BaseCommit = s.context.BaseCommit
+		}
 	}
 	res.Findings = append(res.Findings, s.findings...)
 	res.RateLimitWait, res.RateLimitGuidance = s.waitTime, s.guidance

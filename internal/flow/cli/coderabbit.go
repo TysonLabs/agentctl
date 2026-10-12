@@ -24,11 +24,17 @@ Run the CodeRabbit CLI's local review once (coderabbit review --agent) and
 return its findings as JSON. Run it in the background; reviews take minutes.
 
   --dir DIR           repository to review (default: current directory)
-  --base REF          review committed changes against REF
+  --base REF          review committed changes against REF, which must name
+                      a commit (git rev-parse --verify REF^{commit})
   --base-commit SHA   review committed changes against commit SHA
   --uncommitted       review uncommitted changes
-                      (default scope: committed changes against the default
-                      branch, read from origin/HEAD or gh; never guessed)
+                      One scope is required. There is no default: the
+                      repository's default branch is often not the branch a
+                      PR targets (main vs development), and a wrong base
+                      reviews a whole backlog. Without a scope the run exits
+                      1 before it takes the lock; when gh finds an open PR
+                      for the current branch, the message names its base
+                      (for example: pass --base origin/development).
   --deep              use the full pull request review policy
   --use-credits       pass --use-credits: CodeRabbit may bill usage credits
                       when the review exceeds the included limits (default
@@ -81,9 +87,12 @@ never ran), waited_s (lock wait + rate-limit waits), lock_wait_s,
 rate_limit_wait_s, rate_limit_wait_time and retry_after_s (the last
 waitTime, verbatim and in seconds), rate_limit_guidance, lock_holder,
 findings (severity, file, text, suggestions), severity_counts,
-reviewed_files, base, base_commit and the exact args run.
+reviewed_files, base and base_commit (CodeRabbit's reported base, else the
+--base / --base-commit given; set on every outcome, including the lock
+statuses) and the exact args run.
 
-Exit codes: 0 clean · 1 usage/precondition, or lock_busy (--no-wait-lock)
+Exit codes: 0 clean · 1 usage/precondition (including a missing scope or a
+--base that names no commit), or lock_busy (--no-wait-lock)
 · 3 failed · 4 no result · 5 rate/usage limited after every retry
 · 6 lock_timeout · 10 findings · 124 timeout · 125 stalled
 · 130 interrupted (also while waiting for the lock or a rate limit).
@@ -218,6 +227,18 @@ func runCodeRabbit(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return fail("--dir %s is not a directory", o.Dir)
 	}
 	o.Dir = dir
+	// A scope is required and checked before the out dir and the lock, so a
+	// missing or wrong base never holds the repository lock.
+	if scopes == 0 {
+		msg := "a review scope is required: pass --base REF (or --base-commit SHA, or --uncommitted); the default branch is never assumed"
+		if pr, ok := ghOpenPR(ctx, o.Dir); ok {
+			msg = fmt.Sprintf("--base is required; the open PR #%d targets %s: pass --base origin/%s", pr.Number, pr.BaseRefName, pr.BaseRefName)
+		}
+		return fail("%s", msg)
+	}
+	if o.Scope.Base != "" && !coderabbit.RefExists(o.Dir, o.Scope.Base) {
+		return fail("--base %q is not a commit in %s: check the name, or fetch it first (for example: git fetch origin <branch>)", o.Scope.Base, o.Dir)
+	}
 	if o.OutDir != "" {
 		if o.OutDir, err = filepath.Abs(o.OutDir); err != nil {
 			return fail("%v", err)
@@ -261,7 +282,7 @@ func runCodeRabbit(ctx context.Context, args []string, stdout, stderr io.Writer)
 	}
 	// notRun is the result for an outcome where CodeRabbit never started.
 	notRun := func(s coderabbit.Status, msg string, lockWait time.Duration) coderabbit.Result {
-		return coderabbit.Result{Status: s, Error: msg, Dir: o.Dir, Out: o.OutDir, ReviewedFiles: []string{},
+		return coderabbit.Result{Status: s, Error: msg, Dir: o.Dir, Out: o.OutDir, Base: o.Scope.Base, BaseCommit: o.Scope.BaseCommit, ReviewedFiles: []string{},
 			Findings: []coderabbit.Finding{}, Severities: map[string]int{}, Args: coderabbit.Args(o),
 			LockWaitS: lockWait.Round(10 * time.Millisecond).Seconds()}
 	}
@@ -297,19 +318,6 @@ func runCodeRabbit(ctx context.Context, args []string, stdout, stderr io.Writer)
 	}
 	defer unlockRepo()
 	lockWait := time.Since(lockStart)
-	if scopes == 0 {
-		base, err := coderabbit.DefaultBase(o.Dir, func(dir string) (string, error) {
-			return ghDefaultBranch(ctx, dir)
-		})
-		if err != nil {
-			if ctx.Err() != nil {
-				return finish(notRun(coderabbit.StatusInterrupted, "interrupted while deriving the default branch; not run", time.Since(lockStart)))
-			}
-			return fail("%v", err)
-		}
-		o.Scope.Base = base
-	}
-
 	jitter := crHooks.jitter
 	if jitter == nil {
 		jitter = coderabbit.DefaultJitter
@@ -341,22 +349,40 @@ func envTrue(v string) bool {
 	return false
 }
 
-// ghDefaultBranch asks gh for the repository's default branch name.
-func ghDefaultBranch(ctx context.Context, dir string) (string, error) {
+// prInfo is the part of `gh pr view --json` the base hint needs.
+type prInfo struct {
+	Number      int    `json:"number"`
+	BaseRefName string `json:"baseRefName"`
+	State       string `json:"state"`
+}
+
+// ghPRTimeout bounds the gh lookup behind the missing-base hint.
+var ghPRTimeout = 10 * time.Second
+
+// ghOpenPR returns the open PR for dir's current branch, for a hint only.
+// Any gh failure (missing, unauthenticated, no PR, timeout, bad output)
+// returns ok=false: the caller then prints the plain error. stdin is not
+// passed on (nil Stdin reads /dev/null).
+func ghOpenPR(ctx context.Context, dir string) (prInfo, bool) {
 	bin := os.Getenv("AGENTFLOW_GH")
 	if bin == "" {
 		var err error
 		if bin, err = exec.LookPath("gh"); err != nil {
-			return "", err
+			return prInfo{}, false
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, ghPRTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name")
+	cmd := exec.CommandContext(ctx, bin, "pr", "view", "--json", "baseRefName,number,state")
 	cmd.Dir = dir
+	cmd.WaitDelay = time.Second
 	out, err := cmd.Output()
 	if err != nil {
-		return "", err
+		return prInfo{}, false
 	}
-	return strings.TrimSpace(string(out)), nil
+	var pr prInfo
+	if json.Unmarshal(out, &pr) != nil || pr.State != "OPEN" || pr.Number <= 0 || pr.BaseRefName == "" || strings.HasPrefix(pr.BaseRefName, "-") {
+		return prInfo{}, false
+	}
+	return pr, true
 }
