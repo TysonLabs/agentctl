@@ -65,21 +65,47 @@
     setTimeout(() => t.remove(), bad ? 7000 : 4000);
   }
 
-  // Writes carry the version they were based on; a 409 means the file changed
-  // underneath us, so reload and let the person redo the edit.
-  async function write(path, body) {
+  // Writes carry the version they were based on (the current one unless the
+  // caller passes the version its form was built from); a 409 means the file
+  // changed underneath us, so reload and let the person redo the edit.
+  async function write(path, body, version) {
     try {
-      const next = await api("POST", path, Object.assign({ version: state ? state.version : "" }, body));
+      const v = version !== undefined ? version : (state ? state.version : "");
+      const next = await api("POST", path, Object.assign({ version: v }, body));
       apply(next);
       (next.notes || []).forEach((n) => toast(n));
-      return true;
+      return next;
     } catch (e) {
       if (e.status === 409) {
         await load();
-        throw new Error("services.toml changed on disk, so the page reloaded. Check it and try again.");
+        const conflict = new Error("services.toml changed on disk, so the page reloaded. Check it and try again.");
+        conflict.status = 409;
+        throw conflict;
       }
       throw e;
     }
+  }
+
+  // Focus keys. render() rebuilds the cards, so the buttons a person was on
+  // are new nodes afterwards. Controls that must keep focus across a render
+  // carry data-focus; pendingFocus names where focus goes after the next
+  // render (first key that exists and is enabled wins).
+  let pendingFocus = null;
+  function findFocus(k) {
+    if (!k) return null;
+    return [...document.querySelectorAll("[data-focus]")].find((el) => el.dataset.focus === k) || null;
+  }
+  function focusKeys(keys) {
+    for (const k of keys || []) {
+      const el = findFocus(k);
+      if (el && !el.disabled) { el.focus(); return true; }
+    }
+    return false;
+  }
+  // write, then put focus on the first of keys that the new page has.
+  async function writeFocus(keys, path, body) {
+    pendingFocus = keys;
+    try { return await write(path, body); } finally { pendingFocus = null; }
   }
 
   async function load() {
@@ -127,6 +153,14 @@
   }
 
   function render() {
+    const active = document.activeElement;
+    const keys = pendingFocus || (active && active.dataset && active.dataset.focus ? [active.dataset.focus] : null);
+    pendingFocus = null;
+    renderPage();
+    if (keys) focusKeys(keys);
+  }
+
+  function renderPage() {
     $("path").textContent = state.path;
     $("appver").textContent = state.app_version ? "v" + state.app_version : "";
     $("add").disabled = !!state.error;
@@ -153,6 +187,13 @@
     $("alerts").replaceChildren(...alerts);
 
     const gs = groups();
+    // Inline lock drafts belong to gates in the rendered snapshot. A
+    // gate-only project can disappear from groups() when its gate is removed,
+    // so discard orphaned drafts before rendering any cards.
+    const gateNames = new Set((state.gates || []).map((gt) => gt.name));
+    for (const name of lockEdit.keys()) {
+      if (!gateNames.has(name)) lockEdit.delete(name);
+    }
     const wired = state.services.filter((s) => s.token.wired).length;
     $("summary").textContent = gs.length
       ? `${plural(gs.length, "service", "services")} · ${plural(state.services.length, "environment", "environments")} · ${wired} wired`
@@ -183,71 +224,206 @@
         h("div", {},
           h("button", { class: "btn ghost", type: "button", text: "Add env", onclick: () => openAdd(g.name) }),
           h("button", { class: "btn ghost", type: "button", text: "Slack", onclick: () => openSlack(g.name, an) }),
-          h("button", { class: "btn ghost", type: "button", text: "Gate step", onclick: () => openGateStep(g.name, null) }),
+          h("button", { class: "btn ghost", type: "button", text: "Gate", "aria-label": "Go to the gate of " + g.name, onclick: () => focusGate(g.name) }),
           h("button", { class: "btn ghost", type: "button", text: "Details", onclick: () => openMeta(g) }))),
       g.envs.map(renderEnv),
-      renderGate(g.name));
+      renderGate(g));
   }
 
-  // agentflow's [name.gate]: the ordered steps `agentflow gate` runs.
-  function renderGate(name) {
-    const gt = (state.gates || []).find((x) => x.name === name);
-    if (!gt) return null;
+  // agentflow's [name.gate]: the ordered steps `agentflow gate` runs. Every
+  // project card shows this block, with an empty state when there is no gate.
+  const DEFAULT_TIMEOUT = "30m";
+  const LOCK_HINT = "agentflow gate holds this named lock for the whole run, so two gates that share it never run at once. Empty means no lock.";
+  const STOP_HINT = "Stop on fail: if this step fails, the later steps are skipped.";
+  const lockEdit = new Map(); // project name -> {draft, error} while its lock is being edited
+
+  function gateOf(name) {
+    return (state.gates || []).find((x) => x.name === name) || null;
+  }
+
+  // The ⛔ marker. Screen readers hear "stop on fail", not the emoji's name.
+  function stopMark(withText) {
+    return h("span", { class: "stop-mark", title: STOP_HINT },
+      h("span", { "aria-hidden": "true", text: "⛔" }),
+      withText ? h("span", { class: "stop-text", text: "stop on fail" }) : h("span", { class: "vh", text: "stop-on-fail" }));
+  }
+
+  // The card's "Gate" action: bring the block into view and focus its heading.
+  function focusGate(name) {
+    const head = findFocus("gate-h:" + name);
+    if (!head) return;
+    head.scrollIntoView({ block: "center" });
+    head.focus({ preventScroll: true });
+    const block = head.closest(".gate");
+    block.classList.remove("flash");
+    void block.offsetWidth; // restart the highlight
+    block.classList.add("flash");
+  }
+
+  function renderGate(g) {
+    const name = g.name;
+    const gt = gateOf(name);
+    const hid = "gate-h-" + name;
+    const title = h("h3", { class: "gate-title", id: hid, tabindex: "-1", "data-focus": "gate-h:" + name, text: "Gate" });
+    if (!gt) {
+      // A gate is optional: a project without one gets a single muted line.
+      title.className = "gate-title gate-off-title";
+      return h("section", { class: "gate gate-off", "aria-labelledby": hid },
+        h("div", { class: "gate-off-line small muted" }, title,
+          h("span", { text: "not set up" }),
+          h("span", { "aria-hidden": "true", text: "·" }),
+          h("button", { class: "btn ghost", type: "button", text: "Add", "data-focus": "gate-add:" + name,
+            "aria-label": "Add a gate step to " + name,
+            title: "Commands that must pass before a PR, run in order. agentflow gate runs them and records a receipt per step.",
+            onclick: () => openGateStep(name, null) })));
+    }
     const n = gt.steps.length;
-    const lockBtn = h("button", { class: "btn", type: "button", text: gt.lock ? "Change lock" : "Set lock", onclick: () => openGateLock(name, gt) });
     const rmGate = armedButton("Remove gate", "Confirm: remove all steps", async () => {
-      await write("/api/gate/remove", { name });
+      await writeFocus(["gate-add:" + name, "gate-h:" + name, "add-gate"], "/api/gate/remove", { name });
       toast("Removed the gate of " + name);
     });
+    const [lockInline, lockExtra] = renderLock(name, gt);
     const head = h("div", { class: "gate-head" },
-      h("span", { class: "pill", text: "gate" }),
-      h("div", { class: "gate-sum" },
-        h("span", { class: "muted small", text: plural(n, "step", "steps") + " · lock " }),
-        gt.lock ? h("span", { class: "chip ok mono", text: gt.lock }) : h("span", { class: "muted small", text: "none" }),
-        gt.error ? h("span", { class: "reason", text: gt.error, title: gt.error }) : null),
-      h("div", { class: "actions" }, lockBtn, rmGate));
-    const rows = gt.steps.map((st, i) => {
-      const up = h("button", { class: "btn", type: "button", text: "↑", title: "Move up", "aria-label": "Move " + st.name + " up", disabled: i === 0 || undefined });
-      up.addEventListener("click", () => busy(up, () => write("/api/gate/move", { name, step: st.name, to: i })));
-      const down = h("button", { class: "btn", type: "button", text: "↓", title: "Move down", "aria-label": "Move " + st.name + " down", disabled: i === n - 1 || undefined });
-      down.addEventListener("click", () => busy(down, () => write("/api/gate/move", { name, step: st.name, to: i + 2 })));
-      const rm = armedButton("Delete", "Confirm", async () => {
-        await write("/api/gate/step/remove", { name, step: st.name });
-        toast("Deleted step " + st.name);
-      });
-      return h("div", { class: "gate-row" },
-        h("span", { class: "gate-idx muted", text: String(i + 1) }),
-        h("div", { class: "gate-step" },
-          h("span", { class: "gate-name", text: st.name }),
-          h("span", { class: "mono gate-run", text: st.run, title: st.run })),
-        h("div", { class: "gate-flags" },
-          h("span", { class: "muted small", text: st.timeout || "30m" }),
-          st.stop_on_fail ? h("span", { class: "chip warn", title: "Later steps are skipped if this one fails", text: "stops" }) : null),
-        h("div", { class: "actions" }, up, down,
-          h("button", { class: "btn", type: "button", text: "Edit", onclick: () => openGateStep(name, st) }),
-          rm));
-    });
-    return h("div", { class: "gate" }, head, rows);
+      h("div", { class: "gate-title-row" }, title, h("span", { class: "muted small", text: plural(n, "step", "steps") })),
+      lockInline,
+      h("div", { class: "gate-head-actions" }, rmGate),
+      lockExtra);
+    const legend = h("p", { class: "gate-legend muted small" },
+      "Runs top to bottom; every step runs even if an earlier one fails. A ", stopMark(false), " step skips the rest when it fails.");
+    const list = n
+      ? h("ol", { class: "gate-steps", role: "list", "aria-label": "Gate steps of " + name + ", in run order" },
+        gt.steps.map((st, i) => renderGateStep(name, gt.steps, i)))
+      : h("p", { class: "gate-none muted small", text: "No steps yet." });
+    const foot = h("p", { class: "gate-foot muted small" },
+      "Run: ", h("code", { class: "mono", text: "agentflow gate" }),
+      " · Proof: ", h("code", { class: "mono", text: "agentflow gate --check --rev HEAD" }),
+      g.meta.repo ? null : h("span", { class: "gate-norepo", text: " · Set the repo in Details so agentflow gate can find this project." }));
+    return h("section", { class: "gate", "aria-labelledby": hid },
+      head, legend,
+      gt.error ? h("p", { class: "gate-error", text: "agentflow refuses this gate: " + gt.error }) : null,
+      list,
+      h("div", { class: "gate-add" },
+        h("button", { class: "btn", type: "button", text: "+ Add step", "data-focus": "gate-add:" + name,
+          onclick: () => openGateStep(name, null) })),
+      foot);
   }
 
-  // A destructive button that needs a second click within 4 s.
-  function armedButton(text, armedText, fn) {
-    const b = h("button", { class: "btn danger", type: "button", text });
+  function renderGateStep(name, steps, i) {
+    const st = steps[i];
+    const n = steps.length;
+    const key = name + ":" + st.name;
+    const up = h("button", { class: "btn icon", type: "button", text: "↑", title: "Move up", "aria-label": "Move " + st.name + " up",
+      "data-focus": "gate-up:" + key, disabled: i === 0 || undefined });
+    up.addEventListener("click", () => busy(up, () =>
+      writeFocus(["gate-up:" + key, "gate-down:" + key], "/api/gate/move", { name, step: st.name, to: i })));
+    const down = h("button", { class: "btn icon", type: "button", text: "↓", title: "Move down", "aria-label": "Move " + st.name + " down",
+      "data-focus": "gate-down:" + key, disabled: i === n - 1 || undefined });
+    down.addEventListener("click", () => busy(down, () =>
+      writeFocus(["gate-down:" + key, "gate-up:" + key], "/api/gate/move", { name, step: st.name, to: i + 2 })));
+    const edit = h("button", { class: "btn", type: "button", text: "Edit", "aria-label": "Edit step " + st.name,
+      "data-focus": "gate-edit:" + key, onclick: () => openGateStep(name, st) });
+    // After a removal, focus moves to the next step (or the previous one).
+    const neighbour = steps[i + 1] || steps[i - 1];
+    const rm = armedButton("Remove", "Confirm", async () => {
+      await writeFocus([neighbour ? "gate-edit:" + name + ":" + neighbour.name : "", "gate-add:" + name, "add-gate"],
+        "/api/gate/step/remove", { name, step: st.name });
+      toast("Removed step " + st.name);
+    }, ["Remove step " + st.name, "Confirm: remove step " + st.name]);
+    const timeout = st.timeout
+      ? h("span", { class: "gate-timeout mono", title: "Timeout" }, h("span", { class: "vh", text: "timeout " }), st.timeout)
+      : h("span", { class: "gate-timeout mono muted", title: "Timeout (the default)" }, h("span", { class: "vh", text: "default timeout " }), DEFAULT_TIMEOUT);
+    return h("li", { class: "gate-row" + (st.stop_on_fail ? " stops" : "") },
+      h("span", { class: "gate-idx", text: String(i + 1) }),
+      h("span", { class: "gate-name mono", text: st.name, title: st.name }),
+      h("span", { class: "gate-run mono", text: st.run, title: st.run }),
+      timeout,
+      h("span", { class: "gate-stop" }, st.stop_on_fail ? stopMark(true) : null),
+      h("div", { class: "actions" }, up, down, edit, rm));
+  }
+
+  // The lock, edited in place in the block header. Returns the inline part
+  // and, while editing, a full-width row with the hint and any error.
+  function renderLock(name, gt) {
+    const e = lockEdit.get(name);
+    if (!e) {
+      return [h("div", { class: "gate-lock" },
+        h("span", { class: "muted small", text: "Lock:" }),
+        gt.lock ? h("span", { class: "chip ok mono", text: gt.lock, title: LOCK_HINT }) : h("span", { class: "muted small", text: "none", title: LOCK_HINT }),
+        h("button", { class: "btn ghost", type: "button", text: "Edit", "aria-label": "Edit gate lock", "data-focus": "gate-lock:" + name,
+          onclick: () => {
+            lockEdit.set(name, { draft: gt.lock || "", error: "" });
+            pendingFocus = ["gate-lock-in:" + name];
+            render();
+          } })), null];
+    }
+    const id = "gate-lock-in-" + name;
+    const input = h("input", { id, type: "text", class: "mono", value: e.draft, placeholder: name + "-build", autocomplete: "off",
+      spellcheck: "false", "data-focus": "gate-lock-in:" + name, "aria-describedby": id + "-hint", "aria-invalid": e.error ? "true" : undefined });
+    input.addEventListener("input", () => { e.draft = input.value; });
+    const save = h("button", { class: "btn primary", type: "button", text: "Save" });
+    const cancel = h("button", { class: "btn", type: "button", text: "Cancel" });
+    const close = () => {
+      lockEdit.delete(name);
+      pendingFocus = ["gate-lock:" + name, "gate-add:" + name, "add-gate"];
+      render();
+    };
+    const doSave = () => busy(save, async () => {
+      try {
+        await write("/api/gate/lock", { name, lock: input.value.trim() });
+      } catch (err) {
+        if (lockEdit.has(name)) {
+          e.error = err.message;
+          pendingFocus = ["gate-lock-in:" + name];
+          render();
+        } else {
+          focusKeys(["gate-add:" + name, "add-gate"]);
+        }
+        return;
+      }
+      close();
+      toast("Saved the gate lock of " + name);
+    });
+    save.addEventListener("click", doSave);
+    cancel.addEventListener("click", close);
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); doSave(); }
+      if (ev.key === "Escape") { ev.preventDefault(); close(); }
+    });
+    return [
+      h("div", { class: "gate-lock editing" },
+        h("label", { for: id, class: "muted small", text: "Lock:" }), input, save, cancel),
+      h("div", { class: "gate-lock-extra" },
+        h("p", { class: "hint", id: id + "-hint", text: LOCK_HINT }),
+        e.error ? h("p", { class: "form-error", role: "alert", text: e.error }) : null),
+    ];
+  }
+
+  // A destructive button that needs a second click within 4 s. aria, when
+  // given, is [label, armed label] for buttons whose text alone is ambiguous.
+  function armedButton(text, armedText, fn, aria) {
+    const b = h("button", { class: "btn danger", type: "button", text, "aria-label": aria ? aria[0] : undefined });
     let armed = null;
+    const reset = () => {
+      armed = null;
+      b.classList.remove("armed");
+      b.textContent = text;
+      if (aria) b.setAttribute("aria-label", aria[0]);
+    };
     b.addEventListener("click", () => {
       if (!armed) {
         b.classList.add("armed");
         b.textContent = armedText;
-        armed = setTimeout(() => { armed = null; b.classList.remove("armed"); b.textContent = text; }, 4000);
+        if (aria) b.setAttribute("aria-label", aria[1]);
+        armed = setTimeout(reset, 4000);
         return;
       }
       clearTimeout(armed);
       armed = null;
-      busy(b, fn);
+      // A refused write leaves the button in place; disarm it.
+      busy(b, fn).then(() => { if (b.isConnected) reset(); });
     });
     return b;
   }
-
   // agentflow's [name.announce]: where `agentflow ship announce` posts.
   function slackChip(an) {
     if (!an) return h("span", { class: "muted", text: "off" });
@@ -313,8 +489,14 @@
   }
 
   async function busy(btn, fn) {
+    const had = document.activeElement === btn;
     btn.disabled = true;
-    try { await fn(); } catch (e) { toast(e.message, true); } finally { btn.disabled = false; }
+    try { await fn(); } catch (e) { toast(e.message, true); } finally {
+      btn.disabled = false;
+      // Disabling the focused button drops focus to the page; when no render
+      // moved it elsewhere, give it back.
+      if (had && btn.isConnected && (!document.activeElement || document.activeElement === document.body)) btn.focus();
+    }
   }
 
   // ---- dialogs ----
@@ -332,7 +514,13 @@
   }
 
   let onSubmit = null;
+  // Where focus goes when the dialog closes: by default the control that
+  // opened it, found again by its focus key if a render replaced it. A
+  // submit handler may point it elsewhere (a renamed step's Edit button).
+  let dialogReturn = null;
   function openDialog(title, hint, fields, okText, submit) {
+    const opener = document.activeElement;
+    dialogReturn = opener && opener.dataset && opener.dataset.focus ? [opener.dataset.focus] : null;
     $("dlg-title").textContent = title;
     $("dlg-hint").textContent = hint || "";
     $("dlg-fields").replaceChildren(...fields);
@@ -341,7 +529,7 @@
     $("dlg-ok").disabled = false;
     onSubmit = submit;
     $("dlg").showModal();
-    const first = $("dlg-fields").querySelector("input:not([readonly])");
+    const first = $("dlg-fields").querySelector("input:not([readonly]), select");
     if (first) first.focus();
   }
   const val = (id) => ($(id) ? $(id).value.trim() : "");
@@ -465,54 +653,127 @@
       hint ? h("div", { class: "hint", text: hint }) : null);
   }
 
-  // Add (st null) or edit a gate step. With no name, it starts a new
-  // gate-only project and can set its repo.
+  // Add (st null) or edit a gate step. The dialog shows the gate's steps with
+  // this one highlighted where it will land; Position picks that place. With
+  // no name, it starts a new gate-only project and can set its repo.
   function openGateStep(name, st) {
     const fresh = !name;
+    // The dialog is built from this snapshot. Every write it makes carries the
+    // snapshot's version (or the version of the write before it), so a file
+    // that changed meanwhile is refused (409) instead of placing the step
+    // against a list the person did not see.
+    let base = state.version;
+    const steps = fresh ? [] : ((gateOf(name) || { steps: [] }).steps).slice();
+    const others = st ? steps.filter((x) => x.name !== st.name) : steps;
     const fields = [];
     if (fresh) {
-      fields.push(h("div", { class: "field-row" },
-        field("f-proj", "Project", { placeholder: "myproj", mono: true, required: true }),
+      fields.push(
+        field("f-proj", "Project", { placeholder: "myproj", mono: true, required: true,
+          hint: "A new project name. To gate an existing service, use the Gate block on its card." }),
         field("f-repo", "Repo (optional)", { placeholder: "~/src/github.com/org/repo", mono: true,
-          hint: "agentflow gate finds the project from this checkout." })));
+          hint: "The project's checkout. agentflow gate picks the project whose repo is the checkout (or a worktree of it) it runs in; without a repo it needs --project." }));
     }
     fields.push(
       field("f-step", "Step name", { value: st ? st.name : "", placeholder: "test", mono: true, required: true }),
       field("f-run", "Command", { value: st ? st.run : "", placeholder: "make test", mono: true, required: true,
         hint: "Runs with /bin/sh -c from the repo root, stdin closed." }),
-      field("f-timeout", "Timeout", { value: st ? st.timeout : "", placeholder: "30m", mono: true,
-        hint: "Empty means 30m. The whole process group is killed when it runs out." }),
-      checkbox("f-stop", "Stop on fail", st && st.stop_on_fail, "Skip the later steps when this one fails."));
+      field("f-timeout", "Timeout", { value: st ? st.timeout : "", placeholder: DEFAULT_TIMEOUT, mono: true,
+        hint: "Empty means " + DEFAULT_TIMEOUT + " (max 24h). When it runs out, the step's whole process group is killed." }),
+      checkbox("f-stop", "Stop on fail", st && st.stop_on_fail,
+        "On: if this step fails, the later steps are skipped. Off: the later steps still run, so one run reports every failure. The gate fails either way."));
+
+    // Position: 0 = first, k = after others[k-1]. A new step defaults to the
+    // end; an edited one to where it is now.
+    let sel = null;
+    let preview = null;
+    if (others.length) {
+      const initial = st ? steps.findIndex((x) => x.name === st.name) : others.length;
+      sel = h("select", { id: "f-pos", name: "f-pos", "aria-describedby": "f-preview-label" },
+        h("option", { value: "0", text: "First" }),
+        others.map((x, k) => h("option", { value: String(k + 1), text: "After " + x.name + (k === others.length - 1 ? " (last)" : "") })));
+      sel.value = String(initial);
+      preview = h("ol", { class: "gate-preview", role: "list", "aria-labelledby": "f-preview-label" });
+      fields.push(h("div", { class: "field" },
+        h("label", { for: "f-pos", text: "Position" }), sel,
+        h("div", { class: "hint", id: "f-preview-label", text: "Order after saving:" }),
+        preview));
+    }
+    const draw = () => {
+      if (!preview) return;
+      const k = Number(sel.value);
+      const label = val("f-step") || (st ? st.name : "new step");
+      const rows = others.map((x) => h("li", {},
+        h("span", { class: "mono", text: x.name }), h("span", { class: "mono muted pv-run", text: x.run })));
+      rows.splice(k, 0, h("li", { class: "this" },
+        h("span", { class: "mono", text: label }),
+        h("span", { class: "pv-tag", text: st ? "this step" : "new" })));
+      preview.replaceChildren(...rows);
+    };
+
     openDialog(st ? "Edit gate step " + st.name : (fresh ? "Add a gate project" : "Add a gate step to " + name),
-      "agentflow gate runs these steps in order and records a receipt for each pass.", fields, st ? "Save" : "Add",
+      "agentflow gate runs the steps top to bottom and records a receipt for each step that passes.", fields, st ? "Save" : "Add",
       async () => {
         const form = {
           proj: fresh ? val("f-proj") : name, repo: fresh ? val("f-repo") : "",
           step: { name: val("f-step"), run: val("f-run"), timeout: val("f-timeout"), stop_on_fail: $("f-stop").checked },
+          pos: sel ? Number(sel.value) : others.length,
         };
-        if (fresh && groups().some((g) => g.name === form.proj)) {
-          throw new Error(form.proj + " already exists. Use its Gate step button.");
+        const anchor = form.pos > 0 ? others[form.pos - 1].name : null; // the step it goes after
+        if (fresh) {
+          if (groups().some((g) => g.name === form.proj)) {
+            throw new Error(form.proj + " already exists. Use the Gate block on its card.");
+          }
+          // The repo goes first: a gate without meta.repo cannot run, while a
+          // refused step leaves only the repo, and resubmitting adds the step.
+          if (form.repo) {
+            const next = await write("/api/meta", { name: form.proj, meta: { repo: form.repo } }, base);
+            base = next.version;
+          }
+          await write("/api/gate/step", { name: form.proj, original: "", step: form.step }, base);
+          toast("Added step " + form.step.name + " to " + form.proj);
+          return;
         }
-        // The repo goes first: a gate without meta.repo cannot run, while a
-        // refused step leaves only the repo, and resubmitting adds the step.
-        if (form.repo) {
-          await write("/api/meta", { name: form.proj, meta: { repo: form.repo } });
+        if (!st) {
+          dialogReturn = ["gate-add:" + name, "add-gate"];
+          const at = anchor === null ? 1 : steps.findIndex((x) => x.name === anchor) + 2;
+          await write("/api/gate/step", { name, original: "", step: form.step, at }, base);
+          toast("Added step " + form.step.name);
+          return;
         }
-        await write("/api/gate/step", { name: form.proj, original: st ? st.name : "", step: form.step });
-        toast((st ? "Saved step " : "Added step ") + form.step.name);
+        // Focus returns to this step's Edit button, under its new name.
+        dialogReturn = ["gate-edit:" + name + ":" + form.step.name, "gate-add:" + name, "add-gate"];
+        const changed = form.step.name !== st.name || form.step.run !== st.run ||
+          form.step.timeout !== (st.timeout || "") || form.step.stop_on_fail !== !!st.stop_on_fail;
+        let moveVersion = base;
+        if (changed) {
+          const next = await write("/api/gate/step", { name, original: st.name, step: form.step }, base);
+          moveVersion = next.version;
+        }
+        // Then the position, against the list as it is now.
+        const cur = (gateOf(name) || { steps: [] }).steps;
+        const rest = cur.filter((x) => x.name !== form.step.name);
+        const now = cur.findIndex((x) => x.name === form.step.name) + 1;
+        const to = anchor === null ? 1 : rest.findIndex((x) => x.name === anchor) + 2;
+        if (to !== now) {
+          try {
+            await write("/api/gate/move", { name, step: form.step.name, to }, moveVersion);
+          } catch (e) {
+            if (!changed) throw e;
+            // The edit already committed; close and say what is left to do.
+            toast("Saved step " + form.step.name + ", but did not move it: " + e.message, true);
+            return;
+          }
+        }
+        toast(changed || to !== now ? "Saved step " + form.step.name : "No changes to save");
       });
+    if (!dialogReturn) dialogReturn = [];
+    if (!dialogReturn.includes("add-gate")) dialogReturn.push("add-gate");
+    if (preview) {
+      draw();
+      sel.addEventListener("change", draw);
+      $("f-step").addEventListener("input", draw);
+    }
   }
-
-  function openGateLock(name, gt) {
-    openDialog("Gate lock for " + name,
-      "agentflow gate holds this named lock for the whole run, so two gates that share it never run at once. Leave it empty for no lock.",
-      [field("f-lock", "Lock name", { value: gt.lock, placeholder: name + "-build", mono: true })], "Save",
-      async () => {
-        await write("/api/gate/lock", { name, lock: val("f-lock") });
-        toast("Saved the gate lock of " + name);
-      });
-  }
-
   function openMeta(g) {
     openDialog("Details for " + g.name, "Used by agentflow and the fleet view. Leave a field empty to clear it.",
       [
@@ -540,7 +801,15 @@
       await onSubmit();
       $("dlg").close();
     } catch (e) {
-      $("dlg-error").textContent = e.message;
+      if (e.status === 409) {
+        // A gate dialog is tied to the list it showed. Closing every stale
+        // dialog also prevents any form from silently overwriting reloaded
+        // values; reopening it takes a fresh snapshot.
+        $("dlg").close();
+        toast(e.message, true);
+      } else {
+        $("dlg-error").textContent = e.message;
+      }
     } finally {
       controls.forEach((control) => { control.disabled = false; });
     }
@@ -549,7 +818,13 @@
   $("dlg").addEventListener("cancel", (ev) => {
     if ($("dlg-ok").disabled) ev.preventDefault();
   });
-  $("dlg").addEventListener("close", () => { $("dlg-fields").replaceChildren(); onSubmit = null; });
+  $("dlg").addEventListener("close", () => {
+    $("dlg-fields").replaceChildren();
+    onSubmit = null;
+    const keys = dialogReturn;
+    dialogReturn = null;
+    if (keys) focusKeys(keys);
+  });
 
   $("add").addEventListener("click", () => openAdd());
   $("add-gate").addEventListener("click", () => openGateStep("", null));
