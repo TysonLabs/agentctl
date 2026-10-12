@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 
 func TestCodeRabbitUsageErrors(t *testing.T) {
 	t.Setenv("AGENTFLOW_CODERABBIT", "/nonexistent/coderabbit") // never run: each case fails first
+	t.Setenv("AGENTFLOW_GH", "/nonexistent/gh")                 // no PR hint
 	dir := t.TempDir()
 	cases := []struct {
 		args []string
@@ -36,7 +39,9 @@ func TestCodeRabbitUsageErrors(t *testing.T) {
 		{[]string{"coderabbit", "--config", filepath.Join(dir, "missing.md"), "--dir", dir}, "is not a readable file"},
 		{[]string{"coderabbit", "--config", dir, "--dir", dir}, "is not a readable file"},
 		{[]string{"coderabbit", "--dir", filepath.Join(dir, "nope")}, "is not a directory"},
-		{[]string{"coderabbit", "--dir", dir}, "not inside a git repository"},
+		{[]string{"coderabbit", "--dir", dir, "--uncommitted"}, "not inside a git repository"},
+		{[]string{"coderabbit", "--dir", dir}, "a review scope is required"},
+		{[]string{"coderabbit", "--dir", dir, "--base", "origin/main"}, "is not a commit in"},
 		{[]string{"coderabbit", "extra"}, "unexpected argument"},
 		{[]string{"coderabbit", "--bogus"}, "flag provided but not defined"},
 	}
@@ -106,10 +111,13 @@ func crRepo(t *testing.T) (repo, rec string) {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENTFLOW_CODERABBIT", script)
+	// Hermetic: no real gh, and no use-credits switch from the caller's env.
+	t.Setenv("AGENTFLOW_GH", filepath.Join(rec, "no-gh"))
+	t.Setenv("AGENTFLOW_CR_USE_CREDITS", "")
 	return repo, rec
 }
 
-func TestCodeRabbitDefaultScopeAndConfigPaths(t *testing.T) {
+func TestCodeRabbitBaseScopeAndConfigPaths(t *testing.T) {
 	repo, rec := crRepo(t)
 	// --config is relative to the invocation cwd, not to --dir.
 	cwd := t.TempDir()
@@ -118,7 +126,7 @@ func TestCodeRabbitDefaultScopeAndConfigPaths(t *testing.T) {
 	}
 	t.Chdir(cwd)
 	var out, errb bytes.Buffer
-	code := Run([]string{"coderabbit", "--dir", repo, "--deep", "--config", "AGENTS.md", "--out", filepath.Join(t.TempDir(), "o")}, &out, &errb)
+	code := Run([]string{"coderabbit", "--dir", repo, "--base", "origin/trunk", "--deep", "--config", "AGENTS.md", "--out", filepath.Join(t.TempDir(), "o")}, &out, &errb)
 	if code != 0 {
 		t.Fatalf("exit %d, stderr %q, stdout %s", code, errb.String(), out.String())
 	}
@@ -156,7 +164,7 @@ func TestCodeRabbitNoWaitLockRefusesWhileRepoLocked(t *testing.T) {
 	defer unlock()
 	outDir := filepath.Join(t.TempDir(), "o")
 	var out, errb bytes.Buffer
-	if code := Run([]string{"coderabbit", "--dir", repo, "--no-wait-lock", "--out", outDir}, &out, &errb); code != 1 || !strings.Contains(errb.String(), "another agentflow coderabbit run") {
+	if code := Run([]string{"coderabbit", "--dir", repo, "--base", "origin/trunk", "--no-wait-lock", "--out", outDir}, &out, &errb); code != 1 || !strings.Contains(errb.String(), "another agentflow coderabbit run") {
 		t.Fatalf("exit %d, stderr %q", code, errb.String())
 	}
 	if _, err := os.Stat(filepath.Join(rec, "args.txt")); err == nil {
@@ -206,7 +214,7 @@ func TestCodeRabbitWaitsForLockThenRuns(t *testing.T) {
 	var out bytes.Buffer
 	done := make(chan int, 1)
 	go func() {
-		done <- runCodeRabbit(context.Background(), []string{"--dir", repo, "--out", filepath.Join(t.TempDir(), "o")}, &out, errw)
+		done <- runCodeRabbit(context.Background(), []string{"--dir", repo, "--base", "origin/trunk", "--out", filepath.Join(t.TempDir(), "o")}, &out, errw)
 	}()
 	select {
 	case <-errw.hit:
@@ -246,7 +254,7 @@ func TestCodeRabbitLockTimeout(t *testing.T) {
 	}
 	defer unlock()
 	var out, errb bytes.Buffer
-	code := Run([]string{"coderabbit", "--dir", repo, "--lock-timeout", "200ms", "--out", filepath.Join(t.TempDir(), "o")}, &out, &errb)
+	code := Run([]string{"coderabbit", "--dir", repo, "--base", "origin/trunk", "--lock-timeout", "200ms", "--out", filepath.Join(t.TempDir(), "o")}, &out, &errb)
 	if code != 6 {
 		t.Fatalf("exit %d, stderr %q; want 6", code, errb.String())
 	}
@@ -276,7 +284,7 @@ func TestCodeRabbitStaleHolderRecordDoesNotBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errb bytes.Buffer
-	if code := Run([]string{"coderabbit", "--dir", repo, "--lock-timeout", "5s", "--out", filepath.Join(t.TempDir(), "o")}, &out, &errb); code != 0 {
+	if code := Run([]string{"coderabbit", "--dir", repo, "--base", "origin/trunk", "--lock-timeout", "5s", "--out", filepath.Join(t.TempDir(), "o")}, &out, &errb); code != 0 {
 		t.Fatalf("exit %d, stderr %q", code, errb.String())
 	}
 	if strings.Contains(errb.String(), "waiting") {
@@ -303,7 +311,7 @@ func TestCodeRabbitUseCreditsPassthrough(t *testing.T) {
 			repo, rec := crRepo(t)
 			t.Setenv("AGENTFLOW_CR_USE_CREDITS", c.env)
 			var out, errb bytes.Buffer
-			args := append([]string{"coderabbit", "--dir", repo, "--out", filepath.Join(t.TempDir(), "o")}, c.args...)
+			args := append([]string{"coderabbit", "--dir", repo, "--base", "origin/trunk", "--out", filepath.Join(t.TempDir(), "o")}, c.args...)
 			if code := Run(args, &out, &errb); code != 0 {
 				t.Fatalf("exit %d, stderr %q", code, errb.String())
 			}
@@ -320,7 +328,7 @@ func TestCodeRabbitStartFailureWritesResult(t *testing.T) {
 	t.Setenv("AGENTFLOW_CODERABBIT", filepath.Join(t.TempDir(), "missing-coderabbit"))
 	outDir := filepath.Join(t.TempDir(), "out")
 	var out, errb bytes.Buffer
-	if code := Run([]string{"coderabbit", "--dir", repo, "--out", outDir}, &out, &errb); code != 3 {
+	if code := Run([]string{"coderabbit", "--dir", repo, "--base", "origin/trunk", "--out", outDir}, &out, &errb); code != 3 {
 		t.Fatalf("exit %d, stderr %q; want failed exit 3", code, errb.String())
 	}
 	res := readResult(t, out.Bytes())
@@ -353,7 +361,7 @@ func TestCodeRabbitRateLimitRetriedThroughCLI(t *testing.T) {
 	t.Cleanup(func() { crHooks.sleep, crHooks.jitter = nil, nil })
 
 	var out, errb bytes.Buffer
-	if code := Run([]string{"coderabbit", "--dir", repo, "--out", filepath.Join(t.TempDir(), "o")}, &out, &errb); code != 0 {
+	if code := Run([]string{"coderabbit", "--dir", repo, "--base", "origin/trunk", "--out", filepath.Join(t.TempDir(), "o")}, &out, &errb); code != 0 {
 		t.Fatalf("exit %d, stderr %q", code, errb.String())
 	}
 	if len(waits) != 1 || waits[0] != 3*time.Minute+2*time.Second {
@@ -374,7 +382,7 @@ func TestCodeRabbitRateLimitRetriedThroughCLI(t *testing.T) {
 	waits = nil
 	out.Reset()
 	errb.Reset()
-	if code := Run([]string{"coderabbit", "--dir", repo, "--rate-limit-retries", "0", "--out", filepath.Join(t.TempDir(), "o")}, &out, &errb); code != 5 {
+	if code := Run([]string{"coderabbit", "--dir", repo, "--base", "origin/trunk", "--rate-limit-retries", "0", "--out", filepath.Join(t.TempDir(), "o")}, &out, &errb); code != 5 {
 		t.Fatalf("exit %d, stderr %q; want 5", code, errb.String())
 	}
 	res = readResult(t, out.Bytes())
@@ -383,48 +391,151 @@ func TestCodeRabbitRateLimitRetriedThroughCLI(t *testing.T) {
 	}
 }
 
-func TestCodeRabbitCancellationInterruptsDefaultBranchLookup(t *testing.T) {
-	repo, rec := crRepo(t)
-	if out, err := exec.Command("git", "-C", repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD").CombinedOutput(); err != nil {
-		t.Fatalf("delete origin/HEAD: %v %s", err, out)
-	}
-	ghDir := t.TempDir()
-	gh, started := filepath.Join(ghDir, "gh"), filepath.Join(ghDir, "started")
-	if err := os.WriteFile(gh, []byte("#!/bin/sh\ntouch \""+started+"\"\nexec sleep 2\n"), 0o755); err != nil {
+// fakeGHPR installs a gh script that prints body and exits with code.
+func fakeGHPR(t *testing.T, body string, code int) (calls string) {
+	t.Helper()
+	d := t.TempDir()
+	gh, calls := filepath.Join(d, "gh"), filepath.Join(d, "calls")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + calls + "\"\ncat <<'EOF'\n" + body + "\nEOF\nexit " + fmt.Sprint(code) + "\n"
+	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENTFLOW_GH", gh)
+	return calls
+}
 
-	// Cancel once the gh lookup has started, not on a timer: a timer can
-	// fire during the lock wait on a loaded machine.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
-			if _, err := os.Stat(started); err == nil {
-				break
+// TestCodeRabbitRequiresScope: without --base/--base-commit/--uncommitted
+// the run refuses (exit 1, stderr only) before it takes the lock, writes no
+// result and never starts CodeRabbit. It never falls back to origin/HEAD.
+func TestCodeRabbitRequiresScope(t *testing.T) {
+	for _, c := range []struct {
+		name, ghBody string
+		ghExit       int
+		want, not    string
+	}{
+		{"open PR names its base", `{"baseRefName":"development","number":123,"state":"OPEN"}`, 0,
+			"--base is required; the open PR #123 targets development: pass --base origin/development", ""},
+		{"stacked PR names the feature branch", `{"baseRefName":"feat/parent","number":7,"state":"OPEN"}`, 0,
+			"the open PR #7 targets feat/parent: pass --base origin/feat/parent", ""},
+		{"shell metacharacters are quoted", `{"baseRefName":"development;touch${IFS}/tmp/pwn","number":8,"state":"OPEN"}`, 0,
+			"the open PR #8 targets development;touch${IFS}/tmp/pwn: pass --base 'origin/development;touch${IFS}/tmp/pwn'", "pass --base origin/development;touch${IFS}/tmp/pwn"},
+		{"closed PR gives no hint", `{"baseRefName":"development","number":9,"state":"CLOSED"}`, 0,
+			"a review scope is required", "#9"},
+		{"merged PR gives no hint", `{"baseRefName":"development","number":9,"state":"MERGED"}`, 0,
+			"a review scope is required", "#9"},
+		{"gh fails (no PR, unauthenticated)", `no pull requests found for branch "trunk"`, 1,
+			"a review scope is required", "PR #"},
+		{"gh prints garbage", `not json`, 0, "a review scope is required", "PR #"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			repo, rec := crRepo(t)
+			calls := fakeGHPR(t, c.ghBody, c.ghExit)
+			outDir := filepath.Join(t.TempDir(), "o")
+			var out, errb bytes.Buffer
+			code := Run([]string{"coderabbit", "--dir", repo, "--deep", "--out", outDir}, &out, &errb)
+			if code != 1 || !strings.Contains(errb.String(), c.want) || (c.not != "" && strings.Contains(errb.String(), c.not)) {
+				t.Fatalf("exit %d, stderr %q; want 1 with %q", code, errb.String(), c.want)
 			}
-		}
-		cancel()
-	}()
+			if out.Len() != 0 {
+				t.Fatalf("stdout %q; a usage error writes no result", out.String())
+			}
+			if _, err := os.Stat(outDir); !os.IsNotExist(err) {
+				t.Fatalf("out dir created: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(rec, "args.txt")); !os.IsNotExist(err) {
+				t.Fatal("coderabbit ran without a scope")
+			}
+			if got, _ := os.ReadFile(calls); strings.TrimSpace(string(got)) != "pr view --json baseRefName,number,state" {
+				t.Fatalf("gh calls %q", got)
+			}
+		})
+	}
+}
+
+func TestCodeRabbitRequiresScopeWhenGHMissing(t *testing.T) {
+	repo, _ := crRepo(t)
+	t.Setenv("AGENTFLOW_GH", filepath.Join(t.TempDir(), "no-gh"))
+	var out, errb bytes.Buffer
+	if code := Run([]string{"coderabbit", "--dir", repo}, &out, &errb); code != 1 || !strings.Contains(errb.String(), "a review scope is required") {
+		t.Fatalf("exit %d, stderr %q", code, errb.String())
+	}
+}
+
+// A hung gh is cut off by its bounded timeout: plain error, no hang.
+func TestCodeRabbitRequiresScopeWhenGHHangs(t *testing.T) {
+	repo, _ := crRepo(t)
+	d := t.TempDir()
+	gh, childPID := filepath.Join(d, "gh"), filepath.Join(d, "child.pid")
+	script := "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' \"$!\" > \"" + childPID + "\"\nwait\n"
+	if err := os.WriteFile(gh, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENTFLOW_GH", gh)
+	old := ghPRTimeout
+	ghPRTimeout = time.Second
+	defer func() { ghPRTimeout = old }()
 	start := time.Now()
 	var out, errb bytes.Buffer
-	outDir := filepath.Join(t.TempDir(), "out")
-	code := runCodeRabbit(ctx, []string{"--dir", repo, "--out", outDir}, &out, &errb)
-	if elapsed := time.Since(start); elapsed > 1900*time.Millisecond {
-		t.Fatalf("cancellation took %s; gh lookup did not use the command context", elapsed)
+	code := Run([]string{"coderabbit", "--dir", repo}, &out, &errb)
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("took %s; the gh lookup is not bounded", elapsed)
 	}
-	if code != coderabbitExitCodes[coderabbit.StatusInterrupted] {
-		t.Fatalf("exit %d, stderr %q; want interrupted exit %d", code, errb.String(), coderabbitExitCodes[coderabbit.StatusInterrupted])
+	if code != 1 || !strings.Contains(errb.String(), "a review scope is required") {
+		t.Fatalf("exit %d, stderr %q", code, errb.String())
 	}
-	res := readResult(t, out.Bytes())
-	if res.Status != coderabbit.StatusInterrupted || res.Attempts != 0 || !strings.Contains(res.Error, "default branch") {
-		t.Fatalf("result %+v", res)
+	b, err := os.ReadFile(childPID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if saved, err := os.ReadFile(filepath.Join(outDir, "result.json")); err != nil || readResult(t, saved).Status != coderabbit.StatusInterrupted {
-		t.Fatalf("result.json: %v", err)
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Kill(pid, syscall.SIGKILL) // clean up if the assertion fails
+	assertProcessDead(t, pid)
+}
+
+func assertProcessDead(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return
+		}
+		if out, _ := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output(); strings.HasPrefix(strings.TrimSpace(string(out)), "Z") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("gh helper pid %d survived the lookup timeout", pid)
+}
+
+// An explicit --base that names no commit refuses before the lock; it is
+// never swapped for another ref.
+func TestCodeRabbitBaseMustExist(t *testing.T) {
+	repo, rec := crRepo(t)
+	outDir := filepath.Join(t.TempDir(), "o")
+	var out, errb bytes.Buffer
+	code := Run([]string{"coderabbit", "--dir", repo, "--base", "origin/development", "--out", outDir}, &out, &errb)
+	if code != 1 || !strings.Contains(errb.String(), `--base "origin/development" is not a commit`) {
+		t.Fatalf("exit %d, stderr %q", code, errb.String())
 	}
 	if _, err := os.Stat(filepath.Join(rec, "args.txt")); !os.IsNotExist(err) {
-		t.Fatalf("coderabbit ran after cancellation; stat error = %v", err)
+		t.Fatal("coderabbit ran with a missing base")
+	}
+}
+
+// The requested base is in the result even when CodeRabbit never ran.
+func TestCodeRabbitResultRecordsBase(t *testing.T) {
+	repo, _ := crRepo(t)
+	unlock, _, err := coderabbit.LockRepo(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	var out, errb bytes.Buffer
+	Run([]string{"coderabbit", "--dir", repo, "--base", "origin/trunk", "--no-wait-lock", "--out", filepath.Join(t.TempDir(), "o")}, &out, &errb)
+	if res := readResult(t, out.Bytes()); res.Status != coderabbit.StatusLockBusy || res.Base != "origin/trunk" {
+		t.Fatalf("result %+v", res)
 	}
 }
