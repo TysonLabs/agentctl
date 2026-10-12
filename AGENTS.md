@@ -65,6 +65,10 @@ background and keep working; your harness tells you when it exits. Never wait in
    --title ... --body-file ...` (what changed and how to test it, in plain language).
 10. **Clean up:** sync any long-lived branches the repo keeps, then remove the worktree
     and the merged branches with `agentflow worktree done <branch>` (never `--force`).
+    It proves the merge from the branch's merged PR, whatever its base; pass `--into`
+    only for a branch merged without a PR. `agentflow worktree sweep` shows each
+    worktree's owner; remove only your own (`sweep --yes --owner <you>`). If you made a
+    worktree with plain `git worktree add`, stamp it with `agentflow worktree adopt`.
 
 **When something looks wrong in a running service,** read it, don't guess:
 `agentctl endpoints <service.env>` lists what it exposes; `agentctl get <service.env>

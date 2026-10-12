@@ -50,13 +50,15 @@ func TestWorktreeNewScratchSweepAndDone(t *testing.T) {
 	}
 	t.Setenv("AGENTFLOW_LSOF", lsof)
 	t.Setenv("AGENTFLOW_GH", filepath.Join(root, "no-gh"))
+	clearOwnerEnv(t)
+	t.Setenv("AGENTFLOW_OWNER", "job-new")
 
 	code, out, errOut := run(t, "worktree", "new", "feat/x", "--repo", repo)
 	var made struct {
-		Path, Branch, Base string
-		BaseSHA            string `json:"base_sha"`
+		Path, Branch, Base, Owner string
+		BaseSHA                   string `json:"base_sha"`
 	}
-	if code != 0 || json.Unmarshal([]byte(out), &made) != nil || made.Branch != "feat/x" || made.Base != "origin/main" {
+	if code != 0 || json.Unmarshal([]byte(out), &made) != nil || made.Branch != "feat/x" || made.Base != "origin/main" || made.Owner != "job-new" {
 		t.Fatalf("new: exit %d out %s err %s", code, out, errOut)
 	}
 	// Dirty, so neither sweep --yes below nor done may remove it.
@@ -118,9 +120,18 @@ func TestWorktreeNewScratchSweepAndDone(t *testing.T) {
 	if code != 0 || !strings.Contains(out, `"ok": true`) || strings.Contains(out, `"removed"`) {
 		t.Fatalf("done --dry-run: exit %d out %s err %s", code, out, errOut)
 	}
+	cleanupMarker := filepath.Join(root, "scratch-cleanup.out")
+	cleanupHook := filepath.Join(root, "scratch-cleanup.sh")
+	if err := os.WriteFile(cleanupHook, []byte("#!/bin/sh\nprintf '%s\\n' \"$1\" > \""+cleanupMarker+"\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, repo, "config", "--add", "agentflow.worktreeCleanup", cleanupHook+" {path}")
 	code, out, errOut = run(t, "worktree", "done", scratch.Path, "--repo", repo)
-	if code != 0 || !strings.Contains(out, `"discarded_dirty_files": 1`) {
+	if code != 0 || !strings.Contains(out, `"discarded_dirty_files": 1`) || !strings.Contains(out, `"owner": "job-new"`) || !strings.Contains(out, `"ok": true`) {
 		t.Fatalf("done scratch: exit %d out %s err %s", code, out, errOut)
+	}
+	if b, err := os.ReadFile(cleanupMarker); err != nil || strings.TrimSpace(string(b)) != scratch.Path {
+		t.Fatalf("scratch cleanup marker = %q, %v", b, err)
 	}
 	if _, err := os.Stat(scratch.Path); !os.IsNotExist(err) {
 		t.Fatalf("scratch still there: %v", err)

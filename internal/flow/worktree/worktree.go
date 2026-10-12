@@ -4,9 +4,11 @@
 // output such as target/) are deleted with the worktree; untracked or
 // modified files make it refuse.
 //
-// Merge proof is either "the branch tip is contained in the fetched
-// target branch" or "GitHub shows a merged PR whose head is exactly this
-// tip" (squash and rebase merges leave no ancestry).
+// Merge proof is either "GitHub shows a merged PR whose head branch and
+// head are exactly this branch and tip" (into whatever base that PR has;
+// squash and rebase merges leave no ancestry), or, only when the caller
+// names the target explicitly (--into), "the tip is contained in the
+// fetched target branch". It never guesses a target branch.
 package worktree
 
 import (
@@ -25,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // Worktree is one entry of `git worktree list --porcelain`.
@@ -43,6 +46,8 @@ type Env struct {
 	Git  string // default "git"
 	GH   string // default "gh"; "" after defaults means unavailable
 	Lsof string // default "lsof"
+	// GHTimeout bounds each gh call (default DefaultGHTimeout).
+	GHTimeout time.Duration
 }
 
 func (e Env) withDefaults() Env {
@@ -153,13 +158,53 @@ func canonical(p string) string {
 	}
 }
 
-// Target is the branch merges are checked against, e.g. "origin/main".
+// Target is the branch merges are checked against by ancestry, e.g.
+// "origin/main". Branch is "" when the caller named none (--into absent):
+// then only a merged PR proves a merge. Default is origin's HEAD branch,
+// used only to protect it from deletion, never to judge "merged".
 type Target struct {
-	Remote string
-	Branch string
+	Remote  string
+	Branch  string
+	Default string
 }
 
-func (t Target) Ref() string { return t.Remote + "/" + t.Branch }
+// Ref is "REMOTE/BRANCH", or "" when no target branch was named.
+func (t Target) Ref() string {
+	if t.Branch == "" {
+		return ""
+	}
+	return t.Remote + "/" + t.Branch
+}
+
+// ResolveTarget is the target for done and sweep: the --into branch if
+// given, else none (Branch "") on origin. Either way Default is origin's
+// current HEAD branch, used only to protect it from deletion.
+func ResolveTarget(ctx context.Context, env Env, dir, into string) (Target, error) {
+	env = env.withDefaults()
+	t := Target{Remote: "origin"}
+	if into != "" {
+		var err error
+		if t, err = DefaultTarget(ctx, env, dir, into); err != nil {
+			return Target{}, err
+		}
+	}
+	out, err := run(ctx, dir, env.Git, "ls-remote", "--symref", "origin", "HEAD")
+	if err != nil {
+		return Target{}, fmt.Errorf("%w: resolve origin's default branch for deletion protection: %v", ErrRemote, err)
+	}
+	for _, line := range nonEmptyLines(out) {
+		if rest, ok := strings.CutPrefix(line, "ref: refs/heads/"); ok {
+			if branch, ref, ok := strings.Cut(rest, "\t"); ok && branch != "" && ref == "HEAD" {
+				t.Default = branch
+				break
+			}
+		}
+	}
+	if t.Default == "" {
+		return Target{}, fmt.Errorf("%w: cannot tell origin's default branch from `git ls-remote --symref origin HEAD`; refusing because it could be deleted", ErrRemote)
+	}
+	return t, nil
+}
 
 // DefaultTarget is origin's HEAD branch (origin/main), or the one named.
 func DefaultTarget(ctx context.Context, env Env, dir, into string) (Target, error) {
@@ -190,9 +235,13 @@ func DefaultTarget(ctx context.Context, env Env, dir, into string) (Target, erro
 	return Target{Remote: remote, Branch: branch}, nil
 }
 
-// Fetch updates the target branch's remote-tracking ref.
+// Fetch updates the target branch's remote-tracking ref (nothing to do
+// without a target branch).
 func Fetch(ctx context.Context, env Env, dir string, t Target) error {
 	env = env.withDefaults()
+	if t.Branch == "" {
+		return nil
+	}
 	_, err := run(ctx, dir, env.Git, "fetch", "--quiet", t.Remote, "+refs/heads/"+t.Branch+":refs/remotes/"+t.Ref())
 	return err
 }
@@ -203,12 +252,29 @@ type Check struct {
 	Branch    string   `json:"branch,omitempty"`
 	Head      string   `json:"head"`
 	OK        bool     `json:"ok"`
-	MergedVia string   `json:"merged_via,omitempty"` // "contained in origin/main" or "PR #123"
+	MergedVia string   `json:"merged_via,omitempty"` // "PR #123 into development" or "contained in origin/main"
 	Refusals  []string `json:"refusals,omitempty"`
 	Prunable  bool     `json:"prunable,omitempty"` // directory gone: only a stale record is left
 	// KeepBranch says why the branch survives removal ("" = it is deleted).
 	KeepBranch string `json:"keep_branch,omitempty"`
+	// The PR found for the branch: the merged proof, else the one that
+	// explains the refusal (open, closed, or merged at another head).
+	PRNumber int    `json:"pr_number,omitempty"`
+	PRState  string `json:"pr_state,omitempty"`
+	PRBase   string `json:"pr_base,omitempty"`
+	// PRError says why GitHub could not be checked (gh missing, failed or
+	// timed out). It never counts as a pass.
+	PRError string `json:"pr_error,omitempty"`
+	// Owner is the recorded creator (worktree new / adopt); "" = unknown.
+	Owner string `json:"owner,omitempty"`
+
+	prProof    bool   // PRNumber is a merged PR with exactly this branch and head
+	prHeadRepo string // that PR's head repository (owner/name), "" = unknown
 }
+
+// ErrRemote means the remote could not be read (an external-command error,
+// not a usage error).
+var ErrRemote = errors.New("remote unavailable")
 
 // ErrRefused means safety changed after Inspect and removal was not attempted.
 var ErrRefused = errors.New("worktree removal refused")
@@ -217,7 +283,7 @@ var ErrRefused = errors.New("worktree removal refused")
 // target must have been fetched already.
 func Inspect(ctx context.Context, env Env, w Worktree, t Target) (Check, error) {
 	env = env.withDefaults()
-	c := Check{Path: w.Path, Branch: w.Branch, Head: w.Head, KeepBranch: keepBranch(w.Branch, t)}
+	c := Check{Path: w.Path, Branch: w.Branch, Head: w.Head, KeepBranch: keepBranch(w.Branch, t, "")}
 	refuse := func(format string, a ...any) { c.Refusals = append(c.Refusals, fmt.Sprintf(format, a...)) }
 
 	if w.Main {
@@ -248,18 +314,10 @@ func Inspect(ctx context.Context, env Env, w Worktree, t Target) (Check, error) 
 	}
 	c.Refusals = append(c.Refusals, contained...)
 
-	targetHead, err := resolveCommit(ctx, env, w.Path, t.Ref())
-	if err != nil {
-		return c, fmt.Errorf("resolve fetched target %s: %w", t.Ref(), err)
-	}
-	via, err := mergeProof(ctx, env, w, t, targetHead)
-	if err != nil {
+	if err := mergeProof(ctx, env, w, t, &c); err != nil {
 		return c, err
 	}
-	if via == "" {
-		refuse("not merged: %s is not contained in %s and no merged PR has exactly this head", short(w.Head), t.Ref())
-	}
-	c.MergedVia = via
+	c.KeepBranch = keepBranch(w.Branch, t, c.PRBase)
 
 	// Keep this last so Remove's second Inspect leaves the smallest possible
 	// window for another process to enter after the in-use check.
@@ -480,64 +538,73 @@ func resolveCommit(ctx context.Context, env Env, dir, ref string) (string, error
 	return strings.TrimSpace(out), err
 }
 
-// mergeProof returns how the tip is known to be merged, or "".
-func mergeProof(ctx context.Context, env Env, w Worktree, t Target, targetHead string) (string, error) {
-	cmd := exec.CommandContext(ctx, env.Git, "merge-base", "--is-ancestor", w.Head, targetHead)
-	cmd.Dir = w.Path
-	err := cmd.Run()
-	var ee *exec.ExitError
-	switch {
-	case err == nil:
-		return "contained in " + t.Ref(), nil
-	case errors.As(err, &ee) && ee.ExitCode() == 1:
-		// Not an ancestor; maybe squash- or rebase-merged.
-	default:
-		return "", fmt.Errorf("git merge-base: %v", err)
-	}
-	pr, err := mergedPR(ctx, env, w.Path, t, w.Branch, w.Head)
-	if err != nil || pr.Number == "" {
-		return "", err
-	}
-	return "PR #" + pr.Number, nil
-}
-
-type prProof struct {
-	Number   string
-	HeadRepo string
-}
-
-// mergedPR returns a merged PR whose head is exactly branch@head, or an
-// empty proof (also when gh is unavailable or there is no branch).
-func mergedPR(ctx context.Context, env Env, dir string, t Target, branch, head string) (prProof, error) {
-	if branch == "" || env.GH == "" {
-		return prProof{}, nil
-	}
-	args := []string{"pr", "list", "--head", branch, "--base", t.Branch, "--state", "merged",
-		"--json", "number,headRefOid,headRepository", "--jq", `.[] | "\(.number) \(.headRefOid) \(.headRepository.nameWithOwner // "")"`}
-	repo, _, ok := githubRemote(ctx, env, dir, t.Remote)
-	if !ok {
-		out, err := run(ctx, dir, env.Git, "remote", "get-url", t.Remote)
+// mergeProof sets c.MergedVia (or adds the "not merged" refusal) and the
+// PR fields. A merged PR whose head branch and head are exactly w's proves
+// the merge into that PR's base, whatever the base. Ancestry is checked
+// only against an explicitly named target (t.Branch). A gh failure is
+// recorded in c.PRError and never proves anything.
+func mergeProof(ctx context.Context, env Env, w Worktree, t Target, c *Check) error {
+	refuse := func(format string, a ...any) { c.Refusals = append(c.Refusals, fmt.Sprintf(format, a...)) }
+	var detail string
+	if w.Branch != "" {
+		prs, err := branchPRs(ctx, env, w.Path, t.Remote, w.Branch)
 		if err != nil {
-			return prProof{}, err
-		}
-		repo = strings.TrimSpace(out)
-	}
-	args = append(args, "--repo", repo)
-	out, err := run(ctx, dir, env.GH, args...)
-	if err != nil {
-		return prProof{}, err
-	}
-	for _, line := range nonEmptyLines(out) {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && strings.EqualFold(fields[1], head) {
-			proof := prProof{Number: fields[0]}
-			if len(fields) >= 3 {
-				proof.HeadRepo = fields[2]
+			c.PRError = err.Error()
+		} else {
+			proof, related, why := prVerdict(prs, w.Head)
+			switch {
+			case proof != nil:
+				c.PRNumber, c.PRState, c.PRBase = proof.Number, proof.State, proof.Base
+				c.prProof, c.prHeadRepo = true, proof.HeadRepo
+				c.MergedVia = fmt.Sprintf("PR #%d into %s", proof.Number, proof.Base)
+				return nil
+			case related != nil:
+				c.PRNumber, c.PRState, c.PRBase = related.Number, related.State, related.Base
+				detail = why
 			}
-			return proof, nil
 		}
 	}
-	return prProof{}, nil
+	if t.Branch != "" {
+		targetHead, err := resolveCommit(ctx, env, w.Path, t.Ref())
+		if err != nil {
+			return fmt.Errorf("resolve fetched target %s: %w", t.Ref(), err)
+		}
+		cmd := exec.CommandContext(ctx, env.Git, "merge-base", "--is-ancestor", w.Head, targetHead)
+		cmd.Dir = w.Path
+		err = cmd.Run()
+		var ee *exec.ExitError
+		switch {
+		case err == nil:
+			c.MergedVia = "contained in " + t.Ref()
+			return nil
+		case errors.As(err, &ee) && ee.ExitCode() == 1:
+			// Not an ancestor.
+		default:
+			return fmt.Errorf("git merge-base: %v", err)
+		}
+	}
+	// Not proven. Say why, naming the PR that explains it if there is one.
+	var why []string
+	if t.Branch != "" {
+		why = append(why, fmt.Sprintf("not merged: %s is not contained in %s", short(w.Head), t.Ref()))
+	} else {
+		why = append(why, "not merged")
+	}
+	switch {
+	case c.PRError != "":
+		why = append(why, "GitHub could not be checked for a merged PR ("+c.PRError+")")
+	case detail != "":
+		why = append(why, detail)
+	case w.Branch == "":
+		why = append(why, "a detached HEAD has no PR to check")
+	default:
+		why = append(why, fmt.Sprintf("GitHub has no merged PR from branch %s with head %s", w.Branch, short(w.Head)))
+	}
+	if t.Branch == "" {
+		why = append(why, "to prove the merge by ancestry instead, pass --into <branch> (no default branch is assumed)")
+	}
+	refuse("%s", strings.Join(why, "; "))
+	return nil
 }
 
 var scpRemoteRe = regexp.MustCompile(`^(?:[^@/]+@)?([^:/]+):/?(.+)$`)
@@ -580,14 +647,17 @@ var longLived = map[string]bool{
 	"dev": true, "staging": true, "production": true, "prod": true,
 }
 
-// keepBranch says why a branch must survive its worktree, or "".
-func keepBranch(branch string, t Target) string {
+// keepBranch says why a branch must survive its worktree, or "". prBase
+// is the base of the PR that proved the merge ("" = none).
+func keepBranch(branch string, t Target, prBase string) string {
 	lower := strings.ToLower(branch)
 	switch {
 	case branch == "":
 		return ""
-	case branch == t.Branch:
+	case branch == t.Branch, branch == prBase:
 		return "it is the merge target"
+	case branch == t.Default:
+		return "it is the remote's default branch"
 	case longLived[lower], strings.HasPrefix(lower, "release/"), strings.HasPrefix(lower, "hotfix/"):
 		return "it looks long-lived"
 	}
@@ -702,8 +772,8 @@ func Remove(ctx context.Context, env Env, repoDir string, c Check, t Target, del
 	if c.Branch == "" {
 		return r, nil
 	}
-	if c.KeepBranch != "" || keepBranch(c.Branch, t) != "" {
-		r.addNote("branch " + c.Branch + " kept: " + keepBranch(c.Branch, t))
+	if keep := firstNonEmpty(fresh.KeepBranch, c.KeepBranch); keep != "" {
+		r.addNote("branch " + c.Branch + " kept: " + keep)
 		return r, nil
 	}
 	if branchWorktree, err := worktreeForBranch(ctx, env, repoDir, c.Branch); err != nil {
@@ -725,16 +795,17 @@ func Remove(ctx context.Context, env Env, repoDir string, c Check, t Target, del
 	}
 	// A remote branch goes only when it was the head of a merged PR: being
 	// contained in the target proves nothing about whether others use it.
-	pr, err := mergedPR(ctx, env, repoDir, t, c.Branch, c.Head)
-	if err != nil {
-		r.addNote("remote branch kept: " + err.Error())
+	// fresh is the re-inspection just before removal, so its PR proof is
+	// the latest GitHub answer.
+	if !fresh.prProof {
+		why := "no merged PR has it as head"
+		if fresh.PRError != "" {
+			why = "GitHub could not be checked (" + fresh.PRError + ")"
+		}
+		r.addNote("remote branch kept: " + why)
 		return r, nil
 	}
-	if pr.Number == "" {
-		r.addNote("remote branch kept: no merged PR has it as head")
-		return r, nil
-	}
-	if repo, _, ok := githubRemote(ctx, env, repoDir, t.Remote); ok && !prHeadMatchesRemote(pr.HeadRepo, repo) {
+	if repo, _, ok := githubRemote(ctx, env, repoDir, t.Remote); ok && !prHeadMatchesRemote(fresh.prHeadRepo, repo) {
 		r.addNote("remote branch kept: merged PR head belongs to a different or unknown repository")
 		return r, nil
 	}
@@ -798,6 +869,15 @@ func worktreeForBranch(ctx context.Context, env Env, repoDir, branch string) (st
 		}
 	}
 	return "", nil
+}
+
+func firstNonEmpty(a ...string) string {
+	for _, s := range a {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 func (r *Removed) addNote(s string) {

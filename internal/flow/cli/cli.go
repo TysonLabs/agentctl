@@ -55,6 +55,7 @@ Usage:
   agentflow worktree new <branch>|--scratch    create a worktree under .claude/worktrees
   agentflow worktree done <branch|path>        remove a merged, clean, unused worktree
   agentflow worktree sweep [--yes]             list (or remove) every such worktree
+  agentflow worktree adopt <branch|path>       record an owner on a hand-made worktree
                                                (see: agentflow worktree --help)
   agentflow branch sync [--base REF] [--merge] report ahead/behind/overlap vs the default
                                                branch; merge it in (see: agentflow branch --help)

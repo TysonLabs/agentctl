@@ -23,6 +23,7 @@ func runWorktreeNew(ctx context.Context, args []string, stdout, stderr io.Writer
 	fs.SetOutput(io.Discard)
 	var (
 		repo, from, at string
+		ownerFlag      string
 		scratch        bool
 		clones         pathList
 	)
@@ -31,6 +32,7 @@ func runWorktreeNew(ctx context.Context, args []string, stdout, stderr io.Writer
 	fs.StringVar(&at, "at", "", "")
 	fs.BoolVar(&scratch, "scratch", false, "")
 	fs.Var(&clones, "clone-dir", "")
+	fs.StringVar(&ownerFlag, "owner", "", "")
 	pos, err := parseInterleaved(fs, args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -58,11 +60,11 @@ func runWorktreeNew(ctx context.Context, args []string, stdout, stderr io.Writer
 		return fail(1, "%s is not inside a git checkout (use --repo)", repo)
 	}
 	opt := worktree.NewOptions{From: from, Scratch: scratch, CloneDirs: clones}
+	opt.Owner, opt.OwnerSource = worktree.ResolveOwner(ownerFlag, os.Getenv)
 	if !scratch {
 		opt.Branch = pos[0]
 	}
-	env := worktree.Env{Git: os.Getenv("AGENTFLOW_GIT"), GH: os.Getenv("AGENTFLOW_GH"), Lsof: os.Getenv("AGENTFLOW_LSOF")}
-	c, err := worktree.New(ctx, env, repo, opt)
+	c, err := worktree.New(ctx, worktreeEnv(), repo, opt)
 	if err != nil {
 		var refused *worktree.RefusedError
 		if errors.As(err, &refused) {
@@ -84,14 +86,14 @@ func runWorktreeNew(ctx context.Context, args []string, stdout, stderr io.Writer
 
 // scratchDone is `worktree done` on a scratch worktree: no merged or clean
 // checks, but the marker and unused checks, re-run right before removal.
-func scratchDone(ctx context.Context, env worktree.Env, repo string, w worktree.Worktree, dryRun bool, stdout, stderr io.Writer) int {
+func scratchDone(ctx context.Context, env worktree.Env, repo string, w worktree.Worktree, dryRun, noClean bool, cleanupTimeout time.Duration, stdout, stderr io.Writer) int {
 	now := time.Now()
 	c, err := worktree.InspectScratch(ctx, env, repo, w, now, 0)
 	if err != nil {
 		fmt.Fprintf(stderr, "agentflow worktree done: %s: %v\n", w.Path, err)
 		return 3
 	}
-	e := scratchEntry{ScratchCheck: c}
+	e := scratchEntry{ScratchCheck: c, Owner: ownerOf(ctx, env, repo, w)}
 	code := 0
 	if c.OK && !dryRun {
 		r, err := worktree.RemoveScratch(ctx, env, repo, c, now, 0)
@@ -106,10 +108,15 @@ func scratchDone(ctx context.Context, env worktree.Env, repo string, w worktree.
 			e.Removed = &r
 		}
 	}
+	var cleanup []worktree.CleanupResult
+	if e.Removed != nil && !noClean {
+		cleanup = runCleanupHook(ctx, env, repo, e.Path, e.Branch, cleanupTimeout, stderr)
+	}
 	out, _ := json.MarshalIndent(struct {
 		scratchEntry
-		DryRun bool `json:"dry_run,omitempty"`
-	}{e, dryRun}, "", "  ")
+		DryRun  bool                     `json:"dry_run,omitempty"`
+		Cleanup []worktree.CleanupResult `json:"cleanup,omitempty"`
+	}{e, dryRun, cleanup}, "", "  ")
 	_, _ = stdout.Write(append(out, '\n'))
 	if !e.OK {
 		for _, r := range e.Refusals {
@@ -122,22 +129,29 @@ func scratchDone(ctx context.Context, env worktree.Env, repo string, w worktree.
 
 type scratchEntry struct {
 	worktree.ScratchCheck
+	Owner   string                   `json:"owner,omitempty"`
 	Removed *worktree.RemovedScratch `json:"removed,omitempty"`
 	Error   string                   `json:"error,omitempty"`
 }
 
-// sweepScratch inspects (and with yes removes) the scratch worktrees.
-func sweepScratch(ctx context.Context, env worktree.Env, repo string, list []worktree.Worktree, minAge time.Duration, yes bool) (entries []scratchEntry, removable, removed int, freed int64, hadError bool) {
+// sweepScratch inspects (and with yes removes) the scratch worktrees; with
+// ownerFilter set, only that owner's.
+func sweepScratch(ctx context.Context, env worktree.Env, repo string, list []worktree.Worktree, minAge time.Duration, yes bool, ownerFilter string) (entries []scratchEntry, removable, removed int, freed int64, hadError bool) {
 	now := time.Now()
 	entries = []scratchEntry{}
 	for _, w := range list {
+		owner := ownerOf(ctx, env, repo, w)
 		c, err := worktree.InspectScratch(ctx, env, repo, w, now, minAge)
 		if err != nil {
-			entries = append(entries, scratchEntry{ScratchCheck: worktree.ScratchCheck{Path: w.Path, Head: w.Head, Scratch: true}, Error: err.Error()})
+			entries = append(entries, scratchEntry{ScratchCheck: worktree.ScratchCheck{Path: w.Path, Head: w.Head, Scratch: true}, Owner: owner, Error: err.Error()})
 			hadError = true
 			continue
 		}
-		e := scratchEntry{ScratchCheck: c}
+		if ownerFilter != "" && !dirGone(w.Path) && owner != ownerFilter {
+			c.OK = false
+			c.Refusals = append(c.Refusals, fmt.Sprintf("owned by %s, not %s (--owner)", ownerOrUnknown(owner), ownerFilter))
+		}
+		e := scratchEntry{ScratchCheck: c, Owner: owner}
 		if c.OK {
 			removable++
 			if yes {
