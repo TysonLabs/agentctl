@@ -86,6 +86,8 @@ func TestCodeRabbitExitCodesCoverEveryStatus(t *testing.T) {
 // coderabbit script that records its argv and prints a clean review.
 func crRepo(t *testing.T) (repo, rec string) {
 	t.Helper()
+	// The caller's environment must not change the args under test.
+	t.Setenv("AGENTFLOW_CR_USE_CREDITS", "")
 	repo, rec = t.TempDir(), t.TempDir()
 	for _, args := range [][]string{
 		{"init", "-q", "-b", "trunk"},

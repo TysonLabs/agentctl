@@ -170,8 +170,10 @@ h2 { font-size: 16px; margin: 0 0 4px; }
 .gate-add { padding: 8px 16px 0; }
 .gate-foot { margin: 8px 16px 6px; }
 .gate-foot code { background: var(--subtle); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
-.gate-empty { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 16px 6px; }
-.gate-empty p { margin: 0; }
+.gate.gate-off { padding: 0; }
+.gate-off-line { display: flex; align-items: center; gap: 6px; padding: 4px 16px; }
+.gate-off-line .btn.ghost { padding: 2px 6px; }
+.gate-off-title { font-size: inherit; font-weight: 600; color: var(--muted); margin: 0; }
 
 /* The step dialog's order preview. */
 .gate-preview { list-style: none; counter-reset: pv; margin: 6px 0 0; padding: 0; border: 1px solid var(--border); border-radius: 8px; }
@@ -259,7 +261,6 @@ dialog form { padding: 20px; }
   .gate-timeout { grid-column: 2; text-align: left; }
   .gate-stop { grid-column: 3; }
   .gate .actions { grid-column: 2 / -1; justify-content: flex-start; flex-wrap: wrap; }
-  .gate-empty { flex-direction: column; align-items: flex-start; }
   .gate-lock.editing input { width: 10rem; }
   #appver { display: none; }
 }

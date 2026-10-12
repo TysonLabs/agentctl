@@ -306,10 +306,14 @@ func TestEveryCardShowsItsGateBlock(t *testing.T) {
 	if strings.Contains(body, "if (!gt) return null") {
 		t.Fatal("a project without a gate shows no gate block")
 	}
-	for _, want := range []string{"Add first step", "agentflow gate runs them", `"+ Add step"`, "agentflow gate --check --rev HEAD"} {
+	for _, want := range []string{`"gate gate-off"`, `text: "not set up"`, `"gate-add:" + name`, "agentflow gate runs them", `"+ Add step"`, "agentflow gate --check --rev HEAD"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("gate block lacks %q", want)
 		}
+	}
+	// A gate is optional: no gate is one muted line, not a call-to-action block.
+	if strings.Contains(body, "Add first step") || strings.Contains(body, "btn primary") {
+		t.Fatal("a project without a gate must show one muted line, not a primary button")
 	}
 	if strings.Contains(src, `text: "Gate step"`) || !strings.Contains(src, "onclick: () => focusGate(g.name)") {
 		t.Fatal(`the card action must be "Gate", going to the block`)

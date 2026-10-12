@@ -266,12 +266,15 @@
     const hid = "gate-h-" + name;
     const title = h("h3", { class: "gate-title", id: hid, tabindex: "-1", "data-focus": "gate-h:" + name, text: "Gate" });
     if (!gt) {
-      return h("section", { class: "gate", "aria-labelledby": hid },
-        h("div", { class: "gate-head" },
-          h("div", { class: "gate-title-row" }, title, h("span", { class: "muted small", text: "not set up" }))),
-        h("div", { class: "gate-empty" },
-          h("p", { class: "muted", text: "Commands that must pass before a PR, run in order. agentflow gate runs them and records a receipt per step." }),
-          h("button", { class: "btn primary", type: "button", text: "Add first step", "data-focus": "gate-add:" + name,
+      // A gate is optional: a project without one gets a single muted line.
+      title.className = "gate-title gate-off-title";
+      return h("section", { class: "gate gate-off", "aria-labelledby": hid },
+        h("div", { class: "gate-off-line small muted" }, title,
+          h("span", { text: "not set up" }),
+          h("span", { "aria-hidden": "true", text: "·" }),
+          h("button", { class: "btn ghost", type: "button", text: "Add", "data-focus": "gate-add:" + name,
+            "aria-label": "Add a gate step to " + name,
+            title: "Commands that must pass before a PR, run in order. agentflow gate runs them and records a receipt per step.",
             onclick: () => openGateStep(name, null) })));
     }
     const n = gt.steps.length;
