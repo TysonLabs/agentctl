@@ -83,22 +83,29 @@ func writeFile(t *testing.T, dir, name, body string) {
 	}
 }
 
-// setPRs records merged PRs as "number headOid" pairs; the fake gh returns
-// them as gh's JSON, with headRepository null (unknown) or, via setPRsFrom,
-// {"nameWithOwner": repo}.
-func (f *fixture) setPRs(lines ...string) {
-	f.setPRsFrom("", lines...)
+// setPRs records branch's PRs as "number headOid [STATE [base]]" lines
+// (default MERGED into main); the fake gh returns them as gh's JSON, with
+// headRepository null (unknown) or, via setPRsFrom, {"nameWithOwner": repo}.
+func (f *fixture) setPRs(branch string, lines ...string) {
+	f.setPRsFrom("", branch, lines...)
 }
 
-func (f *fixture) setPRsFrom(repo string, lines ...string) {
+func (f *fixture) setPRsFrom(repo, branch string, lines ...string) {
 	if _, err := exec.LookPath("jq"); err != nil {
 		f.t.Skip("jq not installed: the fake gh needs it to apply --jq")
 	}
 	prs := []map[string]any{}
 	for _, l := range lines {
-		num, oid, _ := strings.Cut(strings.TrimSpace(l), " ")
-		n, _ := strconv.Atoi(num)
-		pr := map[string]any{"number": n, "headRefOid": oid}
+		fields := strings.Fields(l)
+		n, _ := strconv.Atoi(fields[0])
+		state, base := "MERGED", "main"
+		if len(fields) > 2 {
+			state = fields[2]
+		}
+		if len(fields) > 3 {
+			base = fields[3]
+		}
+		pr := map[string]any{"number": n, "headRefOid": fields[1], "state": state, "baseRefName": base, "headRefName": branch}
 		if repo != "" {
 			pr["headRepository"] = map[string]any{"nameWithOwner": repo}
 		} else {
@@ -197,10 +204,10 @@ func TestMergedCleanWorktreeIsRemovedWithItsBuildOutput(t *testing.T) {
 	writeFile(t, path, "target/big.bin", strings.Repeat("x", 4096)) // ignored build output
 	f.mergeOnOrigin("feat/a")
 	head := git(t, path, "rev-parse", "HEAD")
-	f.setPRs("12 " + head)
+	f.setPRs("feat/a", "12 "+head)
 
 	c := f.inspect("feat/a") // origin/main is stale locally until Inspect's fetch
-	if !c.OK || c.MergedVia != "contained in origin/main" || c.KeepBranch != "" {
+	if !c.OK || c.MergedVia != "PR #12 into main" || c.PRNumber != 12 || c.PRBase != "main" || c.KeepBranch != "" {
 		t.Fatalf("got %+v", c)
 	}
 	gitLog := filepath.Join(f.root, "git.log")
@@ -236,8 +243,11 @@ func TestRemoteBranchKeptWithoutPRProof(t *testing.T) {
 	f := newFixture(t)
 	f.worktree("feat/b")
 	f.mergeOnOrigin("feat/b")
-	f.setPRs() // gh knows of no merged PR
+	f.setPRs("feat/b") // gh knows of no merged PR
 	c := f.inspect("feat/b")
+	if !c.OK || c.MergedVia != "contained in origin/main" {
+		t.Fatalf("explicit --into ancestry must still prove the merge: %+v", c)
+	}
 	r := f.remove(c, true)
 	if r.RemoteDeleted || !remoteHas(t, f, "feat/b") || !strings.Contains(r.Note, "no merged PR") {
 		t.Fatalf("remote branch should stay without PR proof: %+v", r)
@@ -285,13 +295,13 @@ func TestSquashMergeProvenByPRHead(t *testing.T) {
 	f.squashOnOrigin("feat/sq")
 	head := git(t, path, "rev-parse", "HEAD")
 
-	f.setPRs("7 " + strings.Repeat("0", 40)) // a merged PR with a different head
+	f.setPRs("feat/sq", "7 "+strings.Repeat("0", 40)) // a merged PR with a different head
 	if c := f.inspect("feat/sq"); c.OK || !refusedFor(c, "not merged") {
 		t.Fatalf("a PR with another head must not prove the merge: %+v", c)
 	}
-	f.setPRs("7 " + strings.ToUpper(head))
+	f.setPRs("feat/sq", "7 "+strings.ToUpper(head))
 	c := f.inspect("feat/sq")
-	if !c.OK || c.MergedVia != "PR #7" {
+	if !c.OK || c.MergedVia != "PR #7 into main" {
 		t.Fatalf("got %+v", c)
 	}
 	if r := f.remove(c, true); !r.BranchDeleted || !r.RemoteDeleted {
@@ -302,7 +312,7 @@ func TestSquashMergeProvenByPRHead(t *testing.T) {
 func TestUnmergedIsRefused(t *testing.T) {
 	f := newFixture(t)
 	f.worktree("feat/open")
-	f.setPRs()
+	f.setPRs("feat/open")
 	if c := f.inspect("feat/open"); c.OK || !refusedFor(c, "not merged") {
 		t.Fatalf("got %+v", c)
 	}
@@ -484,7 +494,7 @@ func TestLongLivedBranchSurvives(t *testing.T) {
 	git(t, f.repo, "switch", "-q", "-c", "side")
 	wt := filepath.Join(f.root, "wt-main")
 	git(t, f.repo, "worktree", "add", "-q", wt, "main")
-	f.setPRs("1 " + git(t, wt, "rev-parse", "HEAD")) // even a "PR proof" must not matter
+	f.setPRs("main", "1 "+git(t, wt, "rev-parse", "HEAD")) // even a "PR proof" must not matter
 	c := f.inspect("main")
 	if !c.OK || c.KeepBranch != "it is the merge target" {
 		t.Fatalf("got %+v", c)
@@ -497,7 +507,7 @@ func TestLongLivedBranchSurvives(t *testing.T) {
 		t.Errorf("the worktree itself should still be removed")
 	}
 	for _, b := range []string{"development", "release/1.2", "staging"} {
-		if keepBranch(b, Target{Remote: "origin", Branch: "main"}) == "" {
+		if keepBranch(b, Target{Remote: "origin", Branch: "main"}, "") == "" {
 			t.Errorf("%s should be kept", b)
 		}
 	}
@@ -508,7 +518,7 @@ func TestRemoteBranchThatMovedIsKept(t *testing.T) {
 	path := f.worktree("feat/moved")
 	f.mergeOnOrigin("feat/moved")
 	head := git(t, path, "rev-parse", "HEAD")
-	f.setPRs("3 " + head)
+	f.setPRs("feat/moved", "3 "+head)
 	// Someone pushes another commit to the remote branch after the merge.
 	git(t, f.seed, "fetch", "-q", "origin")
 	git(t, f.seed, "switch", "-q", "-c", "moved", "origin/feat/moved")
@@ -527,7 +537,7 @@ func TestRemoteBranchKeptWhenPushURLDiffersFromFetchedRemote(t *testing.T) {
 	f := newFixture(t)
 	path := f.worktree("feat/push-url")
 	f.mergeOnOrigin("feat/push-url")
-	f.setPRs("31 " + git(t, path, "rev-parse", "HEAD"))
+	f.setPRs("feat/push-url", "31 "+git(t, path, "rev-parse", "HEAD"))
 
 	other := filepath.Join(f.root, "other.git")
 	git(t, f.root, "clone", "-q", "--bare", f.origin, other)
@@ -605,39 +615,46 @@ func TestGitHubRemoteScopesPRLookup(t *testing.T) {
 	}
 }
 
-func TestMergedPRProofIsRestrictedToTargetBranch(t *testing.T) {
+func TestPRLookupNamesBranchRepoAndAllStates(t *testing.T) {
 	f := newFixture(t)
 	path := f.worktree("feat/base")
 	f.squashOnOrigin("feat/base")
-	f.setPRs("9 " + git(t, path, "rev-parse", "HEAD"))
-	if c := f.inspect("feat/base"); !c.OK || c.MergedVia != "PR #9" {
+	f.setPRs("feat/base", "9 "+git(t, path, "rev-parse", "HEAD"))
+	if c := f.inspect("feat/base"); !c.OK || c.MergedVia != "PR #9 into main" {
 		t.Fatalf("got %+v", c)
 	}
 	args, err := os.ReadFile(filepath.Join(f.root, "gh.args"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(args), "--base main") {
-		t.Fatalf("merged PR lookup was not restricted to the requested target branch: %s", args)
+	for _, want := range []string{"--head feat/base", "--state all", "--repo " + f.origin} {
+		if !strings.Contains(string(args), want) {
+			t.Fatalf("PR lookup lacks %q: %s", want, args)
+		}
 	}
-	if !strings.Contains(string(args), "--repo "+f.origin) {
-		t.Fatalf("merged PR lookup did not explicitly name the target repository: %s", args)
+	if strings.Contains(string(args), "--base") {
+		t.Fatalf("PR lookup must not be restricted to a guessed base: %s", args)
 	}
 }
 
-func TestMergedPRParsesHeadRepository(t *testing.T) {
+func TestBranchPRsParsesHeadRepositoryAndFiltersBranch(t *testing.T) {
 	f := newFixture(t)
 	path := f.worktree("feat/fork")
 	head := git(t, path, "rev-parse", "HEAD")
-	tg, _ := DefaultTarget(context.Background(), f.env, f.repo, "")
-	f.setPRsFrom("someone/fork", "41 "+head)
-	pr, err := mergedPR(context.Background(), f.env.withDefaults(), f.repo, tg, "feat/fork", head)
-	if err != nil || pr.Number != "41" || pr.HeadRepo != "someone/fork" {
-		t.Fatalf("named head repo: %+v %v", pr, err)
+	f.setPRsFrom("someone/fork", "feat/fork", "41 "+head)
+	prs, err := branchPRs(context.Background(), f.env.withDefaults(), f.repo, "origin", "feat/fork")
+	if err != nil || len(prs) != 1 || prs[0].Number != 41 || prs[0].HeadRepo != "someone/fork" || prs[0].State != "MERGED" {
+		t.Fatalf("named head repo: %+v %v", prs, err)
 	}
-	f.setPRs("42 " + head)
-	pr, err = mergedPR(context.Background(), f.env.withDefaults(), f.repo, tg, "feat/fork", head)
-	if err != nil || pr.Number != "42" || pr.HeadRepo != "" {
-		t.Fatalf("null head repo: %+v %v", pr, err)
+	f.setPRs("feat/fork", "42 "+head)
+	prs, err = branchPRs(context.Background(), f.env.withDefaults(), f.repo, "origin", "feat/fork")
+	if err != nil || len(prs) != 1 || prs[0].HeadRepo != "" {
+		t.Fatalf("null head repo: %+v %v", prs, err)
+	}
+	// A PR from another branch (gh's filter notwithstanding) is no proof.
+	f.setPRs("feat/forked-too", "43 "+head)
+	prs, err = branchPRs(context.Background(), f.env.withDefaults(), f.repo, "origin", "feat/fork")
+	if err != nil || len(prs) != 0 {
+		t.Fatalf("other branch: %+v %v", prs, err)
 	}
 }

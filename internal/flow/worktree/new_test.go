@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -65,7 +66,7 @@ func TestNewFetchesAndBranchesFromDerivedDefault(t *testing.T) {
 	if c.Cloned == nil {
 		t.Fatal("cloned must be [] not null")
 	}
-	if len(c.Notes) == 0 || !strings.Contains(c.Notes[0], "not ignored") {
+	if !slices.ContainsFunc(c.Notes, func(n string) bool { return strings.Contains(n, "not ignored") }) {
 		t.Fatalf("want a note that .claude/worktrees is not ignored: %+v", c.Notes)
 	}
 }

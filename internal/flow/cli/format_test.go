@@ -253,15 +253,22 @@ func TestTextRenderers(t *testing.T) {
 			"pr merge: merged (exit 0)\nrepo: o/r\npr: 7\nmethod: squash\nmerge_sha: m\nsync: development synced m\n"},
 		{"pr thread refused", threadText(pr.ThreadResult{Status: pr.ThreadRefused, Thread: "PRRT_1", Error: "not a thread"}, 2),
 			"pr thread: refused (exit 2)\nthread: PRRT_1\nerror: not a thread\n"},
-		{"worktree done", worktreeDoneText(worktreeEntry{Check: worktree.Check{Path: "/w", Branch: "b", Head: "h", Refusals: []string{"dirty", "in use"}}}, "origin/main", false, 2),
-			"worktree done: refused (exit 2)\ninto: origin/main\n- [refused] /w\n    branch: b\n    refused: dirty\n    refused: in use\n"},
-		{"worktree done dry", worktreeDoneText(worktreeEntry{Check: worktree.Check{Path: "/w", Branch: "b", OK: true, MergedVia: "PR #3"}}, "origin/main", true, 0),
-			"worktree done: removable (dry run) (exit 0)\ninto: origin/main\n- [removable] /w\n    branch: b\n    merged_via: PR #3\n"},
+		{"worktree done", worktreeDoneText(worktreeEntry{Check: worktree.Check{Path: "/w", Branch: "b", Head: "h", PRNumber: 9, PRState: "OPEN", PRBase: "development", Refusals: []string{"dirty", "in use"}}}, "", false, nil, 2),
+			"worktree done: refused (exit 2)\n- [refused] /w\n    branch: b\n    owner: unknown\n    pr: #9 OPEN into development\n    refused: dirty\n    refused: in use\n"},
+		{"worktree done dry", worktreeDoneText(worktreeEntry{Check: worktree.Check{Path: "/w", Branch: "b", OK: true, MergedVia: "PR #3 into main", Owner: "job-1"}}, "origin/main", true, nil, 0),
+			"worktree done: removable (dry run) (exit 0)\ninto: origin/main\n- [removable] /w\n    branch: b\n    owner: job-1\n    merged_via: PR #3 into main\n"},
+		{"worktree done cleanup", worktreeDoneText(worktreeEntry{Check: worktree.Check{Path: "/w", Branch: "b", OK: true}, Removed: &worktree.Removed{}}, "", false,
+			[]worktree.CleanupResult{{Command: []string{"a"}, OK: true}, {Command: []string{"b", "x"}, ExitCode: 4, Error: "exit status 4"}, {Command: []string{"c"}, ExitCode: -1, TimedOut: true}}, 0),
+			"worktree done: removed (exit 0)\n- [removed] /w\n    branch: b\n    owner: unknown\n    freed_bytes: 0\n    branch_deleted: false\n    remote_deleted: false\n" +
+				"- cleanup ok: a\n- cleanup failed (exit 4): b x\n    error: exit status 4\n- cleanup timed out: c\n"},
 		{"worktree sweep", worktreeSweepText([]worktreeEntry{
 			{Check: worktree.Check{Path: "/a", Branch: "a", OK: true}, Removed: &worktree.Removed{FreedBytes: 9, BranchDeleted: true}},
-			{Check: worktree.Check{Path: "/b"}, Error: "git failed"}}, "origin/main", 1, 1, 0, 9, "", true, 3),
-			"worktree sweep: error (exit 3)\ninto: origin/main\nremovable: 1\nremoved: 1\npruned_stale_records: 0\nfreed_bytes: 9\n" +
-				"- [removed] /a\n    branch: a\n    freed_bytes: 9\n    branch_deleted: true\n    remote_deleted: false\n- [error] /b\n    error: git failed\n"},
+			{Check: worktree.Check{Path: "/b"}, Error: "git failed"},
+			{Check: worktree.Check{Path: "/gone", Prunable: true}}}, "origin/main", 1, 1,
+			[]staleEntry{{Path: "/gone", Branch: "g", Owner: "job-2"}, {Path: "/locked", Locked: true}}, []string{"/gone"}, 9, "", true, 3),
+			"worktree sweep: error (exit 3)\ninto: origin/main\nremovable: 1\nremoved: 1\npruned_stale_records: 1\nfreed_bytes: 9\n" +
+				"- [removed] /a\n    branch: a\n    owner: unknown\n    freed_bytes: 9\n    branch_deleted: true\n    remote_deleted: false\n- [error] /b\n    owner: unknown\n    error: git failed\n" +
+				"- stale records (directory gone):\n- [pruned] /gone\n    branch: g\n    owner: job-2\n- [stale, locked (prune keeps it)] /locked\n    owner: unknown\n"},
 		{"lessons retire", retireText([]lessons.Candidate{{Lesson: lessons.Lesson{ID: "l2", Title: "T", File: "X.md"}, Reason: "unused", Linked: true}}, false),
 			"lessons retire: ok (exit 0)\napplied: false\ncandidates: 1\n- l2 T: unused (X.md) [kept: linked from principles]\n"},
 		{"lessons stats", statsText(lessons.Stats{Lessons: 5, Inbox: 2}),

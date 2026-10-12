@@ -241,7 +241,12 @@ func worktreeEntryState(e worktreeEntry) string {
 
 func worktreeEntryText(t *render.Text, e worktreeEntry) {
 	t.Item("[%s] %s", worktreeEntryState(e), e.Path)
-	t.Field("    branch", e.Branch).Field("    merged_via", e.MergedVia).Field("    keep_branch", e.KeepBranch)
+	t.Field("    branch", e.Branch).Field("    owner", ownerOrUnknown(e.Owner))
+	if e.PRNumber > 0 {
+		t.Field("    pr", fmt.Sprintf("#%d %s into %s", e.PRNumber, e.PRState, e.PRBase))
+	}
+	t.Field("    pr_error", e.PRError)
+	t.Field("    merged_via", e.MergedVia).Field("    keep_branch", e.KeepBranch)
 	if e.Removed != nil {
 		t.Field("    freed_bytes", e.Removed.FreedBytes)
 		t.Field("    branch_deleted", e.Removed.BranchDeleted).Field("    remote_deleted", e.Removed.RemoteDeleted)
@@ -253,7 +258,7 @@ func worktreeEntryText(t *render.Text, e worktreeEntry) {
 	}
 }
 
-func worktreeDoneText(e worktreeEntry, into string, dryRun bool, code int) string {
+func worktreeDoneText(e worktreeEntry, into string, dryRun bool, cleanup []worktree.CleanupResult, code int) string {
 	status := worktreeEntryState(e)
 	if dryRun && e.OK {
 		status = "removable (dry run)"
@@ -261,10 +266,21 @@ func worktreeDoneText(e worktreeEntry, into string, dryRun bool, code int) strin
 	t := render.New("worktree done", status, code)
 	t.Field("into", into)
 	worktreeEntryText(t, e)
+	for _, c := range cleanup {
+		state := "ok"
+		switch {
+		case c.TimedOut:
+			state = "timed out"
+		case !c.OK:
+			state = fmt.Sprintf("failed (exit %d)", c.ExitCode)
+		}
+		t.Item("cleanup %s: %s", state, strings.Join(c.Command, " "))
+		t.Field("    error", c.Error)
+	}
 	return t.String()
 }
 
-func worktreeSweepText(entries []worktreeEntry, into string, removable, removed, pruned int, freed int64, sweepErr string, applied bool, code int) string {
+func worktreeSweepText(entries []worktreeEntry, into string, removable, removed int, stale []staleEntry, stalePruned []string, freed int64, sweepErr string, applied bool, code int) string {
 	status := "listed"
 	if applied {
 		status = "swept"
@@ -274,9 +290,49 @@ func worktreeSweepText(entries []worktreeEntry, into string, removable, removed,
 	}
 	t := render.New("worktree sweep", status, code)
 	t.Field("into", into).Field("removable", removable).Field("removed", removed)
-	t.Field("pruned_stale_records", pruned).Field("freed_bytes", freed).Field("error", sweepErr)
+	t.Field("pruned_stale_records", len(stalePruned)).Field("freed_bytes", freed).Field("error", sweepErr)
 	for _, e := range entries {
+		if e.Prunable {
+			continue // listed under stale
+		}
 		worktreeEntryText(t, e)
+	}
+	if len(stale) > 0 {
+		pruned := map[string]bool{}
+		for _, p := range stalePruned {
+			pruned[p] = true
+		}
+		t.Item("stale records (directory gone):")
+		for _, s := range stale {
+			state := "stale"
+			switch {
+			case pruned[s.Path]:
+				state = "pruned"
+			case s.Locked:
+				state = "stale, locked (prune keeps it)"
+			}
+			t.Item("[%s] %s", state, s.Path)
+			t.Field("    branch", s.Branch).Field("    owner", ownerOrUnknown(s.Owner))
+		}
+	}
+	return t.String()
+}
+
+func worktreeAdoptText(a worktree.Adopted, refusals []string, code int) string {
+	status := "adopted"
+	switch {
+	case code != 0:
+		status = "refused"
+	case a.Unchanged:
+		status = "unchanged"
+	}
+	t := render.New("worktree adopt", status, code)
+	t.Field("path", a.Path).Field("branch", a.Branch)
+	if a.Owner.Owner != "" {
+		t.Field("owner", a.Owner.Owner).Field("source", a.Owner.Source)
+	}
+	for _, r := range refusals {
+		t.Item("refused: %s", r)
 	}
 	return t.String()
 }

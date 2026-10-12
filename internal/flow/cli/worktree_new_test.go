@@ -50,13 +50,15 @@ func TestWorktreeNewScratchSweepAndDone(t *testing.T) {
 	}
 	t.Setenv("AGENTFLOW_LSOF", lsof)
 	t.Setenv("AGENTFLOW_GH", filepath.Join(root, "no-gh"))
+	clearOwnerEnv(t)
+	t.Setenv("AGENTFLOW_OWNER", "job-new")
 
 	code, out, errOut := run(t, "worktree", "new", "feat/x", "--repo", repo)
 	var made struct {
-		Path, Branch, Base string
-		BaseSHA            string `json:"base_sha"`
+		Path, Branch, Base, Owner string
+		BaseSHA                   string `json:"base_sha"`
 	}
-	if code != 0 || json.Unmarshal([]byte(out), &made) != nil || made.Branch != "feat/x" || made.Base != "origin/main" {
+	if code != 0 || json.Unmarshal([]byte(out), &made) != nil || made.Branch != "feat/x" || made.Base != "origin/main" || made.Owner != "job-new" {
 		t.Fatalf("new: exit %d out %s err %s", code, out, errOut)
 	}
 	// Dirty, so neither sweep --yes below nor done may remove it.

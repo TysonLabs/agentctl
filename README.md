@@ -762,22 +762,33 @@ JSON on stdout: `path`, `branch`, `scratch`, `base`, `base_sha`, `cloned`,
 `clone_skipped`, `notes`; on a refusal, `refusals`. Exit codes: 0 created · 1 usage ·
 2 refused · 3 git error.
 
-### `agentflow worktree done` / `sweep`: remove finished worktrees, never by force
+### `agentflow worktree done` / `sweep` / `adopt`: remove finished worktrees, never by force
 
 ```sh
 agentflow worktree done feat/my-change          # by branch, path, or worktree dir name
 agentflow worktree done feat/my-change --dry-run
-agentflow worktree sweep                        # list every removable worktree
-agentflow worktree sweep --yes                  # remove them, prune stale records
+agentflow worktree done feat/old --into main    # no PR? prove the merge by ancestry
+agentflow worktree sweep                        # list every worktree: owner, PR, verdict
+agentflow worktree sweep --yes --owner <job>    # remove only this job's, prune stale records
+agentflow worktree adopt ../repo-feat-x --owner <job>   # stamp a hand-made worktree
 ```
 
 Agents tend to clean up with `git worktree remove --force` and `git branch -D`. That
 works, and it also deletes uncommitted work and unmerged branches without a word.
 `done` proves removal is safe first, and refuses with every reason if it isn't:
 
-- **Merged:** the tip is contained in the freshly fetched target (`--into`, default
-  `origin/HEAD`), or GitHub shows a PR merged into that target whose branch and head
-  are exact matches, so squash and rebase merges count.
+- **Merged:** GitHub shows a **merged PR** of origin's repository whose head branch
+  and head commit are exactly the worktree's branch and tip. It counts as merged into
+  *that PR's base*, whatever it is: a non-default base such as `development`, a
+  stacked PR that was retargeted before its parent merged, a squash merge. The JSON
+  says `merged_via: "PR #113 into development"`. Without such a PR, only an explicit
+  `--into` proves a merge, by ancestry: the tip is contained in the freshly fetched
+  `--into` branch. **No default branch is assumed** (an `origin/HEAD` guess once
+  refused PRs merged into `development`). The refusal names the PR that explains it
+  ("PR #119 is OPEN into development: not merged", "... was CLOSED without merging",
+  "... was MERGED at an older head") and asks for `--into` when there is none. `gh`
+  runs with stdin closed and a 30 s bound; a missing, failing or timed-out `gh` is a
+  refusal (`pr_error`), never a pass.
 - **Clean:** no modified or untracked files. Ignored build output (`target/`,
   `node_modules/`) goes with the worktree, so `--force` is never needed.
 - **Unused:** not locked (the lock reason and whether its owner pid is alive are
@@ -789,20 +800,62 @@ works, and it also deletes uncommitted work and unmerged branches without a word
 
 Then it removes the worktree, deletes the local branch only if it still points at the
 proven head, and deletes the remote branch only when a merged PR from that same
-repository had exactly that branch and head. Long-lived branches (the target, `main`,
-`master`, `develop`, `development`, `staging`, `production`, `release/*`, `hotfix/*`)
-are never deleted. `sweep` runs the same checks on every worktree; with `--yes` it
-removes those that pass and prunes the records of worktrees whose directories are gone.
-Scratch worktrees are listed apart, under `scratch`; with `--yes`, sweep removes those
-older than `--scratch-age` (default `24h`) that pass the scratch checks.
+repository had exactly that branch and head. Long-lived branches (the `--into` branch,
+the proving PR's base, origin's default branch, `main`, `master`, `develop`,
+`development`, `staging`, `production`, `release/*`, `hotfix/*`) are never deleted.
 `--keep-remote` leaves remote branches alone.
 
-JSON on stdout (per worktree: `ok`, `merged_via`, `refusals`, `keep_branch`, and after
-removal `freed_bytes`, `branch_deleted`, `remote_deleted`). Sweep continues after an
+**Owner.** `worktree new` records who created the worktree (`--owner`, else
+`$AGENTFLOW_OWNER`, else the base name of `$CLAUDE_JOB_DIR`, else
+`$CLAUDE_CODE_SESSION_ID`, else `$CODEX_SESSION_ID`) with a timestamp, in the
+worktree's Git admin directory, outside the tree. For a worktree made with plain
+`git worktree add`, `agentflow worktree adopt <branch|path> [--owner X]` stamps the
+same record; it refuses a worktree another owner holds and is a no-op for the same
+owner. `done` works on any owner's worktree (you asked for it by name) and prints the
+owner. `sweep` shows each worktree's owner ("unknown" when none) and the PR it found
+(number, state, base). With `--yes --owner X`, it removes only X's worktrees; others
+are refused "owned by ...".
+
+**Stale records.** `sweep` lists records whose directory is gone under `stale`.
+`sweep --yes` prunes them with `git worktree prune` (git keeps locked ones) and lists
+what went in `stale_pruned`. Scratch worktrees are listed apart, under `scratch`; with
+`--yes`, sweep removes those older than `--scratch-age` (default `24h`) that pass the
+scratch checks.
+
+**Cleanup hook (opt-in).** A repository can name extra commands that `done` runs
+after a successful removal, one per value of the local git config key
+`agentflow.worktreeCleanup`. It is local config, never a tracked file, so a branch
+cannot add commands that run on someone else's machine. Each command runs without a
+shell (words split on spaces; `'...'` and `"..."` quote) in the main checkout, with
+stdin closed, in its own process group, bounded by `--cleanup-timeout` (default
+`2m`). Placeholders are substituted inside each word: `{branch}`, `{slug}`
+(`feat/x` → `feat-x`), `{slug_snake}` (`feat_x`), `{dir}` (the worktree directory
+name), `{path}`; the same values are in `AGENTFLOW_WORKTREE_PATH`, `_BRANCH` and
+`_SLUG`. A failure or timeout is reported in `cleanup[]` and on stderr; it never
+undoes the removal or changes the exit code. `--no-cleanup` skips it; `sweep` never
+runs it. Example for a repository whose agents create one MySQL test database per
+worktree (such as vector-payments' `paytiva_<name>_test`): put the mapping in a
+script, because the database name is not always derivable from the branch.
+
+```sh
+# Once, in that repository's main checkout (not configured anywhere by agentflow):
+git config --add agentflow.worktreeCleanup 'scripts/drop-worktree-test-db.sh {dir} {branch}'
+# scripts/drop-worktree-test-db.sh decides the name (e.g. paytiva_<suffix of {dir}>_test)
+# and runs: mysql -e "DROP DATABASE IF EXISTS paytiva_<suffix>_test"
+```
+
+JSON on stdout. Per worktree: `ok`, `merged_via`, `pr_number`, `pr_state`, `pr_base`,
+`pr_error`, `owner`, `refusals`, `keep_branch`, `prunable`, and after removal
+`removed` {`freed_bytes`, `branch_deleted`, `remote_deleted`, `note`}. `done` adds
+`into` (`""` without `--into`), `dry_run` and `cleanup[]` ({`command`, `ok`,
+`exit_code`, `timed_out`, `error`, `output`, `duration_ms`}). `sweep` adds
+`owner_filter`, `stale[]` ({`path`, `branch`, `head`, `owner`, `locked`}) and
+`stale_pruned[]` beside the existing counts. `adopt` prints {`path`, `branch`,
+`owner` {`owner`, `source`, `via`, `recorded`}, `unchanged`}. Sweep continues after an
 individual worktree error, records it in that entry's `error`, prints the complete
-JSON result, and exits 3. Exit codes: 0 removed (or would be, or sweep finished) ·
-1 usage · 2 refused · 3 git/gh error. A missing or incomplete `lsof` check is a
-safety refusal.
+JSON result, and exits 3. Exit codes: 0 removed/adopted (or would be, or sweep
+finished) · 1 usage · 2 refused · 3 git error. A missing or incomplete `lsof` check,
+and a missing or failing `gh`, are safety refusals.
 
 ### `agentflow branch sync`: catch up with the default branch, never by rebase
 

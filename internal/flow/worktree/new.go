@@ -27,6 +27,9 @@ type NewOptions struct {
 	Scratch   bool     // detached throwaway worktree instead of a branch
 	CloneDirs []string // directories to APFS-clone from the main checkout
 	Now       time.Time
+	// Owner is recorded in the worktree's admin dir ("" = none known);
+	// OwnerSource says where the name came from.
+	Owner, OwnerSource string
 }
 
 // Created reports what New made.
@@ -38,6 +41,7 @@ type Created struct {
 	BaseSHA string      `json:"base_sha"`
 	Cloned  []string    `json:"cloned"`
 	Skipped []CloneSkip `json:"clone_skipped,omitempty"`
+	Owner   string      `json:"owner,omitempty"`
 	Notes   []string    `json:"notes,omitempty"`
 }
 
@@ -107,6 +111,11 @@ func New(ctx context.Context, env Env, repoDir string, opt NewOptions) (Created,
 		}
 		if Slug(opt.Branch) == "" {
 			return c, &RefusedError{[]string{fmt.Sprintf("%q gives an empty directory name", opt.Branch)}}
+		}
+	}
+	if opt.Owner != "" {
+		if err := ValidOwner(opt.Owner); err != nil {
+			refuse("owner: %v", err)
 		}
 	}
 	for _, d := range opt.CloneDirs {
@@ -216,6 +225,17 @@ func New(ctx context.Context, env Env, repoDir string, opt NewOptions) (Created,
 		if _, err := run(ctx, main.Path, env.Git, "worktree", "unlock", c.Path); err != nil {
 			c.Notes = append(c.Notes, "could not remove the creation lock ("+err.Error()+"); run git worktree unlock "+c.Path)
 		}
+	}
+
+	if opt.Owner != "" {
+		rec := OwnerRecord{Owner: opt.Owner, Source: opt.OwnerSource, Via: "new", Recorded: opt.Now.UTC()}
+		if err := writeOwner(ctx, env, main.Path, c.Path, rec, false); err != nil {
+			c.Notes = append(c.Notes, "owner not recorded ("+err.Error()+"); run agentflow worktree adopt "+c.Path)
+		} else {
+			c.Owner = opt.Owner
+		}
+	} else {
+		c.Notes = append(c.Notes, "no owner recorded: pass --owner or set AGENTFLOW_OWNER (sweep shows it as unknown)")
 	}
 
 	c.Cloned = []string{}

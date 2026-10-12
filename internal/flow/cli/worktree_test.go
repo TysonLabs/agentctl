@@ -88,8 +88,9 @@ func TestSweepContinuesAfterOneWorktreeErrors(t *testing.T) {
 	}
 	t.Setenv("AGENTFLOW_GIT", gitWrapper)
 	t.Setenv("AGENTFLOW_LSOF", lsof)
+	t.Setenv("AGENTFLOW_GH", writeFakeGH(t, root, "[]"))
 
-	code, out, errOut := run(t, "worktree", "sweep", "--yes", "--keep-remote", "--repo", repo)
+	code, out, errOut := run(t, "worktree", "sweep", "--yes", "--keep-remote", "--into", "main", "--repo", repo)
 	if code != 3 || !strings.Contains(errOut, "could not be processed") {
 		t.Fatalf("exit=%d stderr=%q, want a reported partial failure", code, errOut)
 	}
