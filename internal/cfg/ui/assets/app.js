@@ -74,11 +74,13 @@
       const next = await api("POST", path, Object.assign({ version: v }, body));
       apply(next);
       (next.notes || []).forEach((n) => toast(n));
-      return true;
+      return next;
     } catch (e) {
       if (e.status === 409) {
         await load();
-        throw new Error("services.toml changed on disk, so the page reloaded. Check it and try again.");
+        const conflict = new Error("services.toml changed on disk, so the page reloaded. Check it and try again.");
+        conflict.status = 409;
+        throw conflict;
       }
       throw e;
     }
@@ -185,6 +187,13 @@
     $("alerts").replaceChildren(...alerts);
 
     const gs = groups();
+    // Inline lock drafts belong to gates in the rendered snapshot. A
+    // gate-only project can disappear from groups() when its gate is removed,
+    // so discard orphaned drafts before rendering any cards.
+    const gateNames = new Set((state.gates || []).map((gt) => gt.name));
+    for (const name of lockEdit.keys()) {
+      if (!gateNames.has(name)) lockEdit.delete(name);
+    }
     const wired = state.services.filter((s) => s.token.wired).length;
     $("summary").textContent = gs.length
       ? `${plural(gs.length, "service", "services")} · ${plural(state.services.length, "environment", "environments")} · ${wired} wired`
@@ -267,7 +276,7 @@
     }
     const n = gt.steps.length;
     const rmGate = armedButton("Remove gate", "Confirm: remove all steps", async () => {
-      await writeFocus(["gate-add:" + name, "gate-h:" + name], "/api/gate/remove", { name });
+      await writeFocus(["gate-add:" + name, "gate-h:" + name, "add-gate"], "/api/gate/remove", { name });
       toast("Removed the gate of " + name);
     });
     const [lockInline, lockExtra] = renderLock(name, gt);
@@ -313,7 +322,7 @@
     // After a removal, focus moves to the next step (or the previous one).
     const neighbour = steps[i + 1] || steps[i - 1];
     const rm = armedButton("Remove", "Confirm", async () => {
-      await writeFocus([neighbour ? "gate-edit:" + name + ":" + neighbour.name : "", "gate-add:" + name],
+      await writeFocus([neighbour ? "gate-edit:" + name + ":" + neighbour.name : "", "gate-add:" + name, "add-gate"],
         "/api/gate/step/remove", { name, step: st.name });
       toast("Removed step " + st.name);
     }, ["Remove step " + st.name, "Confirm: remove step " + st.name]);
@@ -352,7 +361,7 @@
     const cancel = h("button", { class: "btn", type: "button", text: "Cancel" });
     const close = () => {
       lockEdit.delete(name);
-      pendingFocus = ["gate-lock:" + name];
+      pendingFocus = ["gate-lock:" + name, "gate-add:" + name, "add-gate"];
       render();
     };
     const doSave = () => busy(save, async () => {
@@ -363,6 +372,8 @@
           e.error = err.message;
           pendingFocus = ["gate-lock-in:" + name];
           render();
+        } else {
+          focusKeys(["gate-add:" + name, "add-gate"]);
         }
         return;
       }
@@ -648,7 +659,7 @@
     // snapshot's version (or the version of the write before it), so a file
     // that changed meanwhile is refused (409) instead of placing the step
     // against a list the person did not see.
-    const base = state.version;
+    let base = state.version;
     const steps = fresh ? [] : ((gateOf(name) || { steps: [] }).steps).slice();
     const others = st ? steps.filter((x) => x.name !== st.name) : steps;
     const fields = [];
@@ -712,25 +723,28 @@
           // The repo goes first: a gate without meta.repo cannot run, while a
           // refused step leaves only the repo, and resubmitting adds the step.
           if (form.repo) {
-            await write("/api/meta", { name: form.proj, meta: { repo: form.repo } }, base);
+            const next = await write("/api/meta", { name: form.proj, meta: { repo: form.repo } }, base);
+            base = next.version;
           }
-          await write("/api/gate/step", { name: form.proj, original: "", step: form.step }, form.repo ? undefined : base);
+          await write("/api/gate/step", { name: form.proj, original: "", step: form.step }, base);
           toast("Added step " + form.step.name + " to " + form.proj);
           return;
         }
         if (!st) {
-          dialogReturn = ["gate-add:" + name];
+          dialogReturn = ["gate-add:" + name, "add-gate"];
           const at = anchor === null ? 1 : steps.findIndex((x) => x.name === anchor) + 2;
           await write("/api/gate/step", { name, original: "", step: form.step, at }, base);
           toast("Added step " + form.step.name);
           return;
         }
         // Focus returns to this step's Edit button, under its new name.
-        dialogReturn = ["gate-edit:" + name + ":" + form.step.name, "gate-add:" + name];
+        dialogReturn = ["gate-edit:" + name + ":" + form.step.name, "gate-add:" + name, "add-gate"];
         const changed = form.step.name !== st.name || form.step.run !== st.run ||
           form.step.timeout !== (st.timeout || "") || form.step.stop_on_fail !== !!st.stop_on_fail;
+        let moveVersion = base;
         if (changed) {
-          await write("/api/gate/step", { name, original: st.name, step: form.step }, base);
+          const next = await write("/api/gate/step", { name, original: st.name, step: form.step }, base);
+          moveVersion = next.version;
         }
         // Then the position, against the list as it is now.
         const cur = (gateOf(name) || { steps: [] }).steps;
@@ -739,8 +753,7 @@
         const to = anchor === null ? 1 : rest.findIndex((x) => x.name === anchor) + 2;
         if (to !== now) {
           try {
-            // Without an edit, the snapshot's version guards the move too.
-            await write("/api/gate/move", { name, step: form.step.name, to }, changed ? undefined : base);
+            await write("/api/gate/move", { name, step: form.step.name, to }, moveVersion);
           } catch (e) {
             if (!changed) throw e;
             // The edit already committed; close and say what is left to do.
@@ -750,6 +763,8 @@
         }
         toast(changed || to !== now ? "Saved step " + form.step.name : "No changes to save");
       });
+    if (!dialogReturn) dialogReturn = [];
+    if (!dialogReturn.includes("add-gate")) dialogReturn.push("add-gate");
     if (preview) {
       draw();
       sel.addEventListener("change", draw);
@@ -783,7 +798,15 @@
       await onSubmit();
       $("dlg").close();
     } catch (e) {
-      $("dlg-error").textContent = e.message;
+      if (e.status === 409) {
+        // A gate dialog is tied to the list it showed. Closing every stale
+        // dialog also prevents any form from silently overwriting reloaded
+        // values; reopening it takes a fresh snapshot.
+        $("dlg").close();
+        toast(e.message, true);
+      } else {
+        $("dlg-error").textContent = e.message;
+      }
     } finally {
       controls.forEach((control) => { control.disabled = false; });
     }
