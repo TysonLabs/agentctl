@@ -97,7 +97,8 @@ the main checkout, stdin closed, its own process group, each bounded by
 {slug} (feat/x -> feat-x), {slug_snake} (feat_x), {dir} (the worktree
 directory name), {path}. The same values are in AGENTFLOW_WORKTREE_PATH,
 _BRANCH and _SLUG. A failure is reported in cleanup[] and on stderr; it
-never undoes the removal or changes the exit code. Not run by sweep.
+never undoes the removal or changes the exit code. done runs it for scratch
+worktrees too ({branch} is empty there). Not run by sweep.
 
   --repo DIR        any checkout of the repository (default: current dir)
   --into REF        prove merges by ancestry into this branch as well
@@ -202,16 +203,28 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	if err != nil {
 		return fail(3, "%v", err)
 	}
+	// Keep a surviving repository directory for all work after a removal.
+	// The caller may have invoked done from (or with --repo pointing at) the
+	// very linked worktree being removed.
+	operationRepo := repo
+	if len(list) > 0 && list[0].Main {
+		operationRepo = list[0].Path
+	}
 	// Scratch worktrees (agentflow worktree new --scratch) skip the merge
 	// and clean checks; only their marker admits them to that path.
 	var scratch []worktree.Worktree
+	stale := []staleEntry{}
 	if sub == "done" {
 		if w, err := worktree.Find(list, repo, pos[0]); err == nil && isScratch(ctx, env, repo, w) {
-			return scratchDone(ctx, env, repo, w, dryRun, stdout, stderr)
+			return scratchDone(ctx, env, operationRepo, w, dryRun, noClean, cleanupTimeout, stdout, stderr)
 		}
 	} else {
 		var ordinary []worktree.Worktree
 		for _, w := range list {
+			if !w.Main && dirGone(w.Path) {
+				stale = append(stale, staleEntry{Path: w.Path, Branch: w.Branch, Head: w.Head,
+					Owner: ownerOf(ctx, env, operationRepo, w), Locked: w.Locked})
+			}
 			if isScratch(ctx, env, repo, w) {
 				scratch = append(scratch, w)
 			} else {
@@ -252,12 +265,11 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		Error   string            `json:"error,omitempty"`
 	}
 	var entries []entry
-	stale := []staleEntry{}
 	var freed int64
 	removed, eligible := 0, 0
 	hadError := false
 	for _, w := range picked {
-		owner := ownerOf(ctx, env, repo, w)
+		owner := ownerOf(ctx, env, operationRepo, w)
 		c, err := worktree.Inspect(ctx, env, w, target)
 		c.Owner = owner
 		if err != nil {
@@ -271,10 +283,7 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 			hadError = true
 			continue
 		}
-		if sub == "sweep" && dirGone(w.Path) {
-			stale = append(stale, staleEntry{Path: w.Path, Branch: w.Branch, Head: w.Head, Owner: owner, Locked: w.Locked})
-		}
-		if sub == "sweep" && ownerFilter != "" && c.OK && owner != ownerFilter {
+		if sub == "sweep" && ownerFilter != "" && !dirGone(w.Path) && owner != ownerFilter {
 			c.OK = false
 			c.Refusals = append(c.Refusals, fmt.Sprintf("owned by %s, not %s (--owner)", ownerOrUnknown(owner), ownerFilter))
 		}
@@ -282,7 +291,7 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		if c.OK {
 			eligible++
 			if (sub == "done" && !dryRun) || (sub == "sweep" && yes) {
-				r, err := worktree.Remove(ctx, env, repo, c, target, !keepRem)
+				r, err := worktree.Remove(ctx, env, operationRepo, c, target, !keepRem)
 				if err != nil {
 					if sub == "done" {
 						if errors.Is(err, worktree.ErrRefused) {
@@ -313,32 +322,26 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	if sub == "sweep" {
 		var sFreed int64
 		var sErr bool
-		scratchEntries, scratchRemovable, scratchRemoved, sFreed, sErr = sweepScratch(ctx, env, repo, scratch, scratchAge, yes, ownerFilter)
+		scratchEntries, scratchRemovable, scratchRemoved, sFreed, sErr = sweepScratch(ctx, env, operationRepo, scratch, scratchAge, yes, ownerFilter)
 		freed += sFreed
 		hadError = hadError || sErr
 	}
 
 	stalePruned := []string{}
 	var sweepError string
-	if sub == "sweep" && yes {
-		prunable := false
-		for _, e := range entries {
-			prunable = prunable || e.Prunable
-		}
-		if prunable {
-			if pruned, err := pruneStale(ctx, env, repo, stale); err != nil {
-				sweepError = err.Error()
-				hadError = true
-			} else {
-				stalePruned = pruned
-			}
+	if sub == "sweep" && yes && len(stale) > 0 {
+		if pruned, err := pruneStale(ctx, env, operationRepo, stale); err != nil {
+			sweepError = err.Error()
+			hadError = true
+		} else {
+			stalePruned = pruned
 		}
 	}
 
 	// Cleanup commands run after a successful done removal only.
 	var cleanup []worktree.CleanupResult
 	if sub == "done" && entries[0].Removed != nil && !noClean {
-		cleanup = runCleanupHook(ctx, env, repo, entries[0].Path, entries[0].Branch, cleanupTimeout, stderr)
+		cleanup = runCleanupHook(ctx, env, operationRepo, entries[0].Path, entries[0].Branch, cleanupTimeout, stderr)
 	}
 
 	code := 0

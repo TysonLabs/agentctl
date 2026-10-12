@@ -91,8 +91,8 @@ func ReadOwner(ctx context.Context, env Env, repoDir string, w Worktree) (*Owner
 	if err := json.Unmarshal(b, &rec); err != nil {
 		return nil, fmt.Errorf("unreadable owner record: %v", err)
 	}
-	if ValidOwner(rec.Owner) != nil {
-		return nil, errors.New("invalid owner record: missing or malformed owner")
+	if ValidOwner(rec.Owner) != nil || (rec.Via != "new" && rec.Via != "adopt") || rec.Recorded.IsZero() {
+		return nil, errors.New("invalid owner record: missing or malformed owner, via, or recorded time")
 	}
 	return &rec, nil
 }

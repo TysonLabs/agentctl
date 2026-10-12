@@ -102,3 +102,20 @@ func TestUnreadableOwnerRecordIsNotOverwritten(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+func TestIncompleteOwnerRecordIsUnreadable(t *testing.T) {
+	f := newFixture(t)
+	path := filepath.Join(f.root, "wt-incomplete-owner")
+	git(t, f.repo, "worktree", "add", "-q", "-b", "feat/incomplete-owner", path, "origin/main")
+	ctx := context.Background()
+	dir, err := adminDir(ctx, f.env, f.repo, path)
+	if err != nil || dir == "" {
+		t.Fatal(dir, err)
+	}
+	writeFile(t, dir, ownerFile, `{"owner":"job-a"}`)
+	list, _ := List(ctx, f.env, f.repo)
+	w, _ := Find(list, f.repo, "feat/incomplete-owner")
+	if _, err := Adopt(ctx, f.env, f.repo, w, "job-a", "--owner", time.Now()); !refusedWith(err, "invalid owner record") {
+		t.Fatalf("incomplete record was accepted: %v", err)
+	}
+}

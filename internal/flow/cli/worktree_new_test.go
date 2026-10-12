@@ -120,9 +120,18 @@ func TestWorktreeNewScratchSweepAndDone(t *testing.T) {
 	if code != 0 || !strings.Contains(out, `"ok": true`) || strings.Contains(out, `"removed"`) {
 		t.Fatalf("done --dry-run: exit %d out %s err %s", code, out, errOut)
 	}
+	cleanupMarker := filepath.Join(root, "scratch-cleanup.out")
+	cleanupHook := filepath.Join(root, "scratch-cleanup.sh")
+	if err := os.WriteFile(cleanupHook, []byte("#!/bin/sh\nprintf '%s\\n' \"$1\" > \""+cleanupMarker+"\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, repo, "config", "--add", "agentflow.worktreeCleanup", cleanupHook+" {path}")
 	code, out, errOut = run(t, "worktree", "done", scratch.Path, "--repo", repo)
-	if code != 0 || !strings.Contains(out, `"discarded_dirty_files": 1`) {
+	if code != 0 || !strings.Contains(out, `"discarded_dirty_files": 1`) || !strings.Contains(out, `"owner": "job-new"`) || !strings.Contains(out, `"ok": true`) {
 		t.Fatalf("done scratch: exit %d out %s err %s", code, out, errOut)
+	}
+	if b, err := os.ReadFile(cleanupMarker); err != nil || strings.TrimSpace(string(b)) != scratch.Path {
+		t.Fatalf("scratch cleanup marker = %q, %v", b, err)
 	}
 	if _, err := os.Stat(scratch.Path); !os.IsNotExist(err) {
 		t.Fatalf("scratch still there: %v", err)

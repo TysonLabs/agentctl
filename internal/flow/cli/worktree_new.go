@@ -86,14 +86,14 @@ func runWorktreeNew(ctx context.Context, args []string, stdout, stderr io.Writer
 
 // scratchDone is `worktree done` on a scratch worktree: no merged or clean
 // checks, but the marker and unused checks, re-run right before removal.
-func scratchDone(ctx context.Context, env worktree.Env, repo string, w worktree.Worktree, dryRun bool, stdout, stderr io.Writer) int {
+func scratchDone(ctx context.Context, env worktree.Env, repo string, w worktree.Worktree, dryRun, noClean bool, cleanupTimeout time.Duration, stdout, stderr io.Writer) int {
 	now := time.Now()
 	c, err := worktree.InspectScratch(ctx, env, repo, w, now, 0)
 	if err != nil {
 		fmt.Fprintf(stderr, "agentflow worktree done: %s: %v\n", w.Path, err)
 		return 3
 	}
-	e := scratchEntry{ScratchCheck: c}
+	e := scratchEntry{ScratchCheck: c, Owner: ownerOf(ctx, env, repo, w)}
 	code := 0
 	if c.OK && !dryRun {
 		r, err := worktree.RemoveScratch(ctx, env, repo, c, now, 0)
@@ -108,10 +108,15 @@ func scratchDone(ctx context.Context, env worktree.Env, repo string, w worktree.
 			e.Removed = &r
 		}
 	}
+	var cleanup []worktree.CleanupResult
+	if e.Removed != nil && !noClean {
+		cleanup = runCleanupHook(ctx, env, repo, e.Path, e.Branch, cleanupTimeout, stderr)
+	}
 	out, _ := json.MarshalIndent(struct {
 		scratchEntry
-		DryRun bool `json:"dry_run,omitempty"`
-	}{e, dryRun}, "", "  ")
+		DryRun  bool                     `json:"dry_run,omitempty"`
+		Cleanup []worktree.CleanupResult `json:"cleanup,omitempty"`
+	}{e, dryRun, cleanup}, "", "  ")
 	_, _ = stdout.Write(append(out, '\n'))
 	if !e.OK {
 		for _, r := range e.Refusals {
@@ -142,7 +147,7 @@ func sweepScratch(ctx context.Context, env worktree.Env, repo string, list []wor
 			hadError = true
 			continue
 		}
-		if ownerFilter != "" && c.OK && owner != ownerFilter {
+		if ownerFilter != "" && !dirGone(w.Path) && owner != ownerFilter {
 			c.OK = false
 			c.Refusals = append(c.Refusals, fmt.Sprintf("owned by %s, not %s (--owner)", ownerOrUnknown(owner), ownerFilter))
 		}

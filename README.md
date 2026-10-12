@@ -833,8 +833,8 @@ stdin closed, in its own process group, bounded by `--cleanup-timeout` (default
 (`feat/x` → `feat-x`), `{slug_snake}` (`feat_x`), `{dir}` (the worktree directory
 name), `{path}`; the same values are in `AGENTFLOW_WORKTREE_PATH`, `_BRANCH` and
 `_SLUG`. A failure or timeout is reported in `cleanup[]` and on stderr; it never
-undoes the removal or changes the exit code. `--no-cleanup` skips it; `sweep` never
-runs it. Example for a repository whose agents create one MySQL test database per
+undoes the removal or changes the exit code. `--no-cleanup` skips it; `done` on a
+scratch worktree runs it too (`{branch}` is empty there); `sweep` never runs it. Example for a repository whose agents create one MySQL test database per
 worktree (such as vector-payments' `paytiva_<name>_test`): put the mapping in a
 script, because the database name is not always derivable from the branch.
 

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/TysonLabs/agentctl/internal/flow/worktree"
 )
 
 // writeFakeGH writes a gh stand-in that applies the caller's --jq to the
@@ -186,6 +188,39 @@ func TestDoneRefusesOpenPRAndNeverGuessesTheDefaultBranch(t *testing.T) {
 	}
 }
 
+func TestDoneFromRemovedWorktreeRunsCleanupInMainCheckout(t *testing.T) {
+	root, seed, repo := cliRepo(t)
+	path, tip := branchWorktree(t, root, repo, "feat/from-self")
+	squashIntoDevelopment(t, seed, "feat/from-self")
+	setFakePRs(t, root, prFake{121, "MERGED", "development", "feat/from-self", tip, nil})
+	marker := filepath.Join(root, "cleanup-from-self.out")
+	hook := filepath.Join(root, "cleanup-from-self.sh")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf '%s\\n' \"$1\" > \""+marker+"\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, repo, "config", "--add", "agentflow.worktreeCleanup", hook+" {branch}")
+
+	code, out, errOut := run(t, "worktree", "done", "feat/from-self", "--repo", path)
+	if code != 0 {
+		t.Fatalf("done: exit %d out %s err %s", code, out, errOut)
+	}
+	var got struct {
+		Removed *struct {
+			BranchDeleted bool `json:"branch_deleted"`
+		} `json:"removed"`
+		Cleanup []worktree.CleanupResult `json:"cleanup"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Removed == nil || !got.Removed.BranchDeleted || len(got.Cleanup) != 1 || !got.Cleanup[0].OK {
+		t.Fatalf("post-removal work did not use main checkout: %s / %s", out, errOut)
+	}
+	if b, err := os.ReadFile(marker); err != nil || string(b) != "feat/from-self\n" {
+		t.Fatalf("cleanup marker = %q, %v", b, err)
+	}
+}
+
 func TestSweepOwnerFilterAndStaleRecords(t *testing.T) {
 	root, seed, repo := cliRepo(t)
 	mine, tipMine := branchWorktree(t, root, repo, "feat/mine")
@@ -207,6 +242,11 @@ func TestSweepOwnerFilterAndStaleRecords(t *testing.T) {
 	}
 	if code, _, errOut := run(t, "worktree", "adopt", "feat/theirs", "--owner", "job-a", "--repo", repo); code != 2 || !strings.Contains(errOut, "already owned by job-b") {
 		t.Fatalf("re-adopt: exit %d err %s", code, errOut)
+	}
+	// Ownership remains an explicit refusal even when another safety check
+	// (here, a dirty file) already makes the worktree non-removable.
+	if err := os.WriteFile(filepath.Join(theirs, "local-wip.txt"), []byte("wip\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 	gonePath := filepath.Join(root, "repo-feat-gone")
 	if err := os.RemoveAll(gonePath); err != nil {
@@ -275,6 +315,38 @@ func TestSweepOwnerFilterAndStaleRecords(t *testing.T) {
 	code, out, _ = run(t, "worktree", "sweep", "--format", "text", "--repo", repo)
 	if code != 0 || !strings.Contains(out, "owner: job-b") || !strings.Contains(out, "pr: #2 MERGED into development") {
 		t.Fatalf("text sweep: %s", out)
+	}
+}
+
+func TestSweepReportsAndPrunesStaleScratchRecord(t *testing.T) {
+	_, _, repo := cliRepo(t)
+	t.Setenv("AGENTFLOW_OWNER", "job-scratch")
+	code, out, errOut := run(t, "worktree", "new", "--scratch", "--repo", repo)
+	var made struct{ Path string }
+	if code != 0 || json.Unmarshal([]byte(out), &made) != nil {
+		t.Fatalf("new scratch: exit %d out %s err %s", code, out, errOut)
+	}
+	if err := os.RemoveAll(made.Path); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		Stale []struct {
+			Path, Owner string
+		} `json:"stale"`
+		StalePruned []string `json:"stale_pruned"`
+	}
+	code, out, errOut = run(t, "worktree", "sweep", "--scratch-age", "0s", "--repo", repo)
+	var listed result
+	if code != 0 || json.Unmarshal([]byte(out), &listed) != nil || len(listed.Stale) != 1 ||
+		listed.Stale[0].Path != made.Path || listed.Stale[0].Owner != "job-scratch" {
+		t.Fatalf("stale scratch not listed: exit %d out %s err %s", code, out, errOut)
+	}
+
+	code, out, errOut = run(t, "worktree", "sweep", "--yes", "--owner", "job-scratch", "--scratch-age", "0s", "--repo", repo)
+	var swept result
+	if code != 0 || json.Unmarshal([]byte(out), &swept) != nil || len(swept.StalePruned) != 1 || swept.StalePruned[0] != made.Path {
+		t.Fatalf("stale scratch not reported as pruned: exit %d out %s err %s", code, out, errOut)
 	}
 }
 
