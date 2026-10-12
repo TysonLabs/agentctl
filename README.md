@@ -1053,8 +1053,10 @@ read-only guarantee, and it belongs on no agent allowlist. Exit codes: 0 ok · 1
   API call. The server checks the Host header exactly (DNS rebinding), refuses cross-origin
   and non-JSON writes, sends a strict CSP, shows token fingerprints only, rejects an edit made
   against a stale copy of the file (409), and stops after 15 minutes idle (`--idle`) or on Done.
-  Each project card also lists its gate steps in order, with add, edit, delete, move up/down
-  and the lock name; "Add gate project" starts a project that has only a repo and a gate.
+  Each project card has a Gate block: the steps in run order (timeout, ⛔ stop-on-fail marker,
+  move up/down, edit, remove), the lock edited in place, and an "Add first step" empty state.
+  The add/edit dialog shows the list with the step highlighted where it will land, and a
+  Position selector. "Add gate project" starts a project that has only a repo and a gate.
 - **What the Keychain protects:** tokens are out of the file, its backups and `cat`. Items are
   readable by `/usr/bin/security` without a prompt, so a process running as you can still read
   them on purpose; deny `security find-generic-password` in agent permissions if that matters.

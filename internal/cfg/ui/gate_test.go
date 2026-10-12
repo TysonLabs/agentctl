@@ -120,7 +120,7 @@ func TestNewGateProjectWritesRepoFirst(t *testing.T) {
 	}
 	src := string(js)
 	start := strings.Index(src, "function openGateStep(")
-	end := strings.Index(src, "function openGateLock(")
+	end := strings.Index(src, "function openMeta(")
 	if start < 0 || end < start {
 		t.Fatal("could not find openGateStep")
 	}
@@ -128,5 +128,72 @@ func TestNewGateProjectWritesRepoFirst(t *testing.T) {
 	meta, step := strings.Index(body, `write("/api/meta"`), strings.Index(body, `write("/api/gate/step"`)
 	if meta < 0 || step < 0 || meta > step {
 		t.Fatal("a new gate project must save its repo before its first step")
+	}
+}
+
+// The step dialog places a step relative to the list it showed. Every write
+// it makes must be checked against that list's version, and nothing after
+// the first write may read the live form (a re-render can change it).
+func TestGateStepDialogWritesAgainstItsSnapshot(t *testing.T) {
+	js, err := fs.ReadFile(assets, "assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js)
+	start := strings.Index(src, "function openGateStep(")
+	end := strings.Index(src, "function openMeta(")
+	if start < 0 || end < start {
+		t.Fatal("could not find openGateStep")
+	}
+	body := src[start:end]
+	if !strings.Contains(body, "const base = state.version;") {
+		t.Fatal("the step dialog does not keep the version its step list came from")
+	}
+	for _, w := range []string{
+		`write("/api/gate/step", { name, original: "", step: form.step, at }, base)`,
+		`write("/api/gate/step", { name, original: st.name, step: form.step }, base)`,
+		`write("/api/gate/move", { name, step: form.step.name, to }, changed ? undefined : base)`,
+	} {
+		if !strings.Contains(body, w) {
+			t.Fatalf("step dialog write is not pinned to the dialog's version: %s", w)
+		}
+	}
+	submit := strings.Index(body, "async () => {")
+	first := strings.Index(body[submit:], "await write(")
+	if submit < 0 || first < 0 {
+		t.Fatal("could not find the submit handler")
+	}
+	after := body[submit+first:]
+	for _, live := range []string{`val("f-`, `$("f-`, "sel.value"} {
+		if i := strings.Index(after, live); i >= 0 && i < strings.Index(after, "if (preview) {") {
+			t.Fatalf("step dialog reads live form state after its first write: %s", live)
+		}
+	}
+}
+
+// Every project card shows its gate block, with an empty state that says
+// what a gate is; the card action goes to the block instead of a dialog.
+func TestEveryCardShowsItsGateBlock(t *testing.T) {
+	js, err := fs.ReadFile(assets, "assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js)
+	start := strings.Index(src, "function renderGate(")
+	end := strings.Index(src, "function renderGateStep(")
+	if start < 0 || end < start {
+		t.Fatal("could not find renderGate")
+	}
+	body := src[start:end]
+	if strings.Contains(body, "if (!gt) return null") {
+		t.Fatal("a project without a gate shows no gate block")
+	}
+	for _, want := range []string{"Add first step", "agentflow gate runs them", `"+ Add step"`, "agentflow gate --check --rev HEAD"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("gate block lacks %q", want)
+		}
+	}
+	if strings.Contains(src, `text: "Gate step"`) || !strings.Contains(src, "onclick: () => focusGate(g.name)") {
+		t.Fatal(`the card action must be "Gate", going to the block`)
 	}
 }
