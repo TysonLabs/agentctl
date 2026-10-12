@@ -222,6 +222,9 @@ func runWorktree(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	}
 	target, err := worktree.ResolveTarget(ctx, env, repo, into)
 	if err != nil {
+		if errors.Is(err, worktree.ErrRemote) {
+			return fail(3, "%v", err)
+		}
 		return fail(1, "%v", err)
 	}
 

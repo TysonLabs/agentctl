@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 // The owner record says which session or job created (or adopted) a
@@ -56,7 +57,10 @@ func ResolveOwner(flag string, getenv func(string) string) (owner, source string
 
 // ValidOwner accepts 1-128 printable characters without spaces.
 func ValidOwner(s string) error {
-	if s == "" || len(s) > 128 {
+	if !utf8.ValidString(s) {
+		return errors.New("an owner must be valid UTF-8")
+	}
+	if s == "" || utf8.RuneCountInString(s) > 128 {
 		return errors.New("an owner is 1-128 characters")
 	}
 	for _, r := range s {

@@ -178,7 +178,7 @@ func (t Target) Ref() string {
 
 // ResolveTarget is the target for done and sweep: the --into branch if
 // given, else none (Branch "") on origin. Either way Default is origin's
-// HEAD branch when it is known.
+// current HEAD branch, used only to protect it from deletion.
 func ResolveTarget(ctx context.Context, env Env, dir, into string) (Target, error) {
 	env = env.withDefaults()
 	t := Target{Remote: "origin"}
@@ -188,8 +188,20 @@ func ResolveTarget(ctx context.Context, env Env, dir, into string) (Target, erro
 			return Target{}, err
 		}
 	}
-	if out, err := run(ctx, dir, env.Git, "symbolic-ref", "--quiet", "refs/remotes/"+t.Remote+"/HEAD"); err == nil {
-		t.Default = strings.TrimPrefix(strings.TrimSpace(out), "refs/remotes/"+t.Remote+"/")
+	out, err := run(ctx, dir, env.Git, "ls-remote", "--symref", "origin", "HEAD")
+	if err != nil {
+		return Target{}, fmt.Errorf("%w: resolve origin's default branch for deletion protection: %v", ErrRemote, err)
+	}
+	for _, line := range nonEmptyLines(out) {
+		if rest, ok := strings.CutPrefix(line, "ref: refs/heads/"); ok {
+			if branch, ref, ok := strings.Cut(rest, "\t"); ok && branch != "" && ref == "HEAD" {
+				t.Default = branch
+				break
+			}
+		}
+	}
+	if t.Default == "" {
+		return Target{}, fmt.Errorf("%w: cannot tell origin's default branch from `git ls-remote --symref origin HEAD`; refusing because it could be deleted", ErrRemote)
 	}
 	return t, nil
 }
@@ -259,6 +271,10 @@ type Check struct {
 	prProof    bool   // PRNumber is a merged PR with exactly this branch and head
 	prHeadRepo string // that PR's head repository (owner/name), "" = unknown
 }
+
+// ErrRemote means the remote could not be read (an external-command error,
+// not a usage error).
+var ErrRemote = errors.New("remote unavailable")
 
 // ErrRefused means safety changed after Inspect and removal was not attempted.
 var ErrRefused = errors.New("worktree removal refused")

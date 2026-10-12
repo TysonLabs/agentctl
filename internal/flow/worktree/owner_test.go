@@ -24,7 +24,7 @@ func TestResolveOwnerOrder(t *testing.T) {
 	if o, _ := ResolveOwner("", func(string) string { return "" }); o != "" {
 		t.Fatalf("none: %q", o)
 	}
-	for _, bad := range []string{"", "a b", "x\n", string(make([]byte, 129))} {
+	for _, bad := range []string{"", "a b", "x\n", string(make([]byte, 129)), string([]byte{0xff})} {
 		if ValidOwner(bad) == nil {
 			t.Errorf("ValidOwner(%q) accepted", bad)
 		}

@@ -2,6 +2,7 @@ package worktree
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -199,6 +200,21 @@ func TestGHFailureIsARefusalNeverAPass(t *testing.T) {
 	}
 }
 
+func TestMalformedPRFieldsAreARefusalNeverAPass(t *testing.T) {
+	f := newFixture(t)
+	path := f.worktree("feat/malformed")
+	head := git(t, path, "rev-parse", "HEAD")
+	writeFile(t, f.root, "gh-malformed", "#!/bin/sh\nprintf '123\\tMERGED\\t\\tfeat/malformed\\t"+head+"\\t\\n'\n")
+	if err := os.Chmod(filepath.Join(f.root, "gh-malformed"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.env.GH = filepath.Join(f.root, "gh-malformed")
+	c, _ := f.inspectInto("feat/malformed", "")
+	if c.OK || c.PRError == "" || c.PRNumber != 0 || !refusedFor(c, "GitHub could not be checked") {
+		t.Fatalf("malformed PR output must not prove a merge: %+v", c)
+	}
+}
+
 // With --into, ancestry is independent proof: a gh outage is recorded but
 // does not block, and the remote branch is kept (no PR proof).
 func TestGHFailureWithIntoFallsBackToAncestryAndKeepsRemote(t *testing.T) {
@@ -235,5 +251,35 @@ func TestMissingGHIsARefusal(t *testing.T) {
 func TestDefaultBranchIsProtectedWithoutInto(t *testing.T) {
 	if got := keepBranch("trunk-ish", Target{Remote: "origin", Default: "trunk-ish"}, ""); got == "" {
 		t.Fatal("origin's default branch must be kept even when --into is not given")
+	}
+}
+
+func TestOriginDefaultBranchIsProtectedWithAnotherIntoRemote(t *testing.T) {
+	f := newFixture(t)
+	git(t, f.seed, "push", "-q", "origin", "main:refs/heads/trunk-ish")
+	git(t, f.origin, "symbolic-ref", "HEAD", "refs/heads/trunk-ish")
+	git(t, f.repo, "remote", "add", "upstream", f.origin)
+	git(t, f.repo, "fetch", "-q", "upstream")
+	git(t, f.repo, "remote", "set-head", "upstream", "main")
+	// Both local remote HEAD refs are stale at main. Protection must use
+	// origin's current advertised HEAD, independent of the --into remote.
+
+	tg, err := ResolveTarget(context.Background(), f.env, f.repo, "upstream/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tg.Remote != "upstream" || tg.Branch != "main" || tg.Default != "trunk-ish" {
+		t.Fatalf("target must retain origin's default for deletion protection: %+v", tg)
+	}
+	if got := keepBranch("trunk-ish", tg, ""); got != "it is the remote's default branch" {
+		t.Fatalf("origin default is not protected: %q", got)
+	}
+}
+
+func TestUnreadableOriginHeadIsARemoteError(t *testing.T) {
+	f := newFixture(t)
+	git(t, f.repo, "remote", "set-url", "origin", filepath.Join(f.root, "missing.git"))
+	if _, err := ResolveTarget(context.Background(), f.env, f.repo, ""); !errors.Is(err, ErrRemote) {
+		t.Fatalf("got %v, want ErrRemote", err)
 	}
 }

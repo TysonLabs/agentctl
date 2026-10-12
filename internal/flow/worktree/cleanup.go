@@ -41,7 +41,7 @@ type CleanupResult struct {
 // error).
 func CleanupCommands(ctx context.Context, env Env, repoDir string) ([]string, error) {
 	env = env.withDefaults()
-	cmd := exec.CommandContext(ctx, env.Git, "config", "--get-all", CleanupKey)
+	cmd := exec.CommandContext(ctx, env.Git, "config", "--local", "--get-all", CleanupKey)
 	cmd.Dir = repoDir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -51,7 +51,7 @@ func CleanupCommands(ctx context.Context, env Env, repoDir string) ([]string, er
 		return nil, nil // key not set
 	}
 	if err != nil {
-		return nil, fmt.Errorf("git config --get-all %s: %v: %s", CleanupKey, err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("git config --local --get-all %s: %v: %s", CleanupKey, err, strings.TrimSpace(stderr.String()))
 	}
 	return nonEmptyLines(stdout.String()), nil
 }

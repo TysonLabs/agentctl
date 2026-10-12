@@ -801,7 +801,8 @@ works, and it also deletes uncommitted work and unmerged branches without a word
 Then it removes the worktree, deletes the local branch only if it still points at the
 proven head, and deletes the remote branch only when a merged PR from that same
 repository had exactly that branch and head. Long-lived branches (the `--into` branch,
-the proving PR's base, origin's default branch, `main`, `master`, `develop`,
+the proving PR's base, origin's default branch as `git ls-remote --symref origin HEAD`
+reports it now (unreadable: exit 3, nothing removed), `main`, `master`, `develop`,
 `development`, `staging`, `production`, `release/*`, `hotfix/*`) are never deleted.
 `--keep-remote` leaves remote branches alone.
 

@@ -28,7 +28,7 @@ type PR struct {
 
 // prJQ prints one tab-separated line per PR. Every field is always present,
 // so a line with a different field count is malformed output.
-const prJQ = `.[] | "\(.number)\t\(.state)\t\(.baseRefName)\t\(.headRefName)\t\(.headRefOid)\t\(.headRepository.nameWithOwner // "")"`
+const prJQ = `.[] | "\(.number)\t\(.state)\t\(.baseRefName // "")\t\(.headRefName // "")\t\(.headRefOid // "")\t\(.headRepository.nameWithOwner // "")"`
 
 // branchPRs lists the PRs of remote's repository (any state, any base)
 // whose head branch is exactly branch. gh runs with stdin closed and a
@@ -89,6 +89,12 @@ func branchPRs(ctx context.Context, env Env, dir, remote, branch string) ([]PR, 
 		case "OPEN", "CLOSED", "MERGED":
 		default:
 			return nil, fmt.Errorf("unexpected PR state in gh output %q", line)
+		}
+		if f[2] == "" {
+			return nil, fmt.Errorf("missing PR base in gh output %q", line)
+		}
+		if !isHexOID(f[4]) {
+			return nil, fmt.Errorf("unexpected PR head OID in gh output %q", line)
 		}
 		// gh's --head filter is the authority on the branch, but check it
 		// again: the proof must be about exactly this branch.

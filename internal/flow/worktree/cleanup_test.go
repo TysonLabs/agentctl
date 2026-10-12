@@ -75,8 +75,11 @@ func TestRunCleanupSuccessFailureTimeoutAndNoWordSplitting(t *testing.T) {
 func TestCleanupCommandsReadsLocalGitConfig(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
+	global := filepath.Join(t.TempDir(), "global.gitconfig")
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	git(t, f.repo, "config", "--global", "--add", CleanupKey, "must-not-run")
 	if cmds, err := CleanupCommands(ctx, f.env, f.repo); err != nil || len(cmds) != 0 {
-		t.Fatalf("unset: %q %v", cmds, err)
+		t.Fatalf("global config must not enable a per-repository hook: %q %v", cmds, err)
 	}
 	git(t, f.repo, "config", "--add", CleanupKey, "a {slug}")
 	git(t, f.repo, "config", "--add", CleanupKey, "b")
