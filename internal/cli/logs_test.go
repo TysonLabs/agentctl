@@ -60,7 +60,7 @@ func TestLogsPassesFiltersEncoded(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, errOut)
 	}
 	q := (*qs)[0]
-	if q.Get("q") != "dial customer|TEST & co" || q.Get("level") != "warn" || q.Get("limit") != "40" {
+	if q.Get("q") != "dial customer|TEST & co" || q.Get("match") != "substring" || q.Get("level") != "warn" || q.Get("limit") != "40" {
 		t.Errorf("query = %v", q)
 	}
 	since, err := time.Parse(time.RFC3339Nano, q.Get("since"))
@@ -71,6 +71,10 @@ func TestLogsPassesFiltersEncoded(t *testing.T) {
 	run(t, "--config", cfg2, "logs", "payments.dev", "--since", "2026-10-03T14:00:00Z")
 	if got := (*qs2)[0].Get("since"); got != "2026-10-03T14:00:00Z" {
 		t.Errorf("absolute since = %q", got)
+	}
+	// Without --q there is nothing to match: no match parameter.
+	if (*qs2)[0].Has("match") {
+		t.Errorf("match sent without --q: %v", (*qs2)[0])
 	}
 }
 

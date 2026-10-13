@@ -137,6 +137,11 @@ func (a *app) cmdLogs(args []string) error {
 	query := url.Values{}
 	if lo.q != "" {
 		query.Set("q", lo.q)
+		// --q promises a case-insensitive substring. Services whose q is a
+		// regexp by default (vector-payments) switch to a literal,
+		// case-insensitive match on match=substring; services that already
+		// match a substring (recursivecx) ignore the parameter.
+		query.Set("match", "substring")
 	}
 	if lo.level != "" {
 		query.Set("level", lo.level)
