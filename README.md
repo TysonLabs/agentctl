@@ -201,7 +201,11 @@ controls (C0, DEL, C1, and Unicode bidirectional controls) are dropped, so log c
 inject escapes or visually reorder an entry. Configured bearer-token values are scrubbed.
 
 `--q` (substring), `--level` (minimum severity) and `--limit` are passed to the service,
-which does the filtering. `--since` takes a duration back from now (`30m`) or an RFC 3339
+which does the filtering. `--q` is sent with `match=substring`: vector-payments then takes it
+as a case-insensitive literal (its `q` alone is a case-sensitive RE2 regexp), and
+recursivecx ignores the parameter (its `q` is always a case-insensitive substring).
+vector-dialer-v2 and agentassist-callcenter do not read `match` yet: there `--q` is still a
+case-sensitive RE2 regexp, so escape `.`, `(`, `|` and similar characters. `--since` takes a duration back from now (`30m`) or an RFC 3339
 time. `--wait DUR` polls every `--interval` (default 15s) until an entry matches, counting only
 entries newer than the start of the wait (or `--since`). Without an explicit `--since`, an
 initial read uses the service's HTTP `Date` to account for clock skew; subsequent polls keep

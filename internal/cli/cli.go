@@ -35,7 +35,9 @@ Flags (before or after the subcommand):
   --help           this screen
 
 Log flags (logs only):
-  --q TEXT         case-insensitive substring filter (the service applies it)
+  --q TEXT         case-insensitive substring filter (the service applies it;
+                   sent with match=substring — see README for services whose
+                   q is still a regexp)
   --level LEVEL    minimum severity: error, warn, info, debug or trace
   --since WHEN     a duration back from now (30m, 2h) or an RFC 3339 time
   --limit N        at most N entries (the service caps it)
