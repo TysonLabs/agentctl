@@ -173,6 +173,12 @@ func teardownMerged(ctx context.Context, res pr.MergeResult) *teardownResult {
 		td.Status, td.Reason = teardownSkipped, "GitHub did not report the head branch"
 		return td
 	}
+	// An interrupt stops the teardown, not the merge: the worktree stays for
+	// a later done or sweep.
+	if ctx.Err() != nil {
+		td.Status, td.Reason = teardownSkipped, "interrupted before the teardown"
+		return td
+	}
 	dir, err := os.Getwd()
 	if err != nil || !gitWorkTree(ctx, dir) {
 		td.Status, td.Reason = teardownSkipped, "the current directory is not a git checkout"
@@ -183,19 +189,19 @@ func teardownMerged(ctx context.Context, res pr.MergeResult) *teardownResult {
 		td.Status, td.Reason = teardownError, err.Error()
 		return td
 	}
-	found := false
+	foundPath := ""
 	for _, w := range list {
 		if !w.Main && w.Branch == res.HeadBranch {
-			found = true
+			foundPath = w.Path
 			break
 		}
 	}
-	if !found {
+	if foundPath == "" {
 		td.Status = teardownNone
 		return td
 	}
 	var out, errOut bytes.Buffer
-	code := runWorktree(ctx, []string{"done", res.HeadBranch, "--repo", dir, "--format", "json"}, &out, &errOut)
+	code := runWorktree(ctx, []string{"done", foundPath, "--repo", dir, "--format", "json"}, &out, &errOut)
 	if json.Valid(out.Bytes()) {
 		td.Done = json.RawMessage(bytes.TrimSpace(out.Bytes()))
 	}

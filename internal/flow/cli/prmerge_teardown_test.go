@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -56,6 +57,45 @@ func TestTeardownRefusedKeepsTheWorktree(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("worktree removed after a refusal: %v", err)
+	}
+}
+
+func TestTeardownInterruptedKeepsTheWorktree(t *testing.T) {
+	root, seed, repo := cliRepo(t)
+	path, tip := branchWorktree(t, root, repo, "feat/canceled-after-merge")
+	squashIntoDevelopment(t, seed, "feat/canceled-after-merge")
+	setFakePRs(t, root, prFake{10, "MERGED", "development", "feat/canceled-after-merge", tip, nil})
+	t.Chdir(repo)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	td := teardownMerged(ctx, pr.MergeResult{Status: pr.MergeMerged, HeadBranch: "feat/canceled-after-merge"})
+	if td.Status != teardownSkipped || !strings.Contains(td.Reason, "interrupted") {
+		t.Fatalf("got %+v (done: %s)", td, td.Done)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("worktree removed after an interrupt: %v", err)
+	}
+}
+
+func TestTeardownUsesTheExactWorktreePath(t *testing.T) {
+	root, seed, repo := cliRepo(t)
+	path, tip := branchWorktree(t, root, repo, "collision")
+	other := filepath.Join(root, "collision")
+	cliGit(t, repo, "worktree", "add", "-q", "-b", "feat/other", other, "origin/development")
+	squashIntoDevelopment(t, seed, "collision")
+	setFakePRs(t, root, prFake{11, "MERGED", "development", "collision", tip, nil})
+	t.Chdir(repo)
+
+	td := teardownMerged(context.Background(), pr.MergeResult{Status: pr.MergeMerged, HeadBranch: "collision"})
+	if td.Status != teardownRemoved {
+		t.Fatalf("got %+v (done: %s)", td, td.Done)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("head worktree still exists (%v)", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Fatalf("unrelated colliding worktree was removed: %v", err)
 	}
 }
 

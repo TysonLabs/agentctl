@@ -310,10 +310,23 @@ func Inspect(ctx context.Context, env Env, w Worktree, t Target) (Check, error) 
 	if err != nil {
 		return c, err
 	}
+	root, err := os.OpenRoot(w.Path)
+	if err != nil {
+		return c, err
+	}
+	defer root.Close()
 	var lost []string
 	for _, l := range nonEmptyLines(dirty) {
 		if f, ok := scratchFile(l); ok {
-			c.ScratchFiles = append(c.ScratchFiles, f)
+			fi, err := root.Lstat(filepath.FromSlash(f))
+			switch {
+			case err == nil && fi.Mode().IsRegular():
+				c.ScratchFiles = append(c.ScratchFiles, f)
+			case err == nil, errors.Is(err, fs.ErrNotExist):
+				lost = append(lost, l)
+			default:
+				return c, err
+			}
 		} else {
 			lost = append(lost, l)
 		}
@@ -346,11 +359,22 @@ func Inspect(ctx context.Context, env Env, w Worktree, t Target) (Check, error) 
 const scratchDir = ".claude/"
 
 // scratchFile reports whether a `git status --porcelain` line is an untracked
-// regular file under scratchDir, and returns its path. A quoted path or a
-// directory entry ("?? dir/", e.g. a nested repository) never counts.
+// regular-file candidate under scratchDir, and returns its path. Git quotes
+// paths containing spaces and other special characters, so decode its
+// C-style quoting before classifying the path. Inspect verifies the file type.
+// A directory entry ("?? dir/", e.g. a nested repository) never counts.
 func scratchFile(line string) (string, bool) {
 	f, ok := strings.CutPrefix(line, "?? ")
-	if !ok || !strings.HasPrefix(f, scratchDir) || strings.HasPrefix(f, `"`) || strings.HasSuffix(f, "/") ||
+	if !ok {
+		return "", false
+	}
+	if strings.HasPrefix(f, `"`) {
+		var err error
+		if f, err = strconv.Unquote(f); err != nil {
+			return "", false
+		}
+	}
+	if !strings.HasPrefix(f, scratchDir) || strings.HasSuffix(f, "/") ||
 		len(f) == len(scratchDir) || strings.Contains(f, "/../") || strings.HasSuffix(f, "/..") {
 		return "", false
 	}
@@ -796,18 +820,31 @@ func Remove(ctx context.Context, env Env, repoDir string, c Check, t Target, del
 	if !fresh.OK {
 		return r, fmt.Errorf("%w: safety changed after inspection: %s", ErrRefused, strings.Join(fresh.Refusals, "; "))
 	}
+	root, err := os.OpenRoot(c.Path)
+	if err != nil {
+		return r, err
+	}
+	defer root.Close()
 	// git worktree remove refuses untracked files, so delete the scratch the
 	// fresh inspection found. A file that appears after it still makes git
 	// refuse below.
 	for _, f := range fresh.ScratchFiles {
-		p := filepath.Join(c.Path, f)
+		name := filepath.FromSlash(f)
+		p := filepath.Join(c.Path, name)
 		if !pathWithin(c.Path, p) {
 			return r, fmt.Errorf("%w: scratch path %s escapes the worktree", ErrRefused, f)
 		}
-		if fi, err := os.Lstat(p); err == nil && !fi.Mode().IsRegular() && fi.Mode()&fs.ModeSymlink == 0 {
+		fi, err := root.Lstat(name)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return r, err
+		}
+		if !fi.Mode().IsRegular() {
 			return r, fmt.Errorf("%w: scratch path %s is not a file", ErrRefused, f)
 		}
-		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return r, err
 		}
 		r.ScratchDeleted = append(r.ScratchDeleted, f)

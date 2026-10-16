@@ -681,6 +681,45 @@ func TestClaudeScratchIsDeletedWithTheWorktree(t *testing.T) {
 	}
 }
 
+func TestClaudeScratchWithQuotedNameIsDeleted(t *testing.T) {
+	f := newFixture(t)
+	path := f.worktree("feat/quoted-brief")
+	f.mergeOnOrigin("feat/quoted-brief")
+	writeFile(t, path, ".claude/review brief.md", "brief\n")
+	c := f.inspect("feat/quoted-brief")
+	if !c.OK || len(c.ScratchFiles) != 1 || c.ScratchFiles[0] != ".claude/review brief.md" {
+		t.Fatalf("got %+v", c)
+	}
+	r := f.remove(c, false)
+	if len(r.ScratchDeleted) != 1 || r.ScratchDeleted[0] != ".claude/review brief.md" {
+		t.Fatalf("scratch_deleted = %v", r.ScratchDeleted)
+	}
+}
+
+func TestClaudeSymlinkIsNotScratch(t *testing.T) {
+	f := newFixture(t)
+	path := f.worktree("feat/claude-link")
+	f.mergeOnOrigin("feat/claude-link")
+	if err := os.MkdirAll(filepath.Join(path, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(path, ".claude", "notes")
+	if err := os.Symlink(filepath.Join(f.root, "outside-notes"), link); err != nil {
+		t.Fatal(err)
+	}
+	c := f.inspect("feat/claude-link")
+	if c.OK || !refusedFor(c, "1 modified or untracked file(s) would be lost") || len(c.ScratchFiles) != 0 {
+		t.Fatalf("got %+v", c)
+	}
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("symlink was not preserved: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("symlink was replaced: mode=%v", fi.Mode())
+	}
+}
+
 func TestScratchDoesNotHideOtherWork(t *testing.T) {
 	for _, name := range []string{"untracked", "tracked-claude-file"} {
 		t.Run(name, func(t *testing.T) {
@@ -713,7 +752,7 @@ func TestScratchFileClassifier(t *testing.T) {
 		"?? .claude/brief.md":       ".claude/brief.md",
 		"?? .claude/a/b.md":         ".claude/a/b.md",
 		"?? .claude/worktrees/x/":   "",
-		"?? \".claude/a b.md\"":     "",
+		"?? \".claude/a b.md\"":     ".claude/a b.md",
 		" M .claude/settings.json":  "",
 		"?? .claudex/brief.md":      "",
 		"?? .claude/../src/main.go": "",
