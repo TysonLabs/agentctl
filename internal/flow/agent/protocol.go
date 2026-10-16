@@ -35,13 +35,21 @@ type ProtocolPrompt struct {
 	Lessons  bool     // a learned-checks section follows: explain the [learned lNNN] tag
 }
 
+// reachableRule is the bar for a finding, shared by both modes. A reviewer
+// asked to find defects always finds something; the bar keeps hardening for
+// inputs that never arrive out of the code and in "Not fixed" as a note.
+const reachableRule = `- A real defect is wrong behaviour, a broken guarantee, a security hole or a missed case. Skip style and taste.
+- A finding must be reachable today. In WHY, name the real input and the real caller or path that sends it, and the wrong result: money, data, security or a broken contract.
+- A problem that needs a corrupt stored row, a misbehaving upstream service or an input no caller sends is not a finding. List it under "Not fixed" as "unreachable: <what>, <what it would need>".
+- "None." is a normal, expected answer. Do not search for something to report.
+`
+
 const fixHeader = `## Review protocol: fix mode
 
 You review a change that another agent wrote. Find the real defects in it and fix them.
 
 Rules:
-- A real defect is wrong behaviour, a broken guarantee, a security hole or a missed case. Skip style and taste.
-- Fix each defect in the working tree.
+` + reachableRule + `- Fix each real defect in the working tree. Change no code for an unreachable problem.
 - Do not commit, stage, push or open a pull request.
 - Edit only files inside this repository.
 - Add no new dependency unless the fix needs it. If you add one, say why in FIX.
@@ -56,8 +64,7 @@ const reviewHeader = `## Review protocol: review mode
 You review a change that another agent wrote. Find the real defects in it and report them.
 
 Rules:
-- A real defect is wrong behaviour, a broken guarantee, a security hole or a missed case. Skip style and taste.
-- Do not edit, create or delete any file.
+` + reachableRule + `- Do not edit, create or delete any file.
 - For each defect, give the failing scenario, the fix you suggest and a test that would catch it.
 - If you see a problem that you judge is not worth fixing, list it under "Not fixed" with the reason.
 `
@@ -74,7 +81,7 @@ Your final message must have this shape. A program reads it.
 ## Findings
 
 ### F1 [<severity>] <path>:<line>
-WHY: <the failing scenario: the input or steps, and the wrong result>
+WHY: <the failing scenario: the real input, the caller or path that sends it, and the wrong result>
 FIX: <FIXTEXT>
 TEST: <TESTTEXT>
 

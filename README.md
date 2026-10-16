@@ -392,6 +392,13 @@ brief, and the prompt is assembled in this order:
 
 `--max-prompt-bytes` counts all of it.
 
+Both modes hold a finding to one bar. It must be reachable today: WHY names the real input,
+the caller or path that sends it, and the wrong result (money, data, security or a broken
+contract). A problem that needs a corrupt stored row, a misbehaving upstream service or an
+input no caller sends is not a finding: the reviewer changes no code for it and lists it
+under `## Not fixed` as `unreachable: <what>, <what it would need>`. `None.` is a normal
+answer, and the reviewer is told not to search for something to report.
+
 - **`fix`** needs `--write`. The rules: fix each real defect in the working tree; don't
   commit; edit only files in the repository; add no dependency the fix doesn't need;
   add one test per fix that fails without it; run the targeted tests; list deliberate
@@ -415,7 +422,7 @@ TEST: the test that fails without the fix
 
 ## Not fixed
 
-- what was left, and why (or "None.")
+- what was left, and why (or "None."); an unreachable problem as "unreachable: …"
 ```
 
 Severity is `Blocker`, `Major` or `Minor`. With `--lessons`, a learned-check finding ends

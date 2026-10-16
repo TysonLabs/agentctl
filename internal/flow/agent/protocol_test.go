@@ -138,6 +138,12 @@ func TestWrapBrief(t *testing.T) {
 		}
 	}
 	for _, s := range []string{fix, review} {
+		for _, want := range []string{"must be reachable today", "the real caller", `"unreachable: `, "corrupt stored row",
+			"misbehaving upstream service", `"None." is a normal, expected answer`} {
+			if !strings.Contains(s, want) {
+				t.Errorf("protocol missing the reachability bar %q", want)
+			}
+		}
 		if strings.Contains(s, "[learned") {
 			t.Error("learned tag explained without --lessons")
 		}
