@@ -658,3 +658,71 @@ func TestBranchPRsParsesHeadRepositoryAndFiltersBranch(t *testing.T) {
 		t.Fatalf("other branch: %+v %v", prs, err)
 	}
 }
+
+// Agent briefs left in .claude/ blocked teardown of merged worktrees
+// (vector-payments ui/batch3-nav, 2026-10-16): they are scratch, deleted with
+// the worktree, while any other untracked or modified file still refuses.
+func TestClaudeScratchIsDeletedWithTheWorktree(t *testing.T) {
+	f := newFixture(t)
+	path := f.worktree("feat/brief")
+	f.mergeOnOrigin("feat/brief")
+	writeFile(t, path, ".claude/b3-brief.md", "brief\n")
+	writeFile(t, path, ".claude/notes/plan.md", "plan\n")
+	c := f.inspect("feat/brief")
+	if !c.OK || len(c.ScratchFiles) != 2 {
+		t.Fatalf("got %+v", c)
+	}
+	r := f.remove(c, false)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("worktree dir still exists (%v)", err)
+	}
+	if len(r.ScratchDeleted) != 2 {
+		t.Errorf("scratch_deleted = %v, want both files", r.ScratchDeleted)
+	}
+}
+
+func TestScratchDoesNotHideOtherWork(t *testing.T) {
+	for _, name := range []string{"untracked", "tracked-claude-file"} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			branch := "feat/" + name
+			path := f.worktree(branch)
+			if name == "tracked-claude-file" {
+				writeFile(t, path, ".claude/settings.json", "{}\n")
+				git(t, path, "add", ".claude/settings.json")
+				git(t, path, "commit", "-qm", "settings")
+				git(t, path, "push", "-q", "origin", branch)
+			}
+			f.mergeOnOrigin(branch)
+			writeFile(t, path, ".claude/brief.md", "brief\n")
+			if name == "untracked" {
+				writeFile(t, path, "notes/draft.md", "keep me\n")
+			} else {
+				writeFile(t, path, ".claude/settings.json", "{\"changed\":true}\n")
+			}
+			c := f.inspect(branch)
+			if c.OK || !refusedFor(c, "1 modified or untracked file(s) would be lost") {
+				t.Fatalf("got %+v", c)
+			}
+		})
+	}
+}
+
+func TestScratchFileClassifier(t *testing.T) {
+	for line, want := range map[string]string{
+		"?? .claude/brief.md":       ".claude/brief.md",
+		"?? .claude/a/b.md":         ".claude/a/b.md",
+		"?? .claude/worktrees/x/":   "",
+		"?? \".claude/a b.md\"":     "",
+		" M .claude/settings.json":  "",
+		"?? .claudex/brief.md":      "",
+		"?? .claude/../src/main.go": "",
+		"?? notes/.claude/brief.md": "",
+		"?? .claude/":               "",
+	} {
+		got, ok := scratchFile(line)
+		if ok != (want != "") || got != want {
+			t.Errorf("scratchFile(%q) = %q, %v; want %q", line, got, ok, want)
+		}
+	}
+}

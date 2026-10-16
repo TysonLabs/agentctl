@@ -68,7 +68,9 @@ refuses (listing every reason) unless all of these hold:
     The refusal names an OPEN or CLOSED PR for the branch if there is one.
     A gh failure or timeout is a refusal (pr_error), never a pass.
   - clean: no modified or untracked files (ignored build output such as
-    target/ is deleted with the worktree)
+    target/ is deleted with the worktree, and so are untracked files under
+    .claude/, agent briefs and notes, listed in scratch_files and
+    scratch_deleted; a modified tracked .claude/ file still refuses)
   - unused: not locked, no process has its working directory inside, and no
     registered worktree or other Git repository is nested beneath it
   - removable without force: no initialized submodules

@@ -54,19 +54,21 @@ type Sync struct {
 
 // MergeResult is the machine-readable summary.
 type MergeResult struct {
-	Status    MergeStatus `json:"status"`
-	Repo      string      `json:"repo"`
-	PR        int         `json:"pr"`
-	Head      string      `json:"head,omitempty"`
-	Base      string      `json:"base,omitempty"`
-	Method    string      `json:"method"`
-	MergeSHA  string      `json:"merge_sha,omitempty"`
-	AutoMerge bool        `json:"auto_merge,omitempty"` // GitHub holds an auto-merge request for the PR
-	Sync      *Sync       `json:"sync,omitempty"`
-	Reasons   []string    `json:"reasons"`
-	Next      string      `json:"next,omitempty"`
-	CheckedAt string      `json:"checked_at"`
-	Error     string      `json:"error,omitempty"`
+	Status MergeStatus `json:"status"`
+	Repo   string      `json:"repo"`
+	PR     int         `json:"pr"`
+	Head   string      `json:"head,omitempty"`
+	// HeadBranch is the PR's head branch name (what pr merge --teardown removes).
+	HeadBranch string   `json:"head_branch,omitempty"`
+	Base       string   `json:"base,omitempty"`
+	Method     string   `json:"method"`
+	MergeSHA   string   `json:"merge_sha,omitempty"`
+	AutoMerge  bool     `json:"auto_merge,omitempty"` // GitHub holds an auto-merge request for the PR
+	Sync       *Sync    `json:"sync,omitempty"`
+	Reasons    []string `json:"reasons"`
+	Next       string   `json:"next,omitempty"`
+	CheckedAt  string   `json:"checked_at"`
+	Error      string   `json:"error,omitempty"`
 }
 
 // branchRe is the character grammar for --sync-branch: it goes into a REST
@@ -87,6 +89,7 @@ type prState struct {
 	State               string `json:"state"`
 	IsDraft             *bool  `json:"isDraft"`
 	HeadRefOid          string `json:"headRefOid"`
+	HeadRefName         string `json:"headRefName"`
 	BaseRefName         string `json:"baseRefName"`
 	Mergeable           string `json:"mergeable"`
 	IsMergeQueueEnabled *bool  `json:"isMergeQueueEnabled"`
@@ -140,7 +143,7 @@ func Merge(ctx context.Context, o MergeOptions) MergeResult {
 	if err != nil {
 		return finish(MergeGHError, "", err.Error())
 	}
-	res.Head, res.Base = strings.ToLower(st.HeadRefOid), st.BaseRefName
+	res.Head, res.HeadBranch, res.Base = strings.ToLower(st.HeadRefOid), st.HeadRefName, st.BaseRefName
 
 	if st.State != "OPEN" {
 		res.Reasons = append(res.Reasons, "PR is "+strings.ToLower(st.State))
@@ -304,7 +307,7 @@ func confirmMerged(ctx context.Context, o MergeOptions, pinned string) confirmat
 }
 
 const prQuery = `query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){` +
-	`state isDraft headRefOid baseRefName mergeable isMergeQueueEnabled autoMergeRequest{enabledAt} mergeCommit{oid}}}}`
+	`state isDraft headRefOid headRefName baseRefName mergeable isMergeQueueEnabled autoMergeRequest{enabledAt} mergeCommit{oid}}}}`
 
 // readPR reads the PR through GraphQL: gh pr view --json does not offer
 // isMergeQueueEnabled.

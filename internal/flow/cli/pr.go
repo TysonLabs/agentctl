@@ -103,9 +103,15 @@ read).
   --admin               pass --admin to gh pr merge (bypass branch rules)
   --sync-branch BRANCH  after the merge, fast-forward BRANCH to the base
                         branch's head on GitHub; never forced
+  --teardown            after a confirmed merge, run agentflow worktree done
+                        for the PR's head branch in the current checkout (run
+                        it from the main checkout). The JSON's "teardown" says
+                        removed, refused (reason), none (no worktree has the
+                        branch) or skipped; it never changes the exit code.
 
-It never deletes branches (gh's --delete-branch also switches and deletes
-local ones; use agentflow worktree done) and never enables auto-merge.
+It never deletes branches itself (gh's --delete-branch also switches and
+deletes local ones; --teardown uses agentflow worktree done, with all of its
+checks) and never enables auto-merge.
 
 Output: a JSON result on stdout with "merge_sha" (for agentflow ship verify
 --sha), "reasons" when refused, "sync" when --sync-branch is given, and
