@@ -779,7 +779,17 @@ agentflow worktree done feat/old --into main    # no PR? prove the merge by ance
 agentflow worktree sweep                        # list every worktree: owner, PR, verdict
 agentflow worktree sweep --yes --owner <job>    # remove only this job's, prune stale records
 agentflow worktree adopt ../repo-feat-x --owner <job>   # stamp a hand-made worktree
+agentflow pr merge 245 --head <sha> --teardown  # merge, then done for its head branch
 ```
+
+**Tear down when you merge.** Worktrees made by subagents outlive them: the subagent
+ends before the merge, so nobody runs `done`. `agentflow pr merge --teardown`, run from
+the main checkout, runs `done` for the PR's head branch right after a confirmed merge,
+with every check below. Its JSON `teardown` says `removed`, `refused` (with the reason),
+`none` (no worktree has that branch) or `skipped` (not merged); the merge's exit code
+never changes. A session inside the worktree (Claude Code's `caffeinate`, a background
+shell) makes `done` refuse "in use": leave it first, then run `done` from the main
+checkout.
 
 Agents tend to clean up with `git worktree remove --force` and `git branch -D`. That
 works, and it also deletes uncommitted work and unmerged branches without a word.
@@ -798,7 +808,11 @@ works, and it also deletes uncommitted work and unmerged branches without a word
   runs with stdin closed and a 30 s bound; a missing, failing or timed-out `gh` is a
   refusal (`pr_error`), never a pass.
 - **Clean:** no modified or untracked files. Ignored build output (`target/`,
-  `node_modules/`) goes with the worktree, so `--force` is never needed.
+  `node_modules/`) goes with the worktree, so `--force` is never needed. Untracked
+  regular files under `.claude/` (agent briefs and notes) are scratch: listed in
+  `scratch_files`, deleted with the worktree after the final check and listed in
+  `removed.scratch_deleted`. A modified tracked `.claude/` file, a directory entry
+  there (such as a nested repository) or any other untracked file still refuses.
 - **Unused:** not locked (the lock reason and whether its owner pid is alive are
   shown), no process has its working directory inside (via `lsof`), and no
   registered worktree or other Git repository is nested beneath it. Initialized

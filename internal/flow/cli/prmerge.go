@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/TysonLabs/agentctl/internal/flow/pr"
+	"github.com/TysonLabs/agentctl/internal/flow/worktree"
 )
 
 var prMergeExitCodes = map[pr.MergeStatus]int{
@@ -44,6 +46,7 @@ func runPRMerge(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	fs.StringVar(&o.Head, "head", "", "")
 	fs.BoolVar(&o.Admin, "admin", false, "")
 	fs.StringVar(&o.SyncBranch, "sync-branch", "", "")
+	teardown := fs.Bool("teardown", false, "")
 	format := formatFlag(fs)
 	pos, err := parseInterleaved(fs, args)
 	if err != nil {
@@ -104,12 +107,22 @@ func runPRMerge(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	}
 
 	res := pr.Merge(ctx, o)
-	out, _ := json.MarshalIndent(res, "", "  ")
+	var td *teardownResult
+	if *teardown {
+		td = teardownMerged(ctx, res)
+	}
+	out, _ := json.MarshalIndent(struct {
+		pr.MergeResult
+		Teardown *teardownResult `json:"teardown,omitempty"`
+	}{res, td}, "", "  ")
 	code, ok := prMergeExitCodes[res.Status]
 	if !ok {
 		code = 1
 	}
-	emit(stdout, *format, append(out, '\n'), func() string { return mergeText(res, code) })
+	emit(stdout, *format, append(out, '\n'), func() string { return mergeText(res, td, code) })
+	if td != nil && (td.Status == teardownRefused || td.Status == teardownError) {
+		fmt.Fprintf(stderr, "agentflow pr merge: teardown %s: %s\n", td.Status, td.Reason)
+	}
 	if !ok {
 		fmt.Fprintf(stderr, "agentflow pr merge: unknown result status %q\n", res.Status)
 		return code
@@ -127,4 +140,78 @@ func runPRMerge(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "agentflow pr merge: %s: %s\n", res.Status, msg)
 	}
 	return code
+}
+
+// Teardown statuses. A teardown never changes the merge's exit code: the PR
+// is merged either way; the JSON and stderr say what happened to its worktree.
+const (
+	teardownRemoved = "removed" // the head branch's worktree and branch are gone
+	teardownRefused = "refused" // worktree done refused (reason says why); nothing removed
+	teardownNone    = "none"    // no worktree of this checkout has the head branch
+	teardownSkipped = "skipped" // not merged, head branch unknown or not in a checkout
+	teardownError   = "error"   // worktree done could not run or failed
+)
+
+type teardownResult struct {
+	Branch string          `json:"branch,omitempty"`
+	Status string          `json:"status"`
+	Reason string          `json:"reason,omitempty"`
+	Done   json.RawMessage `json:"done,omitempty"` // worktree done's own JSON
+}
+
+// teardownMerged runs worktree done for a merged PR's head branch in the
+// current directory's checkout, so the session that merges also removes the
+// worktree (subagents that made it have ended by then). Run it from the main
+// checkout: a process inside the worktree makes done refuse.
+func teardownMerged(ctx context.Context, res pr.MergeResult) *teardownResult {
+	td := &teardownResult{Branch: res.HeadBranch}
+	if res.Status != pr.MergeMerged && res.Status != pr.MergeSyncFailed {
+		td.Status, td.Reason = teardownSkipped, "the PR is not confirmed merged"
+		return td
+	}
+	if res.HeadBranch == "" {
+		td.Status, td.Reason = teardownSkipped, "GitHub did not report the head branch"
+		return td
+	}
+	// An interrupt stops the teardown, not the merge: the worktree stays for
+	// a later done or sweep.
+	if ctx.Err() != nil {
+		td.Status, td.Reason = teardownSkipped, "interrupted before the teardown"
+		return td
+	}
+	dir, err := os.Getwd()
+	if err != nil || !gitWorkTree(ctx, dir) {
+		td.Status, td.Reason = teardownSkipped, "the current directory is not a git checkout"
+		return td
+	}
+	list, err := worktree.List(ctx, worktreeEnv(), dir)
+	if err != nil {
+		td.Status, td.Reason = teardownError, err.Error()
+		return td
+	}
+	foundPath := ""
+	for _, w := range list {
+		if !w.Main && w.Branch == res.HeadBranch {
+			foundPath = w.Path
+			break
+		}
+	}
+	if foundPath == "" {
+		td.Status = teardownNone
+		return td
+	}
+	var out, errOut bytes.Buffer
+	code := runWorktree(ctx, []string{"done", foundPath, "--repo", dir, "--format", "json"}, &out, &errOut)
+	if json.Valid(out.Bytes()) {
+		td.Done = json.RawMessage(bytes.TrimSpace(out.Bytes()))
+	}
+	switch code {
+	case 0:
+		td.Status = teardownRemoved
+	case 2:
+		td.Status, td.Reason = teardownRefused, strings.TrimSpace(errOut.String())
+	default:
+		td.Status, td.Reason = teardownError, strings.TrimSpace(errOut.String())
+	}
+	return td
 }

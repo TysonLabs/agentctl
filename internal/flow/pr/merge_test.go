@@ -91,6 +91,7 @@ func (f *mergeFake) prDoc() map[string]any {
 	}
 	if !f.omitHead {
 		pv["headRefOid"] = strings.ToUpper(head)
+		pv["headRefName"] = "feat/x"
 	}
 	switch f.queue {
 	case "":
@@ -170,7 +171,7 @@ func runMerge(f *mergeFake, mod func(*MergeOptions)) MergeResult {
 func TestMergeHappyPath(t *testing.T) {
 	f := &mergeFake{}
 	r := runMerge(f, nil)
-	if r.Status != MergeMerged || r.MergeSHA != mergeSHA || r.Head != head || r.Base != "main" || r.Sync != nil {
+	if r.Status != MergeMerged || r.MergeSHA != mergeSHA || r.Head != head || r.HeadBranch != "feat/x" || r.Base != "main" || r.Sync != nil {
 		t.Fatalf("got %+v", r)
 	}
 	m := f.called("pr", "merge")

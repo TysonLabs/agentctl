@@ -1,8 +1,9 @@
 // Package worktree removes finished git worktrees safely: only after
 // proving the branch is merged, the tree has no work that would be lost,
 // and nobody is using it. It never forces anything. Ignored files (build
-// output such as target/) are deleted with the worktree; untracked or
-// modified files make it refuse.
+// output such as target/) are deleted with the worktree, and so are untracked
+// files under .claude/ (agent scratch: briefs, notes); any other untracked or
+// modified file makes it refuse.
 //
 // Merge proof is either "GitHub shows a merged PR whose head branch and
 // head are exactly this branch and tip" (into whatever base that PR has;
@@ -267,6 +268,10 @@ type Check struct {
 	PRError string `json:"pr_error,omitempty"`
 	// Owner is the recorded creator (worktree new / adopt); "" = unknown.
 	Owner string `json:"owner,omitempty"`
+	// ScratchFiles are untracked files under .claude/ (agent briefs and
+	// notes, paths relative to the worktree). They do not block removal and
+	// are deleted with the worktree.
+	ScratchFiles []string `json:"scratch_files,omitempty"`
 
 	prProof    bool   // PRNumber is a merged PR with exactly this branch and head
 	prHeadRepo string // that PR's head repository (owner/name), "" = unknown
@@ -305,8 +310,29 @@ func Inspect(ctx context.Context, env Env, w Worktree, t Target) (Check, error) 
 	if err != nil {
 		return c, err
 	}
-	if lines := nonEmptyLines(dirty); len(lines) > 0 {
-		refuse("%d modified or untracked file(s) would be lost, e.g. %s", len(lines), strings.TrimSpace(lines[0]))
+	root, err := os.OpenRoot(w.Path)
+	if err != nil {
+		return c, err
+	}
+	defer root.Close()
+	var lost []string
+	for _, l := range nonEmptyLines(dirty) {
+		if f, ok := scratchFile(l); ok {
+			fi, err := root.Lstat(filepath.FromSlash(f))
+			switch {
+			case err == nil && fi.Mode().IsRegular():
+				c.ScratchFiles = append(c.ScratchFiles, f)
+			case err == nil, errors.Is(err, fs.ErrNotExist):
+				lost = append(lost, l)
+			default:
+				return c, err
+			}
+		} else {
+			lost = append(lost, l)
+		}
+	}
+	if len(lost) > 0 {
+		refuse("%d modified or untracked file(s) would be lost, e.g. %s", len(lost), strings.TrimSpace(lost[0]))
 	}
 	contained, err := containedRefusals(ctx, env, w.Path)
 	if err != nil {
@@ -326,6 +352,33 @@ func Inspect(ctx context.Context, env Env, w Worktree, t Target) (Check, error) 
 	}
 	c.OK = len(c.Refusals) == 0
 	return c, nil
+}
+
+// scratchDir holds agent scratch (briefs, notes) that a finished worktree may
+// lose: Claude Code sessions write it, and it is never part of the change.
+const scratchDir = ".claude/"
+
+// scratchFile reports whether a `git status --porcelain` line is an untracked
+// regular-file candidate under scratchDir, and returns its path. Git quotes
+// paths containing spaces and other special characters, so decode its
+// C-style quoting before classifying the path. Inspect verifies the file type.
+// A directory entry ("?? dir/", e.g. a nested repository) never counts.
+func scratchFile(line string) (string, bool) {
+	f, ok := strings.CutPrefix(line, "?? ")
+	if !ok {
+		return "", false
+	}
+	if strings.HasPrefix(f, `"`) {
+		var err error
+		if f, err = strconv.Unquote(f); err != nil {
+			return "", false
+		}
+	}
+	if !strings.HasPrefix(f, scratchDir) || strings.HasSuffix(f, "/") ||
+		len(f) == len(scratchDir) || strings.Contains(f, "/../") || strings.HasSuffix(f, "/..") {
+		return "", false
+	}
+	return f, true
 }
 
 // containedRefusals lists what removing the tree at path would delete that
@@ -371,7 +424,7 @@ func inUseRefusal(ctx context.Context, env Env, path string) string {
 	if len(users) > 1 {
 		verb = "have their working directories"
 	}
-	return fmt.Sprintf("in use: %s %s inside", strings.Join(users, ", "), verb)
+	return fmt.Sprintf("in use: %s %s inside; leave it first (a Claude Code session: ExitWorktree or end it), then run done from the main checkout", strings.Join(users, ", "), verb)
 }
 
 func nestedWorktrees(ctx context.Context, env Env, root string) ([]string, error) {
@@ -724,10 +777,12 @@ func Prune(ctx context.Context, env Env, repoDir string) error {
 
 // Removed reports what Remove did.
 type Removed struct {
-	FreedBytes    int64  `json:"freed_bytes"`
-	BranchDeleted bool   `json:"branch_deleted"`
-	RemoteDeleted bool   `json:"remote_deleted"`
-	Note          string `json:"note,omitempty"`
+	FreedBytes    int64 `json:"freed_bytes"`
+	BranchDeleted bool  `json:"branch_deleted"`
+	RemoteDeleted bool  `json:"remote_deleted"`
+	// ScratchDeleted lists the untracked .claude/ files deleted with it.
+	ScratchDeleted []string `json:"scratch_deleted,omitempty"`
+	Note           string   `json:"note,omitempty"`
 }
 
 // Remove deletes a worktree that Inspect passed, then its branches. It
@@ -764,6 +819,35 @@ func Remove(ctx context.Context, env Env, repoDir string, c Check, t Target, del
 	}
 	if !fresh.OK {
 		return r, fmt.Errorf("%w: safety changed after inspection: %s", ErrRefused, strings.Join(fresh.Refusals, "; "))
+	}
+	root, err := os.OpenRoot(c.Path)
+	if err != nil {
+		return r, err
+	}
+	defer root.Close()
+	// git worktree remove refuses untracked files, so delete the scratch the
+	// fresh inspection found. A file that appears after it still makes git
+	// refuse below.
+	for _, f := range fresh.ScratchFiles {
+		name := filepath.FromSlash(f)
+		p := filepath.Join(c.Path, name)
+		if !pathWithin(c.Path, p) {
+			return r, fmt.Errorf("%w: scratch path %s escapes the worktree", ErrRefused, f)
+		}
+		fi, err := root.Lstat(name)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return r, err
+		}
+		if !fi.Mode().IsRegular() {
+			return r, fmt.Errorf("%w: scratch path %s is not a file", ErrRefused, f)
+		}
+		if err := root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return r, err
+		}
+		r.ScratchDeleted = append(r.ScratchDeleted, f)
 	}
 	if _, err := run(ctx, repoDir, env.Git, "worktree", "remove", c.Path); err != nil {
 		return r, err

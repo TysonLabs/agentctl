@@ -196,7 +196,7 @@ func replyText(res pr.ReplyResult, code int) string {
 	return t.String()
 }
 
-func mergeText(res pr.MergeResult, code int) string {
+func mergeText(res pr.MergeResult, td *teardownResult, code int) string {
 	t := render.New("pr merge", string(res.Status), code)
 	t.Field("repo", res.Repo).Field("pr", res.PR).Field("head", res.Head).Field("base", res.Base)
 	t.Field("method", res.Method).Field("merge_sha", res.MergeSHA)
@@ -212,6 +212,16 @@ func mergeText(res pr.MergeResult, code int) string {
 			line += ": " + s.Error
 		}
 		t.Field("sync", line)
+	}
+	if td != nil {
+		line := td.Status
+		if td.Branch != "" {
+			line = td.Branch + " " + line
+		}
+		if td.Reason != "" {
+			line += ": " + td.Reason
+		}
+		t.Field("teardown", line)
 	}
 	t.Field("next", res.Next).Field("error", res.Error)
 	for _, r := range res.Reasons {
