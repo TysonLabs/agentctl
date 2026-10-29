@@ -717,8 +717,15 @@ func keepBranch(branch string, t Target, prBase string) string {
 	return ""
 }
 
+// cwdIgnored names processes that may sit in a worktree without using it.
+// Claude Code runs `caffeinate -i -t 300` in the session's directory and
+// starts a new one every 5 minutes while the session works, so a session
+// that merged from inside the worktree always had one there. caffeinate
+// holds no file in it, and removing its working directory harms nothing.
+var cwdIgnored = map[string]bool{"caffeinate": true}
+
 // cwdUsers lists processes ("name (pid N)") whose working directory is
-// inside dir.
+// inside dir, except the ones in cwdIgnored.
 func cwdUsers(ctx context.Context, env Env, dir string) ([]string, error) {
 	cmd := exec.CommandContext(ctx, env.Lsof, "-d", "cwd", "-Fpcn")
 	out, err := cmd.Output()
@@ -740,7 +747,7 @@ func cwdUsers(ctx context.Context, env Env, dir string) ([]string, error) {
 			name = line[1:]
 		case 'n':
 			p := line[1:]
-			if pid == self {
+			if pid == self || cwdIgnored[name] {
 				continue
 			}
 			if p == root || strings.HasPrefix(p, root+string(filepath.Separator)) ||
