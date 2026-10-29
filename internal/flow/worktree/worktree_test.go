@@ -442,6 +442,24 @@ func TestLsofPartialOutputStillFailsClosed(t *testing.T) {
 	}
 }
 
+func TestCaffeinateDoesNotCountAsInUse(t *testing.T) {
+	dir := t.TempDir()
+	bin := t.TempDir()
+	lsof := filepath.Join(bin, "lsof")
+	writeFile(t, bin, "lsof", "#!/bin/sh\nprintf 'p101\\nccaffeinate\\nfcwd\\nn"+dir+
+		"\\np102\\ncsleep\\nfcwd\\nn"+dir+"/sub\\n'\n")
+	if err := os.Chmod(lsof, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	users, err := cwdUsers(context.Background(), Env{Lsof: lsof}, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 1 || users[0] != "sleep (pid 102)" {
+		t.Fatalf("cwdUsers = %v, want only sleep (pid 102)", users)
+	}
+}
+
 func TestLockedIsRefused(t *testing.T) {
 	f := newFixture(t)
 	path := f.worktree("feat/locked")

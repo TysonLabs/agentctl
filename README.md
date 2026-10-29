@@ -787,9 +787,10 @@ ends before the merge, so nobody runs `done`. `agentflow pr merge --teardown`, r
 the main checkout, runs `done` for the PR's head branch right after a confirmed merge,
 with every check below. Its JSON `teardown` says `removed`, `refused` (with the reason),
 `none` (no worktree has that branch) or `skipped` (not merged); the merge's exit code
-never changes. A session inside the worktree (Claude Code's `caffeinate`, a background
-shell) makes `done` refuse "in use": leave it first, then run `done` from the main
-checkout.
+never changes. A session inside the worktree (a background shell, a test run) makes
+`done` refuse "in use": leave it first, then run `done` from the main checkout. Claude
+Code's own `caffeinate` (it restarts every 5 minutes in the session's directory) does
+not count: it holds no file there.
 
 Agents tend to clean up with `git worktree remove --force` and `git branch -D`. That
 works, and it also deletes uncommitted work and unmerged branches without a word.
@@ -814,7 +815,8 @@ works, and it also deletes uncommitted work and unmerged branches without a word
   `removed.scratch_deleted`. A modified tracked `.claude/` file, a directory entry
   there (such as a nested repository) or any other untracked file still refuses.
 - **Unused:** not locked (the lock reason and whether its owner pid is alive are
-  shown), no process has its working directory inside (via `lsof`), and no
+  shown), no process has its working directory inside (via `lsof`; `caffeinate` is
+  ignored), and no
   registered worktree or other Git repository is nested beneath it. Initialized
   submodules are also refused because Git cannot remove their worktree without
   `--force`.
