@@ -118,6 +118,8 @@ func (f *mergeFake) gh(_ context.Context, args ...string) ([]byte, error) {
 			return nil, f.confirmErr
 		}
 		return json.Marshal(f.prDoc())
+	case args[0] == "api" && args[1] == "graphql" && strings.Contains(query, "stackEntry"):
+		return []byte(`{"data":{"repository":{"pullRequest":{"stackEntry":null,"stack":null}}}}`), nil
 	case args[0] == "api" && args[1] == "graphql" && strings.Contains(query, "reviewThreads"):
 		if f.draftAfterThreads {
 			f.draft = true

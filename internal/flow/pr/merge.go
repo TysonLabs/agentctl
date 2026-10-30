@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -41,7 +42,10 @@ type MergeOptions struct {
 	// accepts the merge.
 	ConfirmWait     time.Duration
 	ConfirmInterval time.Duration
-	GH              GH
+	// StackWait bounds how long a stacked PR's asynchronous merge is polled
+	// before its layers are read back.
+	StackWait time.Duration
+	GH        GH
 }
 
 // Sync reports the fast-forward of the sync branch.
@@ -59,16 +63,19 @@ type MergeResult struct {
 	PR     int         `json:"pr"`
 	Head   string      `json:"head,omitempty"`
 	// HeadBranch is the PR's head branch name (what pr merge --teardown removes).
-	HeadBranch string   `json:"head_branch,omitempty"`
-	Base       string   `json:"base,omitempty"`
-	Method     string   `json:"method"`
-	MergeSHA   string   `json:"merge_sha,omitempty"`
-	AutoMerge  bool     `json:"auto_merge,omitempty"` // GitHub holds an auto-merge request for the PR
-	Sync       *Sync    `json:"sync,omitempty"`
-	Reasons    []string `json:"reasons"`
-	Next       string   `json:"next,omitempty"`
-	CheckedAt  string   `json:"checked_at"`
-	Error      string   `json:"error,omitempty"`
+	HeadBranch string `json:"head_branch,omitempty"`
+	Base       string `json:"base,omitempty"`
+	Method     string `json:"method"`
+	MergeSHA   string `json:"merge_sha,omitempty"`
+	AutoMerge  bool   `json:"auto_merge,omitempty"` // GitHub holds an auto-merge request for the PR
+	// Stack is set when the PR is in a stack: the merge covered every
+	// unmerged layer up to it, and MergeSHA is the top layer's.
+	Stack     *StackMerge `json:"stack,omitempty"`
+	Sync      *Sync       `json:"sync,omitempty"`
+	Reasons   []string    `json:"reasons"`
+	Next      string      `json:"next,omitempty"`
+	CheckedAt string      `json:"checked_at"`
+	Error     string      `json:"error,omitempty"`
 }
 
 // branchRe is the character grammar for --sync-branch: it goes into a REST
@@ -114,6 +121,21 @@ func Merge(ctx context.Context, o MergeOptions) MergeResult {
 	}
 	if !fullSHARe.MatchString(strings.ToLower(o.Head)) && o.Head != "" {
 		return finish(MergeGHError, "", "--head must be a full 40-character commit sha")
+	}
+
+	// A stacked PR merges with every unmerged layer below it, through the
+	// asynchronous endpoint (the synchronous one refuses stacks). Where the
+	// schema has no stacks, GitHub cannot hold one, so the single-PR path is
+	// right.
+	si, err := readStack(ctx, o.GH, o.Repo, o.PR)
+	if ctx.Err() != nil {
+		return finish(MergeInterrupted, "", "interrupted")
+	}
+	if err != nil && !errors.Is(err, errNoStackSchema) {
+		return finish(MergeGHError, "", err.Error())
+	}
+	if si != nil {
+		return mergeStack(ctx, o, si, &res, finish)
 	}
 
 	// Read the potentially paginated thread list first, then read the PR

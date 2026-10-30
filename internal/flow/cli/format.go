@@ -196,7 +196,7 @@ func replyText(res pr.ReplyResult, code int) string {
 	return t.String()
 }
 
-func mergeText(res pr.MergeResult, td *teardownResult, code int) string {
+func mergeText(res pr.MergeResult, tds []*teardownResult, code int) string {
 	t := render.New("pr merge", string(res.Status), code)
 	t.Field("repo", res.Repo).Field("pr", res.PR).Field("head", res.Head).Field("base", res.Base)
 	t.Field("method", res.Method).Field("merge_sha", res.MergeSHA)
@@ -213,7 +213,23 @@ func mergeText(res pr.MergeResult, td *teardownResult, code int) string {
 		}
 		t.Field("sync", line)
 	}
-	if td != nil {
+	if st := res.Stack; st != nil {
+		t.Field("stack", fmt.Sprintf("#%d into %s, position %d of %d", st.Number, st.Base, st.Position, st.Size))
+		for _, l := range st.Layers {
+			line := fmt.Sprintf("#%d %s %s", l.PR, l.HeadBranch, l.Head)
+			if l.MergeSHA != "" {
+				line += " merged " + l.MergeSHA
+			}
+			t.Field("  layer", line)
+		}
+		if st.AsyncStatus != "" {
+			t.Field("async_status", st.AsyncStatus)
+		}
+	}
+	for _, td := range tds {
+		if td == nil {
+			continue
+		}
 		line := td.Status
 		if td.Branch != "" {
 			line = td.Branch + " " + line

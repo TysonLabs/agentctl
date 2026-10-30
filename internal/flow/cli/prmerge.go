@@ -40,6 +40,7 @@ func runPRMerge(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	o := pr.MergeOptions{
 		MergeableWait: 30 * time.Second, MergeableInterval: 3 * time.Second,
 		ConfirmWait: 20 * time.Second, ConfirmInterval: 2 * time.Second,
+		StackWait: 3 * time.Minute,
 	}
 	fs.StringVar(&o.Repo, "repo", "", "")
 	fs.StringVar(&o.Method, "method", "merge", "")
@@ -108,20 +109,33 @@ func runPRMerge(ctx context.Context, args []string, stdout, stderr io.Writer) in
 
 	res := pr.Merge(ctx, o)
 	var td *teardownResult
+	var tdLayers []*teardownResult
 	if *teardown {
 		td = teardownMerged(ctx, res)
+		// A stack merge also merged the layers below the requested PR: the
+		// merging session removes their worktrees too.
+		if res.Stack != nil {
+			for _, l := range res.Stack.Layers {
+				if l.HeadBranch != res.HeadBranch {
+					tdLayers = append(tdLayers, teardownBranch(ctx, res.Status, l.HeadBranch))
+				}
+			}
+		}
 	}
 	out, _ := json.MarshalIndent(struct {
 		pr.MergeResult
-		Teardown *teardownResult `json:"teardown,omitempty"`
-	}{res, td}, "", "  ")
+		Teardown       *teardownResult   `json:"teardown,omitempty"`
+		TeardownLayers []*teardownResult `json:"teardown_layers,omitempty"`
+	}{res, td, tdLayers}, "", "  ")
 	code, ok := prMergeExitCodes[res.Status]
 	if !ok {
 		code = 1
 	}
-	emit(stdout, *format, append(out, '\n'), func() string { return mergeText(res, td, code) })
-	if td != nil && (td.Status == teardownRefused || td.Status == teardownError) {
-		fmt.Fprintf(stderr, "agentflow pr merge: teardown %s: %s\n", td.Status, td.Reason)
+	emit(stdout, *format, append(out, '\n'), func() string { return mergeText(res, append([]*teardownResult{td}, tdLayers...), code) })
+	for _, t := range append([]*teardownResult{td}, tdLayers...) {
+		if t != nil && (t.Status == teardownRefused || t.Status == teardownError) {
+			fmt.Fprintf(stderr, "agentflow pr merge: teardown %s %s: %s\n", t.Branch, t.Status, t.Reason)
+		}
 	}
 	if !ok {
 		fmt.Fprintf(stderr, "agentflow pr merge: unknown result status %q\n", res.Status)
@@ -164,12 +178,17 @@ type teardownResult struct {
 // worktree (subagents that made it have ended by then). Run it from the main
 // checkout: a process inside the worktree makes done refuse.
 func teardownMerged(ctx context.Context, res pr.MergeResult) *teardownResult {
-	td := &teardownResult{Branch: res.HeadBranch}
-	if res.Status != pr.MergeMerged && res.Status != pr.MergeSyncFailed {
+	return teardownBranch(ctx, res.Status, res.HeadBranch)
+}
+
+// teardownBranch runs worktree done for one merged head branch.
+func teardownBranch(ctx context.Context, status pr.MergeStatus, branch string) *teardownResult {
+	td := &teardownResult{Branch: branch}
+	if status != pr.MergeMerged && status != pr.MergeSyncFailed {
 		td.Status, td.Reason = teardownSkipped, "the PR is not confirmed merged"
 		return td
 	}
-	if res.HeadBranch == "" {
+	if branch == "" {
 		td.Status, td.Reason = teardownSkipped, "GitHub did not report the head branch"
 		return td
 	}
@@ -191,7 +210,7 @@ func teardownMerged(ctx context.Context, res pr.MergeResult) *teardownResult {
 	}
 	foundPath := ""
 	for _, w := range list {
-		if !w.Main && w.Branch == res.HeadBranch {
+		if !w.Main && w.Branch == branch {
 			foundPath = w.Path
 			break
 		}

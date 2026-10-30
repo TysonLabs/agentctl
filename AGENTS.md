@@ -48,6 +48,11 @@ background and keep working; your harness tells you when it exits. Never wait in
    returns the existing PR on a rerun, and requests the CodeRabbit review on a
    non-default base. The body says what changed, how it was verified, and any review fix
    you did not take as written, with the reason.
+   For work that depends on an open PR, stack it: branch from that PR's branch
+   (`agentflow worktree new <branch> --from origin/<its branch>`) and open with
+   `--base <its branch> --stack --draft`. Mark it ready once the layer below is
+   reviewed clean. `agentflow pr merge` on a stacked PR merges every layer below it
+   too, after checking each one.
 7. **Handle every PR review thread.** If the repo uses CodeRabbit, run
    `agentflow pr wait <number>` in the background after each push that needs a review:
    exit 0 means the head is reviewed and clean, 10 lists the open threads (with ids) in

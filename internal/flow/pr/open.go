@@ -66,6 +66,9 @@ type OpenOptions struct {
 	Body     string
 	Draft    bool
 	Retarget bool // move an existing PR for this branch to Base instead of refusing
+	// Stack puts the PR on top of the GitHub stack of the PR whose head is
+	// Base (creating the stack if that PR is in none).
+	Stack bool
 	// ReviewMention is posted as a comment when the base is not the default
 	// branch (CodeRabbit skips those). "" posts nothing.
 	ReviewMention string
@@ -90,6 +93,7 @@ type OpenResult struct {
 	HeadSHA         string     `json:"head_sha,omitempty"` // the commit pushed and read back
 	PreviousBase    string     `json:"previous_base,omitempty"`
 	ReviewRequested bool       `json:"review_requested"`
+	Stack           *OpenStack `json:"stack,omitempty"`
 	Reasons         []string   `json:"reasons"`
 	Next            string     `json:"next,omitempty"`
 	CheckedAt       string     `json:"checked_at"`
@@ -260,6 +264,15 @@ func Open(ctx context.Context, o OpenOptions) OpenResult {
 		}
 		res.Reasons = append(res.Reasons, "more than one open PR has this branch as its head: "+strings.Join(nums, ", "))
 	}
+	var parent *stackParent
+	if o.Stack {
+		if parent, err = checkStackParent(ctx, o, base, def, existing, &res.Reasons); err != nil {
+			return fail(err)
+		}
+		if parent != nil {
+			res.Stack = &OpenStack{Parent: parent.pr}
+		}
+	}
 	if len(res.Reasons) > 0 {
 		return finish(OpenRefused, "fix the reasons listed, then run it again", "")
 	}
@@ -323,6 +336,15 @@ func Open(ctx context.Context, o OpenOptions) OpenResult {
 		return finish(OpenUnverified, "check the PR on GitHub", "read-back: "+err.Error())
 	} else if len(problems) > 0 {
 		return finish(OpenUnverified, "fix the PR on GitHub (gh pr edit), then run it again", strings.Join(problems, "; "))
+	}
+
+	// 6b. Put the PR on top of the layer below it in a GitHub stack.
+	if parent != nil {
+		st, err := linkStack(dctx, o, parent.pr, res.Number)
+		res.Stack = st
+		if err != nil {
+			return finish(OpenUnverified, "put the PR on top of the stack by hand (the PR page or gh stack), then run it again", "stack: "+err.Error())
+		}
 	}
 
 	// 7. CodeRabbit skips a PR whose base is not the default branch.
