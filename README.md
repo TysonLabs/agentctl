@@ -646,6 +646,7 @@ log}], log_dir, receipts, lock, warnings}`; a step's status is `passed`, `failed
 ```sh
 agentflow pr open --title "Add retry budget" --body-file pr.md            # base: the default branch
 agentflow pr open --title "Stacked step 2" --body-file pr.md --base feat/step-1
+agentflow pr open --title "Stacked step 2" --body-file pr.md --base feat/step-1 --stack --draft
 agentflow pr open --title "..." --body-file pr.md --draft --dir ../my-worktree
 ```
 
@@ -673,10 +674,19 @@ agentflow pr open --title "..." --body-file pr.md --draft --dir ../my-worktree
   default branch, so pr open comments `@coderabbitai review` there, once: a rerun finds
   the comment and does not post it again. `--reviewer-mention TEXT` changes the text;
   `--no-review-request` posts none.
+- **`--stack` puts the PR in a GitHub stack.** `--base` must be the head branch of exactly
+  one open PR (the layer below), and that PR must be the top of its stack; both are
+  checked before the push. After the read-back, the PR is added on top of that stack, or
+  a stack `[layer below, this PR]` is created, through GitHub's stack API, then read back
+  right above the layer below. JSON `stack`: `parent`, `number`, `position`, `action`
+  (`created`, `added`, or `already` on a rerun). A failure there is exit 4: the PR
+  exists, the stack link does not. Open upper layers with `--draft` and mark them ready
+  once the layer below is reviewed clean: a fix to a lower layer rebases every layer
+  above it, and every push starts a new review.
 
 JSON: `status`, `number`, `url`, `base`, `default_branch`, `head` (the branch), `head_sha`,
-`previous_base` (after `--retarget`), `review_requested`, `reasons`, `next` (for example
-`agentflow pr wait <number>`), `error`.
+`previous_base` (after `--retarget`), `review_requested`, `stack` (with `--stack`),
+`reasons`, `next` (for example `agentflow pr wait <number>`), `error`.
 
 | Exit | Status | Meaning |
 |---|---|---|
@@ -735,6 +745,52 @@ no token.
 | 10 | `open_threads` | the head is reviewed; fix, reply, then resolve each thread |
 | 124 | `timeout` | never reviewed before `--timeout`: request a review once, then ask a human |
 | 130 | `interrupted` | interrupted |
+
+### `agentflow pr merge`: merge a ready PR, or a stack, pinned to its head
+
+```sh
+agentflow pr merge 245 --head <sha>                                  # one PR
+agentflow pr merge 245 --head <sha> --method squash --sync-branch development --teardown
+agentflow pr merge 248 --head <sha of #248>                          # a stack: #246, #247, #248
+```
+
+It reads readiness immediately before the merge and refuses (exit 2, every reason
+listed) unless the PR is open, not a draft, mergeable, has no unresolved review thread
+from any author, its head is `--head`, and its base does not use a merge queue. It
+merges pinned to that head and counts the PR merged only when it reads back merged at
+that head (else exit 4, `unconfirmed`). `merge_sha` goes to `agentflow ship verify`.
+
+**Stacked PRs** ([GitHub stacks](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs)):
+merging a layer merges every unmerged layer below it too, in one atomic operation, and
+`gh pr merge` cannot do it (GitHub refuses the synchronous endpoint for stacks). For a
+PR in a stack, pr merge:
+
+- runs every check above on **every layer it covers**, and checks that each layer
+  targets the branch of the one below it (the bottom one the stack's base);
+- checks the history is linear (each head contains the layer below; the bottom contains
+  the base), so pinning the top head pins every layer: a push to a lower layer breaks
+  linearity and GitHub refuses the merge (rebase the stack, then rerun);
+- merges through `PUT /repos/{o}/{r}/pulls/{n}/merge-async` (API version 2026-03-10,
+  `merge_action=direct_merge`, `--admin` as `bypass_rules`) and polls the result for
+  up to 3 minutes;
+- reads every layer back merged at its checked head into the stack's base. JSON
+  `stack`: `number`, `base`, `position`, `size`, `layers` (each `pr`, `head`,
+  `head_branch`, `merge_sha`), `async_status`. `merge_sha` is the requested PR's,
+  which contains every layer. GitHub's `failed` with every layer still open is
+  `refused` (exit 2); any other mismatch is `unconfirmed` (exit 4);
+- with `--teardown`, removes every merged layer's worktree (`teardown_layers` holds
+  the lower layers').
+
+The layers above the merged one stay open; GitHub retargets them to the stack's base.
+
+| Exit | Status | Meaning |
+|---|---|---|
+| 0 | `merged` | merged (and synced) |
+| 1 | `gh_error` | usage or gh error before the merge call; nothing merged |
+| 2 | `refused` | not ready; nothing changed |
+| 3 | `sync_failed` | merged; the sync branch was not fast-forwarded |
+| 4 | `unconfirmed` | the merge call ran; its outcome was not confirmed |
+| 130 | `interrupted` | interrupted before the merge |
 
 ### `agentflow worktree new`: start from a fresh base, in one place
 

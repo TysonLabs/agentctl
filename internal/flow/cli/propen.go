@@ -29,6 +29,10 @@ open PR for the branch already exists, return it instead of opening another.
   --draft                  open the PR as a draft
   --retarget               an open PR for this branch with another base is
                            moved to B (default: refuse)
+  --stack                  put the PR on top of a GitHub stack: B must be the
+                           head branch of exactly one open PR (the layer
+                           below), and that PR the top of its stack; a stack
+                           [that PR, this PR] is created if it is in none
   --dir D                  the repository checkout (default: current directory)
   --repo OWNER/NAME        GitHub repository (default: D's, from gh; never
                            guessed)
@@ -51,6 +55,14 @@ such a base pr open comments the review request, once (a rerun finds it).
 After opening, the PR is read back: it must be open, on the base, at the
 pushed commit and, when pr open sent the body, carry that body. An existing
 PR's title and body are never changed.
+
+With --stack, the PR is then put on top of the layer below (GitHub's stack
+API) and read back right above it; "stack" in the JSON gives the stack's
+number, the PR's position and the action (created, added, or already on a
+rerun). A failure there is exit 4: the PR exists, the stack link does not.
+Keep upper layers as drafts until the layer below is reviewed clean: a fix
+pushed to a lower layer rebases every layer above it, and each push starts
+a new review.
 
 Output: a JSON result on stdout: status (created, existing, retargeted,
 refused, error, unverified, interrupted), number, url, base, head (the
@@ -88,6 +100,7 @@ func runPROpen(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	fs.StringVar(&o.Base, "base", "", "")
 	fs.BoolVar(&o.Draft, "draft", false, "")
 	fs.BoolVar(&o.Retarget, "retarget", false, "")
+	fs.BoolVar(&o.Stack, "stack", false, "")
 	fs.StringVar(&dir, "dir", "", "")
 	fs.StringVar(&o.Repo, "repo", "", "")
 	fs.BoolVar(&noReview, "no-review-request", false, "")
@@ -130,6 +143,9 @@ func runPROpen(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	}
 	if strings.ContainsAny(o.Title, "\r\n") {
 		return fail("--title must be one line")
+	}
+	if o.Stack && o.Base == "" {
+		return fail("--stack needs --base: the branch of the layer below")
 	}
 	if o.Base != "" && !pr.ValidBranch(o.Base) {
 		return fail("--base %q is not a plain branch name", o.Base)

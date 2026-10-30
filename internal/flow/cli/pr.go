@@ -113,6 +113,22 @@ It never deletes branches itself (gh's --delete-branch also switches and
 deletes local ones; --teardown uses agentflow worktree done, with all of its
 checks) and never enables auto-merge.
 
+Stacked PRs (GitHub stacks): merging a PR in a stack merges every unmerged
+layer below it too, bottom up, in one atomic GitHub operation. pr merge then
+checks EVERY layer it covers: each is open, not a draft, mergeable, has no
+unresolved thread, targets the branch of the layer below (the bottom one the
+stack's base), and no base uses a merge queue. The history must be linear:
+each head contains the layer below it, and the bottom contains the base
+(else: rebase the stack). It merges through GitHub's asynchronous merge
+endpoint (gh pr merge cannot merge a stack), pinned to the requested PR's
+head (--head), polls it for up to 3m, and reads every layer back merged at
+the head it checked. "stack" in the JSON lists each layer with its head
+branch and merge_sha; "merge_sha" is the requested (top) PR's, which
+contains every layer. --admin bypasses the rules the actor may bypass.
+--teardown removes every merged layer's worktree ("teardown_layers" holds
+the lower layers). GitHub's "failed" result with every layer still open is
+refused (exit 2); any other mismatch is unconfirmed (exit 4).
+
 Output: a JSON result on stdout with "merge_sha" (for agentflow ship verify
 --sha), "reasons" when refused, "sync" when --sync-branch is given, and
 "auto_merge" when GitHub holds an auto-merge request for the PR.
