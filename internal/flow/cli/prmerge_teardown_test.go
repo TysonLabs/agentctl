@@ -116,3 +116,38 @@ func TestTeardownNoneAndSkipped(t *testing.T) {
 		}
 	}
 }
+
+// GoPBX #117 (stack #118): a confirmed stack merge removes the worktree of
+// every layer. The upper PR reads back with the lower layer's branch as its
+// base: GitHub does not retarget a merged stack layer.
+func TestTeardownStackRemovesEveryLayer(t *testing.T) {
+	root, seed, repo := cliRepo(t)
+	lowPath, lowTip := branchWorktree(t, root, repo, "feat/queue-order")
+	topPath, topTip := branchWorktree(t, root, repo, "feat/queue-order-console")
+	squashIntoDevelopment(t, seed, "feat/queue-order")
+	squashIntoDevelopment(t, seed, "feat/queue-order-console")
+	setFakePRs(t, root,
+		prFake{115, "MERGED", "development", "feat/queue-order", lowTip, nil},
+		prFake{117, "MERGED", "feat/queue-order", "feat/queue-order-console", topTip, nil})
+	t.Chdir(repo)
+
+	res := pr.MergeResult{Status: pr.MergeMerged, HeadBranch: "feat/queue-order-console", Stack: &pr.StackMerge{
+		Layers: []pr.StackLayer{{PR: 115, HeadBranch: "feat/queue-order"}, {PR: 117, HeadBranch: "feat/queue-order-console"}},
+	}}
+	td, layers := teardownStack(context.Background(), res)
+	if td.Status != teardownRemoved || len(layers) != 1 || layers[0].Status != teardownRemoved || layers[0].Branch != "feat/queue-order" {
+		t.Fatalf("top %+v layers %+v", td, layers)
+	}
+	for _, p := range []string{lowPath, topPath} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("worktree %s still exists (%v)", p, err)
+		}
+	}
+
+	// Unconfirmed: every layer is skipped.
+	res.Status = pr.MergeUnconfirmed
+	td, layers = teardownStack(context.Background(), res)
+	if td.Status != teardownSkipped || len(layers) != 1 || layers[0].Status != teardownSkipped {
+		t.Fatalf("unconfirmed: top %+v layers %+v", td, layers)
+	}
+}

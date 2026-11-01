@@ -111,16 +111,7 @@ func runPRMerge(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	var td *teardownResult
 	var tdLayers []*teardownResult
 	if *teardown {
-		td = teardownMerged(ctx, res)
-		// A stack merge also merged the layers below the requested PR: the
-		// merging session removes their worktrees too.
-		if res.Stack != nil {
-			for _, l := range res.Stack.Layers {
-				if l.HeadBranch != res.HeadBranch {
-					tdLayers = append(tdLayers, teardownBranch(ctx, res.Status, l.HeadBranch))
-				}
-			}
-		}
+		td, tdLayers = teardownStack(ctx, res)
 	}
 	out, _ := json.MarshalIndent(struct {
 		pr.MergeResult
@@ -179,6 +170,21 @@ type teardownResult struct {
 // checkout: a process inside the worktree makes done refuse.
 func teardownMerged(ctx context.Context, res pr.MergeResult) *teardownResult {
 	return teardownBranch(ctx, res.Status, res.HeadBranch)
+}
+
+// teardownStack tears down the requested PR's worktree and, for a stack
+// merge, the worktrees of the layers below it: the merge landed them too.
+func teardownStack(ctx context.Context, res pr.MergeResult) (*teardownResult, []*teardownResult) {
+	td := teardownMerged(ctx, res)
+	var layers []*teardownResult
+	if res.Stack != nil {
+		for _, l := range res.Stack.Layers {
+			if l.HeadBranch != res.HeadBranch {
+				layers = append(layers, teardownBranch(ctx, res.Status, l.HeadBranch))
+			}
+		}
+	}
+	return td, layers
 }
 
 // teardownBranch runs worktree done for one merged head branch.

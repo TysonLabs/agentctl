@@ -322,8 +322,29 @@ func mergeStack(ctx context.Context, o MergeOptions, si *stackInfo, res *MergeRe
 			continue
 		}
 		sm.Layers[i].MergeSHA = c.sha
-		if c.base != si.Base {
-			msgs = append(msgs, fmt.Sprintf("#%d merged into %q, not the stack base %q", l.PR, c.base, si.Base))
+		// GitHub merges the stack in one operation and leaves each upper
+		// layer's base on the branch of the layer below it: it does not
+		// retarget a merged PR to the trunk. That base is expected. Any
+		// other base means the layer landed somewhere else.
+		if c.base != si.Base && (i == 0 || c.base != sm.Layers[i-1].HeadBranch) {
+			want := fmt.Sprintf("%q", si.Base)
+			if i > 0 {
+				want += fmt.Sprintf(" or the lower layer's branch %q", sm.Layers[i-1].HeadBranch)
+			}
+			msgs = append(msgs, fmt.Sprintf("#%d merged into %q, not the stack base %s", l.PR, c.base, want))
+		}
+	}
+	if len(msgs) == 0 {
+		// Every layer reads back MERGED. The stack landed only if the trunk
+		// now holds the top layer (its merge commit, or its reviewed head).
+		top := sm.Layers[len(sm.Layers)-1]
+		landedSHA, msg := trunkHolds(dctx, o, si.Base, top)
+		if msg != "" {
+			msgs = append(msgs, msg)
+		} else {
+			// merge_sha is consumed by ship verify, so report the commit that
+			// was actually proved present on the trunk.
+			res.MergeSHA = landedSHA
 		}
 	}
 	if len(msgs) > 0 {
@@ -332,8 +353,6 @@ func mergeStack(ctx context.Context, o MergeOptions, si *stackInfo, res *MergeRe
 		}
 		return finish(MergeUnconfirmed, "check every layer of the stack on GitHub before verifying a deploy", strings.Join(msgs, "; "))
 	}
-	res.MergeSHA = sm.Layers[len(sm.Layers)-1].MergeSHA
-
 	if o.SyncBranch == "" {
 		return finish(MergeMerged, "verify the deploy with the merge_sha (the top layer's: it contains every layer)", "")
 	}
@@ -375,6 +394,34 @@ func layerReasons(st prState, head string) []string {
 		r = append(r, fmt.Sprintf("GitHub has not computed mergeability (mergeable=%s)", st.Mergeable))
 	}
 	return r
+}
+
+// trunkHolds checks that the trunk contains the top layer's merge commit or
+// its reviewed head, retrying for o.ConfirmWait (the trunk ref can trail the
+// merge read-back). It returns the commit proved present on the trunk, or why
+// the stack merge is unconfirmed. A compare error never counts as contained.
+func trunkHolds(ctx context.Context, o MergeOptions, trunk string, top StackLayer) (string, string) {
+	deadline := time.Now().Add(o.ConfirmWait)
+	for {
+		var errs []string
+		for _, sha := range []string{top.MergeSHA, top.Head} {
+			ok, err := contains(ctx, o, sha, trunk)
+			if err == nil && ok {
+				return sha, ""
+			}
+			if err != nil {
+				errs = append(errs, err.Error())
+			}
+		}
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			msg := fmt.Sprintf("the stack base %q contains neither #%d's merge commit %s nor its head %s", trunk, top.PR, top.MergeSHA, top.Head)
+			if len(errs) > 0 {
+				msg += " (" + strings.Join(errs, "; ") + ")"
+			}
+			return "", msg
+		}
+		time.Sleep(min(o.ConfirmInterval, time.Until(deadline)))
+	}
 }
 
 // contains reports whether head contains base (base is an ancestor of head
