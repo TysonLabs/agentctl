@@ -41,7 +41,9 @@ background; it exits when there is something to do.
 
 "Reviewed" means CodeRabbit's summary comment covers the head commit and no
 review is in progress. An older round's review, the "CodeRabbit" commit
-status and empty-body bot reviews are ignored: they mislead.
+status and empty-body bot reviews are ignored: they mislead. A "Review
+skipped" banner does not end the wait while CodeRabbit's latest reply to a
+"@coderabbitai review" command still reads "Review triggered.".
 
 Output: a JSON result on stdout. "open_threads" lists each open CodeRabbit
 thread with its GraphQL id (for addPullRequestReviewThreadReply and

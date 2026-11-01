@@ -713,6 +713,12 @@ no token.
   covers the PR's head commit (`coveredCommitId`) and no review is in progress. An older
   round's review, the "CodeRabbit" commit status (it can stay pending after the review)
   and empty-body bot reviews (replies to thread replies) are all ignored.
+- **A requested review is waited out.** On a non-default base or a draft, CodeRabbit's
+  summary keeps its "Review skipped" banner even after `@coderabbitai review` starts a
+  review (`pr open`'s own request usually lands before the banner). While CodeRabbit's
+  latest reply to a review command still reads "Review triggered." (it is edited to
+  "Review finished." when the review ends), `pr wait` keeps waiting instead of exiting 3.
+  Only replies from `coderabbitai[bot]` count.
 - **Open threads, ready to handle.** On exit 10, `open_threads` lists each unresolved
   CodeRabbit thread with its GraphQL `id` (what `addPullRequestReviewThreadReply` and
   `resolveReviewThread` take), `path`, `line`, `url` and the first lines of its comment.
@@ -739,7 +745,7 @@ no token.
 | 0 | `clean` | the head is reviewed and no CodeRabbit thread is open |
 | 1 | `gh_error` / — | usage error, or gh failed on the first check |
 | 2 | `waiting` | `--once` only: the head is not reviewed yet |
-| 3 | `skipped` | review skipped (draft, non-default base, paused): comment `@coderabbitai review` (`pr open` already did for a non-default base; check the comment is there) |
+| 3 | `skipped` | review skipped (draft, non-default base, paused) and no requested review is running: comment `@coderabbitai review` (`pr open` already did for a non-default base; check the comment is there and that CodeRabbit replied) |
 | 4 | `rate_limited` | wait the time in CodeRabbit's comment, then `@coderabbitai review` |
 | 5 | `closed` | the PR is closed or merged and its head was never reviewed |
 | 10 | `open_threads` | the head is reviewed; fix, reply, then resolve each thread |

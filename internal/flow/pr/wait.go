@@ -92,7 +92,14 @@ var (
 	skippedRe    = regexp.MustCompile(`(?i)Review skipped|Auto reviews are disabled|Review paused`)
 	rateRe       = regexp.MustCompile(`(?i)Rate limit exceeded|rate limited`)
 	coveredRe    = regexp.MustCompile(`"coveredCommitId":"([0-9a-f]{40})"|between [0-9a-f]{40} and ([0-9a-f]{40})`)
-	summaryRe    = regexp.MustCompile(`(?i)walkthrough|coveredCommitId|review in progress|Review skipped|summarize by coderabbit|Rate limit exceeded|rate limited by coderabbit`)
+	// A `@coderabbitai review` command gets its own bot reply, marked as a
+	// command invocation. It reads "Review triggered." while the requested
+	// review runs and is edited to "Review finished." when it ends. The
+	// summary comment keeps its "Review skipped" banner meanwhile, because
+	// CodeRabbit posts it before (or regardless of) the command.
+	commandReplyRe    = regexp.MustCompile(`CodeRabbit review command invocation`)
+	reviewTriggeredRe = regexp.MustCompile(`(?m)^\s*Review triggered\.`)
+	summaryRe         = regexp.MustCompile(`(?i)walkthrough|coveredCommitId|review in progress|Review skipped|summarize by coderabbit|Rate limit exceeded|rate limited by coderabbit`)
 )
 
 const reReview = "comment `@coderabbitai review` on the PR"
@@ -102,6 +109,7 @@ type snapshot struct {
 	head, state, base string
 	draft             bool
 	summary           string
+	triggered         bool // the latest review-command reply still says "Review triggered."
 	threads           []Thread
 	threadsComplete   bool
 }
@@ -193,6 +201,11 @@ func verdict(snap snapshot, res *Result) (Status, string, bool) {
 	if rateRe.MatchString(snap.summary) {
 		return StatusRateLimited, "wait the time stated in the CodeRabbit summary comment, then " + reReview, true
 	}
+	if snap.triggered {
+		// A requested review is running: the skip banner (or the draft
+		// state) is from before the command. Wait for its result.
+		return "", "", false
+	}
 	if snap.draft || skippedRe.MatchString(snap.summary) {
 		return StatusSkipped, reReview + " (or mark the PR ready for review)", true
 	}
@@ -232,7 +245,15 @@ func read(ctx context.Context, o Options) (snapshot, error) {
 	for _, page := range pages {
 		for _, c := range page {
 			// The bot keeps one summary comment and edits it; take the last match.
-			if strings.EqualFold(c.User.Login, "coderabbitai[bot]") && summaryRe.MatchString(c.Body) {
+			if !strings.EqualFold(c.User.Login, "coderabbitai[bot]") {
+				continue
+			}
+			if commandReplyRe.MatchString(c.Body) {
+				// Comments come oldest first: the last reply is the latest command.
+				snap.triggered = reviewTriggeredRe.MatchString(c.Body)
+				continue
+			}
+			if summaryRe.MatchString(c.Body) {
 				snap.summary = c.Body
 			}
 		}

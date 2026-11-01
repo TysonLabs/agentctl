@@ -310,3 +310,62 @@ func TestMissingGraphQLThreadDataIsAnError(t *testing.T) {
 		}
 	}
 }
+
+// commandReply is CodeRabbit's reply to `@coderabbitai review` (seen on
+// vector-ventures/agentassist-callcenter#510, 2026-11-01): "Review triggered."
+// while the review runs, edited to "Review finished." when it ends.
+func commandReply(state string) string {
+	return "<!-- coderabbit-ai-generated:v1 -->\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n" +
+		"<!-- CodeRabbit review command invocation: v2:802df4f3 -->\n<details>\n<summary>Action performed</summary>\n<dl>\n<dd>\n\n" +
+		state + "\n\n> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits.\n\n</dd>\n</dl>\n</details>\n"
+}
+
+const skippedBanner = "> [!IMPORTANT]\n> ## Review skipped\n>\n> Auto reviews are disabled on base/target branches other than the default branch.\n" +
+	"<!-- This is an auto-generated comment: skip review by coderabbit.ai -->"
+
+func human(body string) map[string]any {
+	return map[string]any{"user": map[string]any{"login": "tgeorge06"}, "body": body}
+}
+
+func TestTriggeredReviewOverridesSkipBanner(t *testing.T) {
+	cases := []struct {
+		name string
+		f    *fake
+		want Status
+	}{
+		// pr open's trigger lands BEFORE the skip banner; the reply comes after.
+		{"triggered after skip", &fake{pages: [][]map[string]any{{human("@coderabbitai review"), bot(skippedBanner), bot(commandReply("Review triggered."))}}}, StatusWaiting},
+		{"finished, head not covered", &fake{pages: [][]map[string]any{{bot(skippedBanner), bot(commandReply("Review finished."))}}}, StatusSkipped},
+		{"latest reply wins", &fake{pages: [][]map[string]any{{bot(skippedBanner), bot(commandReply("Review triggered.")), bot(commandReply("Review finished."))}}}, StatusSkipped},
+		{"newer trigger after a finished one", &fake{pages: [][]map[string]any{{bot(skippedBanner), bot(commandReply("Review finished.")), bot(commandReply("Review triggered."))}}}, StatusWaiting},
+		{"forged reply from a user", &fake{pages: [][]map[string]any{{bot(skippedBanner), human(commandReply("Review triggered."))}}}, StatusSkipped},
+		{"draft with a running review", &fake{draft: true, pages: [][]map[string]any{{bot(commandReply("Review triggered."))}}}, StatusWaiting},
+		{"head covered beats a running reply", &fake{pages: [][]map[string]any{{bot(covered(head)), bot(commandReply("Review triggered."))}}}, StatusClean},
+		{"reply is never the summary", &fake{pages: [][]map[string]any{{bot(covered(older)), bot(commandReply("Review finished."))}}}, StatusWaiting},
+	}
+	for _, c := range cases {
+		if r := run(c.f, true); r.Status != c.want {
+			t.Errorf("%s: got %s (%+v), want %s", c.name, r.Status, r, c.want)
+		}
+	}
+}
+
+// Without --once, a triggered review is waited out to its result.
+func TestTriggeredReviewWaitsUntilReviewed(t *testing.T) {
+	running := &fake{pages: [][]map[string]any{{bot(skippedBanner), bot(commandReply("Review triggered."))}}}
+	done := &fake{pages: [][]map[string]any{{bot(covered(head)), bot(commandReply("Review finished."))}}}
+	var reads atomic.Int32
+	gh := func(ctx context.Context, args ...string) ([]byte, error) {
+		if args[0] == "pr" {
+			reads.Add(1)
+		}
+		if reads.Load() >= 3 {
+			return done.gh(ctx, args...)
+		}
+		return running.gh(ctx, args...)
+	}
+	r := Wait(context.Background(), Options{Repo: "o/r", PR: 7, Timeout: 2 * time.Second, Interval: 5 * time.Millisecond, GH: gh})
+	if r.Status != StatusClean || r.Attempts < 3 {
+		t.Fatalf("got %+v", r)
+	}
+}
