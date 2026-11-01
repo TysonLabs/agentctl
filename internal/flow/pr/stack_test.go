@@ -413,6 +413,16 @@ func TestStackMergeTrunkHoldsTheMergeCommitOrTheHead(t *testing.T) {
 	}
 }
 
+func TestStackMergeReportsTheCommitProvedOnTrunk(t *testing.T) {
+	f := newStackFake()
+	f.keepBase = true
+	f.compare[layerMergeSHA(12)+"...main"] = "diverged"
+	res := runStackMerge(f, 12, nil)
+	if res.Status != MergeMerged || res.MergeSHA != layerHead(12) {
+		t.Fatalf("status = %s merge_sha = %s, want reviewed head %s", res.Status, res.MergeSHA, layerHead(12))
+	}
+}
+
 func TestStackMergeTrunkWithoutTheTopIsUnconfirmed(t *testing.T) {
 	f := newStackFake()
 	f.keepBase = true

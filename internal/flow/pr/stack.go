@@ -338,8 +338,13 @@ func mergeStack(ctx context.Context, o MergeOptions, si *stackInfo, res *MergeRe
 		// Every layer reads back MERGED. The stack landed only if the trunk
 		// now holds the top layer (its merge commit, or its reviewed head).
 		top := sm.Layers[len(sm.Layers)-1]
-		if msg := trunkHolds(dctx, o, si.Base, top); msg != "" {
+		landedSHA, msg := trunkHolds(dctx, o, si.Base, top)
+		if msg != "" {
 			msgs = append(msgs, msg)
+		} else {
+			// merge_sha is consumed by ship verify, so report the commit that
+			// was actually proved present on the trunk.
+			res.MergeSHA = landedSHA
 		}
 	}
 	if len(msgs) > 0 {
@@ -348,8 +353,6 @@ func mergeStack(ctx context.Context, o MergeOptions, si *stackInfo, res *MergeRe
 		}
 		return finish(MergeUnconfirmed, "check every layer of the stack on GitHub before verifying a deploy", strings.Join(msgs, "; "))
 	}
-	res.MergeSHA = sm.Layers[len(sm.Layers)-1].MergeSHA
-
 	if o.SyncBranch == "" {
 		return finish(MergeMerged, "verify the deploy with the merge_sha (the top layer's: it contains every layer)", "")
 	}
@@ -395,16 +398,16 @@ func layerReasons(st prState, head string) []string {
 
 // trunkHolds checks that the trunk contains the top layer's merge commit or
 // its reviewed head, retrying for o.ConfirmWait (the trunk ref can trail the
-// merge read-back). It returns "" when it does, else why the stack merge is
-// unconfirmed. A compare error never counts as contained.
-func trunkHolds(ctx context.Context, o MergeOptions, trunk string, top StackLayer) string {
+// merge read-back). It returns the commit proved present on the trunk, or why
+// the stack merge is unconfirmed. A compare error never counts as contained.
+func trunkHolds(ctx context.Context, o MergeOptions, trunk string, top StackLayer) (string, string) {
 	deadline := time.Now().Add(o.ConfirmWait)
 	for {
 		var errs []string
 		for _, sha := range []string{top.MergeSHA, top.Head} {
 			ok, err := contains(ctx, o, sha, trunk)
 			if err == nil && ok {
-				return ""
+				return sha, ""
 			}
 			if err != nil {
 				errs = append(errs, err.Error())
@@ -415,7 +418,7 @@ func trunkHolds(ctx context.Context, o MergeOptions, trunk string, top StackLaye
 			if len(errs) > 0 {
 				msg += " (" + strings.Join(errs, "; ") + ")"
 			}
-			return msg
+			return "", msg
 		}
 		time.Sleep(min(o.ConfirmInterval, time.Until(deadline)))
 	}

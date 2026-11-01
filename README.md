@@ -778,10 +778,12 @@ PR in a stack, pr merge:
   the stack's base or the branch of the layer below it as its base: GitHub leaves a
   merged upper layer's base on the lower branch and does not retarget it. JSON
   `stack`: `number`, `base`, `position`, `size`, `layers` (each `pr`, `head`,
-  `head_branch`, `merge_sha`), `async_status`. `merge_sha` is the requested PR's,
-  which contains every layer. GitHub's `failed` with every layer still open is
-  `refused` (exit 2); any other mismatch (a layer not merged, merged into another
-  branch, or a base that does not contain the top layer) is `unconfirmed` (exit 4);
+  `head_branch`, `merge_sha`), `async_status`. The top-level `merge_sha` is the
+  requested PR's merge commit, or its reviewed head when that is what the stack
+  base contains; either contains every layer. GitHub's `failed` with every layer
+  still open is `refused` (exit 2); any other mismatch (a layer not merged, merged
+  into another branch, or a base that does not contain the top layer) is
+  `unconfirmed` (exit 4);
 - with `--teardown`, removes every merged layer's worktree (`teardown_layers` holds
   the lower layers').
 

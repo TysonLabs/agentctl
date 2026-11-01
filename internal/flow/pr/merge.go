@@ -69,7 +69,8 @@ type MergeResult struct {
 	MergeSHA   string `json:"merge_sha,omitempty"`
 	AutoMerge  bool   `json:"auto_merge,omitempty"` // GitHub holds an auto-merge request for the PR
 	// Stack is set when the PR is in a stack: the merge covered every
-	// unmerged layer up to it, and MergeSHA is the top layer's.
+	// unmerged layer up to it, and MergeSHA is the top layer's merge commit or
+	// reviewed head, whichever was proved present on the stack base.
 	Stack     *StackMerge `json:"stack,omitempty"`
 	Sync      *Sync       `json:"sync,omitempty"`
 	Reasons   []string    `json:"reasons"`

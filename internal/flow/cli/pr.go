@@ -124,9 +124,11 @@ endpoint (gh pr merge cannot merge a stack), pinned to the requested PR's
 head (--head), polls it for up to 3m, and reads every layer back merged at
 the head it checked, into the stack's base or the branch of the layer below
 (GitHub does not retarget a merged upper layer). The stack's base must then
-contain the top layer's merge commit or head. "stack" in the JSON lists each layer with its head
-branch and merge_sha; "merge_sha" is the requested (top) PR's, which
-contains every layer. --admin bypasses the rules the actor may bypass.
+contain the top layer's merge commit or head. "stack" in the JSON lists each
+layer with its head branch and merge_sha. The top-level "merge_sha" is the
+requested PR's merge commit or reviewed head, whichever was proved on the
+stack's base; either contains every layer. --admin bypasses the rules the
+actor may bypass.
 --teardown removes every merged layer's worktree ("teardown_layers" holds
 the lower layers). GitHub's "failed" result with every layer still open is
 refused (exit 2); any other mismatch (a layer not merged, merged into
