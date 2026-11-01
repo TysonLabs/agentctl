@@ -773,11 +773,15 @@ PR in a stack, pr merge:
 - merges through `PUT /repos/{o}/{r}/pulls/{n}/merge-async` (API version 2026-03-10,
   `merge_action=direct_merge`, `--admin` as `bypass_rules`) and polls the result for
   up to 3 minutes;
-- reads every layer back merged at its checked head into the stack's base. JSON
+- reads every layer back merged at its checked head, and checks that the stack's base
+  contains the top layer's merge commit (or its head). Each layer must read back with
+  the stack's base or the branch of the layer below it as its base: GitHub leaves a
+  merged upper layer's base on the lower branch and does not retarget it. JSON
   `stack`: `number`, `base`, `position`, `size`, `layers` (each `pr`, `head`,
   `head_branch`, `merge_sha`), `async_status`. `merge_sha` is the requested PR's,
   which contains every layer. GitHub's `failed` with every layer still open is
-  `refused` (exit 2); any other mismatch is `unconfirmed` (exit 4);
+  `refused` (exit 2); any other mismatch (a layer not merged, merged into another
+  branch, or a base that does not contain the top layer) is `unconfirmed` (exit 4);
 - with `--teardown`, removes every merged layer's worktree (`teardown_layers` holds
   the lower layers').
 

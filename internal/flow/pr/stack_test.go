@@ -13,13 +13,14 @@ import (
 
 // stackLayerFake is one PR of a stackFake.
 type stackLayerFake struct {
-	pr        int
-	state     string // OPEN, MERGED, CLOSED
-	draft     bool
-	mergeable string // default MERGEABLE
-	queue     bool
-	threads   int // unresolved review threads
-	movedHead bool
+	pr         int
+	state      string // OPEN, MERGED, CLOSED
+	draft      bool
+	mergeable  string // default MERGEABLE
+	queue      bool
+	threads    int // unresolved review threads
+	movedHead  bool
+	mergedBase string // base this layer reads back with once MERGED (overrides the fake's)
 }
 
 // stackFake answers the gh calls of a stacked merge: PRs 11, 12, 13 by
@@ -35,7 +36,8 @@ type stackFake struct {
 	polls      []string // poll responses, in order; the last repeats
 	landed     bool     // every layer up to the target reads back MERGED after the PUT
 	landOnly   int      // if > 0, only this many layers land
-	mergedBase string
+	mergedBase string   // base every MERGED layer reads back with (default main)
+	keepBase   bool     // MERGED layers keep their stack base, as GitHub does (upper layers: the lower branch)
 	put        bool
 	target     int // index of the requested layer
 	calls      [][]string
@@ -122,7 +124,12 @@ func (f *stackFake) gh(_ context.Context, args ...string) ([]byte, error) {
 			"baseRefName": f.baseOf(i), "mergeable": m, "isMergeQueueEnabled": l.queue, "autoMergeRequest": nil, "mergeCommit": nil}
 		if f.stateOf(i) == "MERGED" {
 			base := f.mergedBase
-			if base == "" {
+			switch {
+			case l.mergedBase != "":
+				base = l.mergedBase
+			case f.keepBase:
+				base = f.branch(i - 1)
+			case base == "":
 				base = "main"
 			}
 			doc["baseRefName"] = base
@@ -377,12 +384,82 @@ func TestStackMergeLayerMovedAfterPinIsUnconfirmed(t *testing.T) {
 	}
 }
 
-func TestStackMergeMergedIntoOtherBaseIsUnconfirmed(t *testing.T) {
+// GoPBX #117 (stack #118), dialer #259/#263, GoPBX #120: after a stack
+// merge GitHub leaves each upper layer's base on the branch of the layer below
+// it. Every layer is MERGED and the trunk holds the top layer: that is merged.
+func TestStackMergeUpperLayersKeepTheLowerBranchAsBase(t *testing.T) {
 	f := newStackFake()
-	f.mergedBase = "s1"
+	f.keepBase = true
+	res := runStackMerge(f, 13, nil)
+	if res.Status != MergeMerged || res.Error != "" {
+		t.Fatalf("status = %s error = %s reasons = %v", res.Status, res.Error, res.Reasons)
+	}
+	if res.MergeSHA != layerMergeSHA(13) || len(res.Stack.Layers) != 3 {
+		t.Fatalf("merge_sha = %s layers = %+v", res.MergeSHA, res.Stack.Layers)
+	}
+	if f.count("api repos/o/r/compare/"+layerMergeSHA(13)+"...main") != 1 {
+		t.Fatalf("the trunk was not checked for the top merge commit: %v", f.calls)
+	}
+}
+
+// A squash merge leaves the reviewed head off the trunk: the merge commit
+// alone confirms it. A merge commit off the trunk falls back to the head.
+func TestStackMergeTrunkHoldsTheMergeCommitOrTheHead(t *testing.T) {
+	f := newStackFake()
+	f.keepBase = true
+	f.compare[layerMergeSHA(12)+"...main"] = "diverged"
+	if res := runStackMerge(f, 12, nil); res.Status != MergeMerged {
+		t.Fatalf("head on trunk: status = %s error = %s", res.Status, res.Error)
+	}
+}
+
+func TestStackMergeTrunkWithoutTheTopIsUnconfirmed(t *testing.T) {
+	f := newStackFake()
+	f.keepBase = true
+	f.compare[layerMergeSHA(12)+"...main"] = "diverged"
+	f.compare[layerHead(12)+"...main"] = "diverged"
 	res := runStackMerge(f, 12, nil)
-	if res.Status != MergeUnconfirmed || !strings.Contains(res.Error, "not the stack base") {
+	if res.Status != MergeUnconfirmed || !strings.Contains(res.Error, "contains neither #12's merge commit") {
 		t.Fatalf("status = %s error = %s", res.Status, res.Error)
+	}
+}
+
+func TestStackMergeTrunkUnreadableIsUnconfirmed(t *testing.T) {
+	f := newStackFake()
+	f.keepBase = true
+	f.compare[layerMergeSHA(12)+"...main"] = "weird"
+	f.compare[layerHead(12)+"...main"] = "weird"
+	res := runStackMerge(f, 12, nil)
+	if res.Status != MergeUnconfirmed || !strings.Contains(res.Error, "unknown status") {
+		t.Fatalf("status = %s error = %s", res.Status, res.Error)
+	}
+}
+
+func TestStackMergeUpperLayerNotMergedIsUnconfirmed(t *testing.T) {
+	f := newStackFake()
+	f.keepBase = true
+	f.landOnly = 1
+	res := runStackMerge(f, 12, nil)
+	if res.Status != MergeUnconfirmed || res.MergeSHA != "" || !strings.Contains(res.Error, "#12 did not read back as merged") {
+		t.Fatalf("status = %s merge_sha = %q error = %s", res.Status, res.MergeSHA, res.Error)
+	}
+}
+
+func TestStackMergeMergedIntoOtherBaseIsUnconfirmed(t *testing.T) {
+	for name, set := range map[string]func(f *stackFake){
+		"upper layer into an unrelated branch": func(f *stackFake) { f.layers[1].mergedBase = "release" },
+		"upper layer into a branch two below":  func(f *stackFake) { f.layers[2].mergedBase = "s1" },
+		"bottom layer into its upper branch":   func(f *stackFake) { f.layers[0].mergedBase = "s2" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newStackFake()
+			f.keepBase = true
+			set(f)
+			res := runStackMerge(f, 13, nil)
+			if res.Status != MergeUnconfirmed || !strings.Contains(res.Error, "not the stack base") {
+				t.Fatalf("status = %s error = %s", res.Status, res.Error)
+			}
+		})
 	}
 }
 
