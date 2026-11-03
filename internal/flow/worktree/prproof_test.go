@@ -109,6 +109,28 @@ func TestWorktreeBehindAnyMergedPRHeadIsMerged(t *testing.T) {
 	}
 }
 
+// A merged head that cannot be checked does not hide another merged head
+// that proves the merge; alone, it is still a refusal (CodeRabbit --deep).
+func TestUncheckableMergedHeadDoesNotHideAProof(t *testing.T) {
+	f := newFixture(t)
+	path := f.worktree("feat/mixed")
+	old := git(t, path, "rev-parse", "HEAD")
+	containing := f.pushMore("feat/mixed", "later.txt")
+	git(t, f.repo, "fetch", "-q", "origin")
+	missing := strings.Repeat("3", 40) // no such commit, no refs/pull/11/head
+	f.setPRs("feat/mixed", "11 "+missing+" MERGED main", "9 "+containing+" MERGED development")
+	c, _ := f.inspectInto("feat/mixed", "")
+	if want := "PR #9 into development (" + short(old) + " is contained in its merged head " + short(containing) + ")"; !c.OK || c.MergedVia != want {
+		t.Fatalf("got %+v, want MergedVia %q", c, want)
+	}
+
+	f.setPRs("feat/mixed", "11 "+missing+" MERGED main")
+	c, _ = f.inspectInto("feat/mixed", "")
+	if c.OK || !refusedFor(c, "PR #11 was MERGED into main at 33333333") || !refusedFor(c, "could not check whether the merged head contains it") {
+		t.Fatalf("an uncheckable head alone must refuse: %+v", c)
+	}
+}
+
 // takeover checks out branch's PR head under a local name that tracks it,
 // as a worker taking over someone else's PR does.
 func (f *fixture) takeover(local, branch string) string {

@@ -160,19 +160,24 @@ func prMergeProof(ctx context.Context, env Env, w Worktree, t Target, c *Check) 
 	// prVerdict gives OPEN PRs precedence, so reaching here means every
 	// remaining possible proof is a merged PR. A reused branch can have
 	// several of them; do not let a newer, unrelated merge hide an older
-	// merged head that contains this worktree's commit.
+	// merged head that contains this worktree's commit. A head that cannot
+	// be checked does not stop the scan, but with no proof the first such
+	// failure is the refusal: it is unknown, never "not merged".
+	var unchecked string
 	for i := range prs {
 		p := &prs[i]
 		if p.State != "MERGED" {
 			continue
 		}
 		contained, checkErr := containedInPRHead(ctx, env, w.Path, t.Remote, w.Head, *p)
-		mismatch := fmt.Sprintf("PR #%d was MERGED into %s at %s, but this worktree is at %s",
-			p.Number, p.Base, short(p.HeadOID), short(w.Head))
 		switch {
 		case checkErr != nil:
-			c.PRNumber, c.PRState, c.PRBase = p.Number, p.State, p.Base
-			return false, mismatch + ": could not check whether the merged head contains it (" + checkErr.Error() + ")", nil
+			if unchecked == "" {
+				c.PRNumber, c.PRState, c.PRBase = p.Number, p.State, p.Base
+				unchecked = fmt.Sprintf("PR #%d was MERGED into %s at %s, but this worktree is at %s: could not check whether the merged head contains it (%s)",
+					p.Number, p.Base, short(p.HeadOID), short(w.Head), checkErr.Error())
+			}
+			continue
 		case !contained:
 			continue
 		}
@@ -183,6 +188,9 @@ func prMergeProof(ctx context.Context, env Env, w Worktree, t Target, c *Check) 
 			c.MergedVia += fmt.Sprintf("; head branch %s, this branch's upstream", via)
 		}
 		return true, "", nil
+	}
+	if unchecked != "" {
+		return false, unchecked, nil
 	}
 	return false, why + ": its later commits are not merged", nil
 }
