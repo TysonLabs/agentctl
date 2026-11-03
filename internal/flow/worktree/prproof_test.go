@@ -87,6 +87,28 @@ func TestWorktreeAheadOfMergedPRHeadIsRefused(t *testing.T) {
 	}
 }
 
+// A reused branch can have several merged PRs. A newer PR with an unrelated
+// head must not hide an older merged PR whose head contains the worktree tip.
+func TestWorktreeBehindAnyMergedPRHeadIsMerged(t *testing.T) {
+	f := newFixture(t)
+	path := f.worktree("feat/reused")
+	old := git(t, path, "rev-parse", "HEAD")
+	containing := f.pushMore("feat/reused", "later.txt")
+	unrelated := git(t, f.seed, "rev-parse", "main")
+	git(t, f.repo, "fetch", "-q", "origin")
+	f.setPRs("feat/reused",
+		"10 "+unrelated+" MERGED main",
+		"9 "+containing+" MERGED development")
+
+	c, _ := f.inspectInto("feat/reused", "")
+	if !c.OK {
+		t.Fatalf("an older merged PR contains the worktree head: %+v", c)
+	}
+	if want := "PR #9 into development (" + short(old) + " is contained in its merged head " + short(containing) + ")"; c.MergedVia != want {
+		t.Fatalf("MergedVia = %q, want %q", c.MergedVia, want)
+	}
+}
+
 // takeover checks out branch's PR head under a local name that tracks it,
 // as a worker taking over someone else's PR does.
 func (f *fixture) takeover(local, branch string) string {

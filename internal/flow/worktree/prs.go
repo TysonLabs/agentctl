@@ -157,19 +157,34 @@ func prMergeProof(ctx context.Context, env Env, w Worktree, t Target, c *Check) 
 	if related.State != "MERGED" {
 		return false, why, nil
 	}
-	contained, checkErr := containedInPRHead(ctx, env, w.Path, t.Remote, w.Head, *related)
-	switch {
-	case checkErr != nil:
-		return false, why + ": could not check whether the merged head contains it (" + checkErr.Error() + ")", nil
-	case !contained:
-		return false, why + ": its later commits are not merged", nil
+	// prVerdict gives OPEN PRs precedence, so reaching here means every
+	// remaining possible proof is a merged PR. A reused branch can have
+	// several of them; do not let a newer, unrelated merge hide an older
+	// merged head that contains this worktree's commit.
+	for i := range prs {
+		p := &prs[i]
+		if p.State != "MERGED" {
+			continue
+		}
+		contained, checkErr := containedInPRHead(ctx, env, w.Path, t.Remote, w.Head, *p)
+		mismatch := fmt.Sprintf("PR #%d was MERGED into %s at %s, but this worktree is at %s",
+			p.Number, p.Base, short(p.HeadOID), short(w.Head))
+		switch {
+		case checkErr != nil:
+			c.PRNumber, c.PRState, c.PRBase = p.Number, p.State, p.Base
+			return false, mismatch + ": could not check whether the merged head contains it (" + checkErr.Error() + ")", nil
+		case !contained:
+			continue
+		}
+		c.PRNumber, c.PRState, c.PRBase = p.Number, p.State, p.Base
+		c.MergedVia = fmt.Sprintf("PR #%d into %s (%s is contained in its merged head %s)",
+			p.Number, p.Base, short(w.Head), short(p.HeadOID))
+		if via != "" {
+			c.MergedVia += fmt.Sprintf("; head branch %s, this branch's upstream", via)
+		}
+		return true, "", nil
 	}
-	c.MergedVia = fmt.Sprintf("PR #%d into %s (%s is contained in its merged head %s)",
-		related.Number, related.Base, short(w.Head), short(related.HeadOID))
-	if via != "" {
-		c.MergedVia += fmt.Sprintf("; head branch %s, this branch's upstream", via)
-	}
-	return true, "", nil
+	return false, why + ": its later commits are not merged", nil
 }
 
 // upstreamBranch is branch's upstream branch name on remote (from
