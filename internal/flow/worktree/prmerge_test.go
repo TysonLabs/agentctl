@@ -127,7 +127,7 @@ func TestNotMergedRefusalsNameThePRAndAskForInto(t *testing.T) {
 	}{
 		{"open PR", "119 HEAD OPEN development", "", []string{"PR #119 is OPEN into development: not merged", "pass --into"}},
 		{"closed unmerged PR", "118 HEAD CLOSED development", "", []string{"PR #118 into development was CLOSED without merging"}},
-		{"merged at an older head", "117 " + strings.Repeat("2", 40) + " MERGED development", "", []string{"PR #117 was MERGED into development at 22222222", "later commits are not merged"}},
+		{"merged at an older head", "117 " + strings.Repeat("2", 40) + " MERGED development", "", []string{"PR #117 was MERGED into development at 22222222", "could not check whether the merged head contains it"}},
 		{"no PR", "", "", []string{"GitHub has no merged PR from branch feat/x", "pass --into <branch> (no default branch is assumed)"}},
 		{"open PR with --into", "119 HEAD OPEN development", "main", []string{"is not contained in origin/main", "PR #119 is OPEN"}},
 	}

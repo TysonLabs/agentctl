@@ -592,30 +592,23 @@ func resolveCommit(ctx context.Context, env Env, dir, ref string) (string, error
 }
 
 // mergeProof sets c.MergedVia (or adds the "not merged" refusal) and the
-// PR fields. A merged PR whose head branch and head are exactly w's proves
-// the merge into that PR's base, whatever the base. Ancestry is checked
-// only against an explicitly named target (t.Branch). A gh failure is
-// recorded in c.PRError and never proves anything.
+// PR fields. A merged PR proves the merge into that PR's base, whatever the
+// base, when its head is w's head or contains it (prMergeProof). Ancestry
+// into a branch is checked only against an explicitly named target
+// (t.Branch). A gh failure is recorded in c.PRError and never proves
+// anything.
 func mergeProof(ctx context.Context, env Env, w Worktree, t Target, c *Check) error {
 	refuse := func(format string, a ...any) { c.Refusals = append(c.Refusals, fmt.Sprintf(format, a...)) }
 	var detail string
 	if w.Branch != "" {
-		prs, err := branchPRs(ctx, env, w.Path, t.Remote, w.Branch)
+		proven, why, err := prMergeProof(ctx, env, w, t, c)
 		if err != nil {
-			c.PRError = err.Error()
-		} else {
-			proof, related, why := prVerdict(prs, w.Head)
-			switch {
-			case proof != nil:
-				c.PRNumber, c.PRState, c.PRBase = proof.Number, proof.State, proof.Base
-				c.prProof, c.prHeadRepo = true, proof.HeadRepo
-				c.MergedVia = fmt.Sprintf("PR #%d into %s", proof.Number, proof.Base)
-				return nil
-			case related != nil:
-				c.PRNumber, c.PRState, c.PRBase = related.Number, related.State, related.Base
-				detail = why
-			}
+			return err
 		}
+		if proven {
+			return nil
+		}
+		detail = why
 	}
 	if t.Branch != "" {
 		targetHead, err := resolveCommit(ctx, env, w.Path, t.Ref())
