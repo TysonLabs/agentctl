@@ -107,6 +107,150 @@ func branchPRs(ctx context.Context, env Env, dir, remote, branch string) ([]PR, 
 	return prs, nil
 }
 
+// prMergeProof looks for a merged PR that proves w's commits are merged,
+// and fills c's PR fields. It reports (true, "", nil) when proven; (false,
+// reason, nil) when not, reason naming the PR that explains it ("" when
+// there is none or GitHub could not be checked: c.PRError says which).
+//
+// It asks GitHub for PRs from w.Branch and, only when there is none at all,
+// from the branch's upstream on t.Remote (a branch taken over under another
+// local name, `git checkout -B takeover/155 origin/feat/x`). A merged PR
+// proves the merge when its head is w.Head, or when its head contains
+// w.Head: the worktree is behind the merged head and holds no commit of its
+// own (a worktree left at an older PR head after a squash merge). The PR
+// head is fetched from refs/pull/<n>/head when it is not local.
+//
+// Only an exact head on w.Branch itself sets c.prProof, the one proof that
+// lets Remove delete the remote branch: the other proofs remove the
+// worktree and keep every remote branch.
+func prMergeProof(ctx context.Context, env Env, w Worktree, t Target, c *Check) (bool, string, error) {
+	prs, err := branchPRs(ctx, env, w.Path, t.Remote, w.Branch)
+	if err != nil {
+		c.PRError = err.Error()
+		return false, "", nil
+	}
+	via := ""
+	if len(prs) == 0 {
+		if up := upstreamBranch(ctx, env, w.Path, w.Branch, t.Remote); up != "" && up != w.Branch {
+			if prs, err = branchPRs(ctx, env, w.Path, t.Remote, up); err != nil {
+				c.PRError = err.Error()
+				return false, "", nil
+			}
+			via = up
+		}
+	}
+	proof, related, why := prVerdict(prs, w.Head)
+	if proof != nil {
+		c.PRNumber, c.PRState, c.PRBase = proof.Number, proof.State, proof.Base
+		if via == "" {
+			c.prProof, c.prHeadRepo = true, proof.HeadRepo
+			c.MergedVia = fmt.Sprintf("PR #%d into %s", proof.Number, proof.Base)
+		} else {
+			c.MergedVia = fmt.Sprintf("PR #%d into %s (head branch %s, this branch's upstream)", proof.Number, proof.Base, via)
+		}
+		return true, "", nil
+	}
+	if related == nil {
+		return false, "", nil
+	}
+	c.PRNumber, c.PRState, c.PRBase = related.Number, related.State, related.Base
+	if related.State != "MERGED" {
+		return false, why, nil
+	}
+	// prVerdict gives OPEN PRs precedence, so reaching here means every
+	// remaining possible proof is a merged PR. A reused branch can have
+	// several of them; do not let a newer, unrelated merge hide an older
+	// merged head that contains this worktree's commit. A head that cannot
+	// be checked does not stop the scan, but with no proof the first such
+	// failure is the refusal: it is unknown, never "not merged".
+	var unchecked string
+	for i := range prs {
+		p := &prs[i]
+		if p.State != "MERGED" {
+			continue
+		}
+		contained, checkErr := containedInPRHead(ctx, env, w.Path, t.Remote, w.Head, *p)
+		switch {
+		case checkErr != nil:
+			if unchecked == "" {
+				c.PRNumber, c.PRState, c.PRBase = p.Number, p.State, p.Base
+				unchecked = fmt.Sprintf("PR #%d was MERGED into %s at %s, but this worktree is at %s: could not check whether the merged head contains it (%s)",
+					p.Number, p.Base, short(p.HeadOID), short(w.Head), checkErr.Error())
+			}
+			continue
+		case !contained:
+			continue
+		}
+		c.PRNumber, c.PRState, c.PRBase = p.Number, p.State, p.Base
+		c.MergedVia = fmt.Sprintf("PR #%d into %s (%s is contained in its merged head %s)",
+			p.Number, p.Base, short(w.Head), short(p.HeadOID))
+		if via != "" {
+			c.MergedVia += fmt.Sprintf("; head branch %s, this branch's upstream", via)
+		}
+		return true, "", nil
+	}
+	if unchecked != "" {
+		return false, unchecked, nil
+	}
+	return false, why + ": its later commits are not merged", nil
+}
+
+// upstreamBranch is branch's upstream branch name on remote (from
+// branch.<name>.remote and branch.<name>.merge), or "" when it has none or
+// it tracks another remote.
+func upstreamBranch(ctx context.Context, env Env, dir, branch, remote string) string {
+	r, err := run(ctx, dir, env.Git, "config", "--get", "branch."+branch+".remote")
+	if err != nil || strings.TrimSpace(r) != remote {
+		return ""
+	}
+	m, err := run(ctx, dir, env.Git, "config", "--get", "branch."+branch+".merge")
+	if err != nil {
+		return ""
+	}
+	name, ok := strings.CutPrefix(strings.TrimSpace(m), "refs/heads/")
+	if !ok {
+		return ""
+	}
+	return name
+}
+
+// containedInPRHead reports whether head is an ancestor of (or is) p's head
+// commit. A head commit that is not local is fetched from remote's
+// refs/pull/<n>/head (GitHub keeps it after the branch is deleted), bounded
+// like a gh call; the fetched object must be p.HeadOID itself.
+func containedInPRHead(ctx context.Context, env Env, dir, remote, head string, p PR) (bool, error) {
+	if !isHexOID(p.HeadOID) {
+		return false, fmt.Errorf("PR head %q is not a commit id", p.HeadOID)
+	}
+	if _, err := resolveCommit(ctx, env, dir, p.HeadOID); err != nil {
+		timeout := env.GHTimeout
+		if timeout <= 0 {
+			timeout = DefaultGHTimeout
+		}
+		fctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		ref := fmt.Sprintf("refs/pull/%d/head", p.Number)
+		if _, err := run(fctx, dir, env.Git, "-c", "credential.interactive=never", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", remote, ref); err != nil {
+			return false, fmt.Errorf("fetch %s: %v", ref, err)
+		}
+		if _, err := resolveCommit(ctx, env, dir, p.HeadOID); err != nil {
+			return false, fmt.Errorf("%s did not bring PR head %s", ref, short(p.HeadOID))
+		}
+	}
+	cmd := exec.CommandContext(ctx, env.Git, "merge-base", "--is-ancestor", head, p.HeadOID)
+	cmd.Dir = dir
+	err := cmd.Run()
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.As(err, &ee) && ee.ExitCode() == 1:
+		return false, nil
+	default:
+		return false, fmt.Errorf("git merge-base: %v", err)
+	}
+}
+
 // prVerdict picks the merged PR whose head is exactly head (the proof), or
 // else the PR that best explains why there is none, with a one-line reason.
 // prs must be sorted newest first.
@@ -126,7 +270,9 @@ func prVerdict(prs []PR, head string) (proof, related *PR, detail string) {
 			case "OPEN":
 				return nil, p, fmt.Sprintf("PR #%d is OPEN into %s: not merged", p.Number, p.Base)
 			case "MERGED":
-				return nil, p, fmt.Sprintf("PR #%d was MERGED into %s at %s, but this worktree is at %s: its later commits are not merged",
+				// The caller checks whether the merged head contains head
+				// and completes the reason (prMergeProof).
+				return nil, p, fmt.Sprintf("PR #%d was MERGED into %s at %s, but this worktree is at %s",
 					p.Number, p.Base, short(p.HeadOID), short(head))
 			default:
 				return nil, p, fmt.Sprintf("PR #%d into %s was CLOSED without merging", p.Number, p.Base)

@@ -868,7 +868,15 @@ works, and it also deletes uncommitted work and unmerged branches without a word
   and head commit are exactly the worktree's branch and tip. It counts as merged into
   *that PR's base*, whatever it is: a non-default base such as `development`, a
   stacked PR that was retargeted before its parent merged, a squash merge. The JSON
-  says `merged_via: "PR #113 into development"`. Without such a PR, only an explicit
+  says `merged_via: "PR #113 into development"`. A merged PR whose head *contains*
+  the tip proves it too: the worktree is behind the merged head (left at an older
+  commit of the PR) and holds no commit of its own
+  (`"PR #143 into development (784f445a is contained in its merged head 1986294a)"`).
+  A merged head that is not local is fetched from `refs/pull/<n>/head`; a failed
+  fetch is a refusal. When GitHub has no PR at all from the local branch name, the
+  branch's upstream on the same remote is asked instead, so a PR taken over as
+  `git checkout -B takeover/155 origin/feat/x` is found
+  (`"... (head branch feat/x, this branch's upstream)"`). Without such a PR, only an explicit
   `--into` proves a merge, by ancestry: the tip is contained in the freshly fetched
   `--into` branch. **No default branch is assumed** (an `origin/HEAD` guess once
   refused PRs merged into `development`). The refusal names the PR that explains it
@@ -892,7 +900,8 @@ works, and it also deletes uncommitted work and unmerged branches without a word
 
 Then it removes the worktree, deletes the local branch only if it still points at the
 proven head, and deletes the remote branch only when a merged PR from that same
-repository had exactly that branch and head. Long-lived branches (the `--into` branch,
+repository had exactly that branch and head (a contained-head or upstream proof
+removes the worktree and keeps every remote branch). Long-lived branches (the `--into` branch,
 the proving PR's base, origin's default branch as `git ls-remote --symref origin HEAD`
 reports it now (unreadable: exit 3, nothing removed), `main`, `master`, `develop`,
 `development`, `staging`, `production`, `release/*`, `hotfix/*`) are never deleted.
